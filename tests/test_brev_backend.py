@@ -250,28 +250,46 @@ def test_create_instance_with_resource_request_uses_picker(tmp_path):
 
     with mock.patch("runplz.backends.brev._pick_instance_type", return_value="picked-type"):
         with mock.patch("runplz.backends.brev._sh", fake_sh):
-            brev._create_instance("x", "fallback-type", cfg=app.brev, image=fn.image, function=fn)
+            brev._create_instance("x", cfg=app.brev, image=fn.image, function=fn)
 
     cmd = recorded["create_cmd"]
     assert cmd[:2] == ["brev", "create"]
     assert "picked-type" in cmd
-    assert "fallback-type" not in cmd
     # min_disk forwarded to provisioning
     i = cmd.index("--min-disk")
     assert cmd[i + 1] == "100"
+
+
+def test_create_instance_requires_resource_constraints(tmp_path):
+    cfg = BrevConfig(auto_create=True)
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+    # fn has no resource constraints set.
+    with pytest.raises(RuntimeError, match="resource constraints"):
+        brev._create_instance("x", cfg=cfg, image=fn.image, function=fn)
+
+
+def test_create_instance_raises_when_picker_returns_none(tmp_path):
+    cfg = BrevConfig(auto_create=True)
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(
+        app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path), gpu="T4"
+    )
+    with mock.patch("runplz.backends.brev._pick_instance_type", return_value=None):
+        with pytest.raises(RuntimeError, match="No Brev instance type matched"):
+            brev._create_instance("x", cfg=cfg, image=fn.image, function=fn)
 
 
 def test_create_instance_container_mode_adds_image_flag(tmp_path):
     cfg = BrevConfig(mode="container")
     app = _app(tmp_path, cfg=cfg)
     image = Image.from_registry("pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime")
-    fn = _function(app, image, module_file=_job_inside(tmp_path))
+    fn = _function(app, image, module_file=_job_inside(tmp_path), gpu="T4")
 
     recorded = {}
-    with mock.patch("runplz.backends.brev._sh", lambda c: recorded.setdefault("c", c)):
-        brev._create_instance(
-            "x", "n1-standard-4:nvidia-tesla-t4:1", cfg=cfg, image=image, function=fn
-        )
+    with mock.patch("runplz.backends.brev._pick_instance_type", return_value="picked-type"):
+        with mock.patch("runplz.backends.brev._sh", lambda c: recorded.setdefault("c", c)):
+            brev._create_instance("x", cfg=cfg, image=image, function=fn)
 
     cmd = recorded["c"]
     assert "--mode" in cmd
@@ -284,11 +302,12 @@ def test_create_instance_container_mode_requires_from_registry(tmp_path):
     cfg = BrevConfig(mode="container")
     app = _app(tmp_path, cfg=cfg)
     image = Image.from_dockerfile("Dockerfile")
-    fn = _function(app, image, module_file=_job_inside(tmp_path))
+    fn = _function(app, image, module_file=_job_inside(tmp_path), gpu="T4")
 
-    with mock.patch("runplz.backends.brev._sh", lambda c: None):
-        with pytest.raises(RuntimeError, match="from_registry"):
-            brev._create_instance("x", "any-type", cfg=cfg, image=image, function=fn)
+    with mock.patch("runplz.backends.brev._pick_instance_type", return_value="picked-type"):
+        with mock.patch("runplz.backends.brev._sh", lambda c: None):
+            with pytest.raises(RuntimeError, match="from_registry"):
+                brev._create_instance("x", cfg=cfg, image=image, function=fn)
 
 
 # -- _ensure_docker -------------------------------------------------------
@@ -647,9 +666,9 @@ def test_run_creates_instance_when_auto_create(tmp_path):
 
     created = {}
 
-    def fake_create(name, instance_type, *, cfg=None, image=None, function=None):
+    def fake_create(name, *, cfg=None, image=None, function=None):
         created["name"] = name
-        created["instance_type"] = instance_type
+        created["function"] = function
 
     with mock.patch.multiple(
         "runplz.backends.brev",
@@ -670,7 +689,7 @@ def test_run_creates_instance_when_auto_create(tmp_path):
         brev.run(app, fn, [], {}, instance="newbox")
 
     assert created["name"] == "newbox"
-    assert created["instance_type"] == cfg.instance_type
+    assert created["function"] is fn
 
 
 # -- _run_native and _run_container_mode remote commands ------------------

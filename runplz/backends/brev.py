@@ -66,19 +66,13 @@ def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out")
     _validate_config(cfg)
     if not _instance_exists(instance):
         if cfg.auto_create:
-            _create_instance(
-                instance, cfg.instance_type, cfg=cfg, image=function.image, function=function
-            )
+            _create_instance(instance, cfg=cfg, image=function.image, function=function)
         else:
-            hint = (
-                f"brev create {instance} --type {cfg.instance_type}"
-                if cfg.mode == "vm"
-                else f"brev create {instance} --mode container --type {cfg.instance_type} "
-                f"--container-image {function.image.base or '<base>'}"
-            )
             raise RuntimeError(
                 f"Brev instance {instance!r} not found and auto_create=False. "
-                f"Create it first with `{hint}`."
+                f"Create it first (e.g. `brev create {instance} --type <TYPE>` for vm mode, "
+                f"or `brev create {instance} --mode container --type <TYPE> "
+                f"--container-image <IMAGE>` for container mode)."
             )
     _refresh_ssh()
 
@@ -498,29 +492,36 @@ def _instance_exists(name: str) -> bool:
     return any(i.get("name") == name for i in instances)
 
 
-def _create_instance(name: str, instance_type: str, *, cfg=None, image=None, function=None):
+def _create_instance(name: str, *, cfg=None, image=None, function=None):
     """Provision a Brev instance.
 
-    If `function` carries resource requests (cpu/memory/min_gpu_memory/
-    min_disk/gpu), we translate those into `brev search` filters, pick
-    the cheapest matching instance type, and create with it — overriding
-    the explicit `cfg.instance_type` default. This is the mechanism that
-    makes `@app.function(gpu="T4", memory=26000, cpu=4)` do the same
-    thing on Brev that it does on Modal.
+    `function`'s resource requests (cpu/memory/min_gpu_memory/min_disk/gpu)
+    are translated into `brev search` filters and the cheapest match is
+    picked. This is the mechanism that makes `@app.function(gpu="T4",
+    min_memory=26, min_cpu=4)` do the same thing on Brev that it does
+    on Modal.
     """
-    has_resource_request = function is not None and any(
+    if function is None or not any(
         [
             function.min_cpu is not None,
             function.min_memory is not None,
             function.min_gpu_memory is not None,
             function.min_disk is not None,
-            function.gpu is not None and instance_type is None,
+            function.gpu is not None,
         ]
-    )
-    if has_resource_request:
-        picked = _pick_instance_type(function)
-        if picked:
-            instance_type = picked
+    ):
+        raise RuntimeError(
+            "BrevConfig(auto_create=True) requires resource constraints on the "
+            "function (e.g. gpu=, min_cpu=, min_memory=, min_gpu_memory=, "
+            "min_disk=) to drive `brev search`. Either add constraints or "
+            "pre-create the instance and set auto_create=False."
+        )
+    instance_type = _pick_instance_type(function)
+    if instance_type is None:
+        raise RuntimeError(
+            "No Brev instance type matched the function's resource constraints. "
+            "Loosen the constraints or pre-create the instance."
+        )
 
     cmd = ["brev", "create", name, "--type", instance_type]
     # Propagate --min-disk from function if set (also controls

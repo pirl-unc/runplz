@@ -10,11 +10,7 @@ from runplz import App, BrevConfig, Image
 
 app = App(
     "runplz-simple",
-    brev=BrevConfig(
-        instance_type="n1-standard-4:nvidia-tesla-t4:1",
-        auto_create=False,
-        mode="vm",
-    ),
+    brev=BrevConfig(auto_create=False, mode="vm"),
 )
 
 image = (
