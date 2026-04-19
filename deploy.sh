@@ -7,5 +7,12 @@ cd "$ROOT"
 ./lint.sh
 ./test.sh
 
-PYTHON_BIN="${DEPLOY_PYTHON:-python3}"
-"$PYTHON_BIN" deploy.py "$@"
+python3 -m pip install --upgrade build twine
+rm -rf dist
+python3 -m build
+python3 -m twine upload dist/*
+
+VERSION="$(python3 -c 'from runplz.version import __version__; print(__version__)')"
+TAG="v${VERSION}"
+git tag -a "$TAG" -m "Release ${TAG}"
+git push origin "refs/tags/${TAG}"

@@ -2,7 +2,7 @@
 
 set -e
 
-SOURCES="runplz tests deploy.py release_utils.py"
+SOURCES="runplz tests"
 
 echo "Running ruff check..."
 ruff check $SOURCES
