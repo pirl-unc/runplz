@@ -260,13 +260,20 @@ def test_create_instance_with_resource_request_uses_picker(tmp_path):
     assert cmd[i + 1] == "100"
 
 
-def test_create_instance_requires_resource_constraints(tmp_path):
+def test_create_instance_no_constraints_falls_through_to_picker(tmp_path):
+    """When no instance_type is pinned and no constraints are declared, we
+    still call the picker — it defaults to `brev search cpu --sort price`
+    and returns the cheapest available box rather than raising."""
     cfg = BrevConfig(auto_create=True)
     app = _app(tmp_path, cfg=cfg)
     fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
-    # fn has no resource constraints set.
-    with pytest.raises(RuntimeError, match="resource constraints"):
-        brev._create_instance("x", cfg=cfg, image=fn.image, function=fn)
+
+    recorded = {}
+    with mock.patch("runplz.backends.brev._pick_instance_type", return_value="cheap-cpu-type"):
+        with mock.patch("runplz.backends.brev._sh", lambda c: recorded.setdefault("c", c)):
+            brev._create_instance("x", cfg=cfg, image=fn.image, function=fn)
+
+    assert "cheap-cpu-type" in recorded["c"]
 
 
 def test_create_instance_raises_when_picker_returns_none(tmp_path):
@@ -276,7 +283,7 @@ def test_create_instance_raises_when_picker_returns_none(tmp_path):
         app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path), gpu="T4"
     )
     with mock.patch("runplz.backends.brev._pick_instance_type", return_value=None):
-        with pytest.raises(RuntimeError, match="No Brev instance type matched"):
+        with pytest.raises(RuntimeError, match="no matching instances"):
             brev._create_instance("x", cfg=cfg, image=fn.image, function=fn)
 
 

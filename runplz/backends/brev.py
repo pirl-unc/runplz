@@ -498,34 +498,20 @@ def _create_instance(name: str, *, cfg=None, image=None, function=None):
     Picks the instance type in this order:
     1. `cfg.instance_type` — explicit user override (if set).
     2. Cheapest match from `brev search` driven by `function`'s resource
-       constraints (gpu / min_cpu / min_memory / min_gpu_memory / min_disk).
+       constraints. If no GPU is requested, this falls through to the
+       cheapest CPU box; if a GPU is requested, the cheapest matching
+       GPU box. With no constraints at all, we get the cheapest CPU box
+       Brev offers — a sensible default.
 
-    Raises if neither is available.
+    Raises only if the picker finds no matches (e.g. constraints too tight).
     """
     instance_type: Optional[str] = cfg.instance_type if cfg is not None else None
     if instance_type is None:
-        has_constraints = function is not None and any(
-            [
-                function.min_cpu is not None,
-                function.min_memory is not None,
-                function.min_gpu_memory is not None,
-                function.min_disk is not None,
-                function.gpu is not None,
-            ]
-        )
-        if not has_constraints:
-            raise RuntimeError(
-                "BrevConfig(auto_create=True) needs either an explicit "
-                "`instance_type=...` or resource constraints on the function "
-                "(gpu=, min_cpu=, min_memory=, min_gpu_memory=, min_disk=) "
-                "to drive `brev search`. Otherwise, pre-create the instance "
-                "and set auto_create=False."
-            )
         instance_type = _pick_instance_type(function)
         if instance_type is None:
             raise RuntimeError(
-                "No Brev instance type matched the function's resource "
-                "constraints. Loosen the constraints, pass an explicit "
+                "`brev search` returned no matching instances. Loosen the "
+                "function's resource constraints, pass an explicit "
                 "`instance_type=...` on BrevConfig, or pre-create the instance."
             )
 
