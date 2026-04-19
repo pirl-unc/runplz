@@ -15,6 +15,27 @@ import pytest
 from runplz import App, Image
 from runplz.backends import modal as modal_backend
 
+# --- _modal_gpu_string ----------------------------------------------------
+
+
+def test_modal_gpu_string_passthrough_when_no_min_vram():
+    assert modal_backend._modal_gpu_string("A100", None) == "A100"
+    assert modal_backend._modal_gpu_string(None, None) is None
+    assert modal_backend._modal_gpu_string(None, 80) is None
+
+
+def test_modal_gpu_string_appends_suffix():
+    assert modal_backend._modal_gpu_string("A100", 80) == "A100-80GB"
+    assert modal_backend._modal_gpu_string("H100", 40) == "H100-40GB"
+    assert modal_backend._modal_gpu_string("T4", 16) == "T4-16GB"
+
+
+def test_modal_gpu_string_respects_existing_suffix():
+    # User pinned a size already — don't double-suffix.
+    assert modal_backend._modal_gpu_string("A100-80GB", 40) == "A100-80GB"
+    assert modal_backend._modal_gpu_string("L4-24gb", 16) == "L4-24gb"
+
+
 # --- render_modal_image ---------------------------------------------------
 
 
@@ -220,6 +241,64 @@ def test_run_memory_gb_to_mb_conversion(tmp_path):
     assert "'RUNPLZ_OUT': '/out'" in captured_src["src"]
     assert "'RUNPLZ_FUNCTION': 'train'" in captured_src["src"]
     assert "'FOO': 'bar'" in captured_src["src"]
+
+
+def test_run_min_gpu_memory_appends_suffix(tmp_path, capsys):
+    app = App("x")
+    app._repo_root = tmp_path
+    (tmp_path / "jobs").mkdir()
+    (tmp_path / "jobs" / "j.py").write_text("pass\n")
+
+    @app.function(image=Image.from_registry("ubuntu:22.04"), gpu="A100", min_gpu_memory=80)
+    def t():  # pragma: no cover
+        pass
+
+    fn = app.functions["t"]
+    fn.module_file = str(tmp_path / "jobs" / "j.py")
+    captured = {}
+
+    def fake_run(cmd, *a, **kw):
+        entry = cmd[-1].split("::")[0]
+        captured["src"] = Path(entry).read_text()
+        for line in captured["src"].splitlines():
+            if line.startswith("_OUT_BLOB = "):
+                Path(line.split("=", 1)[1].strip().strip("'\"")).write_bytes(_fake_tarball_blob())
+        return mock.Mock(returncode=0)
+
+    with mock.patch("runplz.backends.modal.subprocess.run", fake_run):
+        modal_backend.run(app, fn, [], {})
+
+    # min_gpu_memory=80 baked into the gpu string as -80GB suffix.
+    assert "_GPU = 'A100-80GB'" in captured["src"]
+
+
+def test_run_min_disk_warns_and_is_ignored(tmp_path, capsys):
+    app = App("x")
+    app._repo_root = tmp_path
+    (tmp_path / "jobs").mkdir()
+    (tmp_path / "jobs" / "j.py").write_text("pass\n")
+
+    @app.function(image=Image.from_registry("ubuntu:22.04"), gpu="T4", min_disk=200)
+    def t():  # pragma: no cover
+        pass
+
+    fn = app.functions["t"]
+    fn.module_file = str(tmp_path / "jobs" / "j.py")
+
+    def fake_run(cmd, *a, **kw):
+        entry = cmd[-1].split("::")[0]
+        src = Path(entry).read_text()
+        for line in src.splitlines():
+            if line.startswith("_OUT_BLOB = "):
+                Path(line.split("=", 1)[1].strip().strip("'\"")).write_bytes(_fake_tarball_blob())
+        return mock.Mock(returncode=0)
+
+    with mock.patch("runplz.backends.modal.subprocess.run", fake_run):
+        modal_backend.run(app, fn, [], {})
+
+    out = capsys.readouterr().out
+    assert "min_disk=200" in out
+    assert "ignored on Modal" in out
 
 
 def test_run_no_memory_emits_none(tmp_path):
