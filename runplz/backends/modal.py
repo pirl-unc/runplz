@@ -27,6 +27,7 @@ True)` mounted at /out, then download after the run via
 import io
 import json
 import os
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -116,9 +117,23 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
 
     # Modal's @app.function accepts memory in MB; our API uses GB. Convert.
     modal_memory = int(function.min_memory * 1024) if function.min_memory is not None else None
+
+    # Modal expresses GPU memory by baking a suffix into the gpu string
+    # (e.g. "A100-80GB"). Translate our min_gpu_memory constraint onto the
+    # gpu string when set; leave the gpu string alone if it already carries
+    # a size suffix.
+    modal_gpu = _modal_gpu_string(function.gpu, function.min_gpu_memory)
+
+    if function.min_disk is not None:
+        print(
+            f"[runplz] warning: min_disk={function.min_disk} ignored on Modal "
+            "(no disk-size kwarg; Modal manages container storage).",
+            flush=True,
+        )
+
     entrypoint_src = _ENTRYPOINT_TEMPLATE.format(
         app_name=f"{app.name}-{function.name}",
-        gpu=function.gpu,
+        gpu=modal_gpu,
         cpu=function.min_cpu,
         memory=modal_memory,
         timeout=function.timeout,
@@ -151,6 +166,26 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
     except OSError:
         pass
     print(f"Modal run complete. Outputs in {host_out}", flush=True)
+
+
+_MODAL_GPU_SUFFIX_RE = re.compile(r"-\d+GB$", re.IGNORECASE)
+
+
+def _modal_gpu_string(gpu, min_gpu_memory):
+    """Translate our (gpu, min_gpu_memory) pair into Modal's gpu string.
+
+    Modal expresses GPU memory by baking a suffix into the gpu string
+    (e.g. "A100-80GB"). If the user already pinned a size ("A100-80GB"),
+    respect it. Otherwise, when `min_gpu_memory` is set, append a "-NGB"
+    suffix so Modal schedules onto a box with at least that VRAM.
+    """
+    if gpu is None:
+        return None
+    if min_gpu_memory is None:
+        return gpu
+    if _MODAL_GPU_SUFFIX_RE.search(gpu):
+        return gpu
+    return f"{gpu}-{int(min_gpu_memory)}GB"
 
 
 def _render_modal_image(image, *, repo: Path) -> str:
