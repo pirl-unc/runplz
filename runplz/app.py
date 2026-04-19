@@ -131,7 +131,14 @@ class App:
 
     def _dispatch(self, function: Function, args: list, kwargs: dict):
         if self._backend is None:
-            raise RuntimeError("No backend selected. Invoke via `runplz <backend> <script>`.")
+            raise RuntimeError(
+                f"{function.name}.remote(...) was called but no backend is "
+                "selected. runplz Functions dispatch via the `runplz` CLI, "
+                "which binds a backend before invoking @local_entrypoint. "
+                f"Run: `runplz <local|brev|modal> {function.module_file}`. "
+                f"(For in-process execution without a backend, use "
+                f"{function.name}.local(...) instead.)"
+            )
         backend = self._backend
         if backend == "local":
             from runplz.backends import local

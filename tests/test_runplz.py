@@ -231,7 +231,7 @@ def test_remote_requires_backend_to_be_selected():
     def train():
         pass
 
-    with pytest.raises(RuntimeError, match="No backend selected"):
+    with pytest.raises(RuntimeError, match="no backend is selected"):
         train.remote()
 
 

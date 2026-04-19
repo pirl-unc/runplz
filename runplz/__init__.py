@@ -2,8 +2,9 @@
 
 One Python decoration, three backends (local Docker, Brev, Modal).
 
-Minimal example:
+Write a job script:
 
+    # jobs/train.py
     from runplz import App, BrevConfig, Image
 
     app = App("my-job", brev=BrevConfig(auto_create=True))
@@ -22,11 +23,16 @@ Minimal example:
     def main():
         train.remote()
 
-Run via the CLI:
+Then run it from the CLI:
 
-    runplz local path/to/job.py
-    runplz brev --instance my-box path/to/job.py
-    runplz modal path/to/job.py
+    runplz local jobs/train.py
+    runplz brev --instance my-box jobs/train.py
+    runplz modal jobs/train.py
+
+The CLI is the only entry point — it imports the script, binds the backend,
+and invokes whatever you decorated with ``@app.local_entrypoint``. Inside
+that entrypoint call ``fn.remote(...)`` to dispatch on the chosen backend,
+or ``fn.local(...)`` to run the body in the current process (for tests).
 """
 
 from runplz.app import App, Function
