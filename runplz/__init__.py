@@ -6,7 +6,7 @@ Minimal example:
 
     from runplz import App, BrevConfig, Image
 
-    app = App("my-job", brev=BrevConfig(instance_type="g2-standard-4:nvidia-l4:1"))
+    app = App("my-job", brev=BrevConfig(auto_create=True))
     image = (
         Image.from_registry("pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime")
         .pip_install("pandas", "scikit-learn")

@@ -10,7 +10,6 @@ from typing import Optional
 
 @dataclass(frozen=True)
 class BrevConfig:
-    instance_type: str = "a100-40gb"
     auto_create: bool = False
     api_key_env: str = "BREV_API_KEY"  # env var name for REST fallback; optional
     auth: str = "cli"  # "cli" (default) or "rest" (not implemented)
