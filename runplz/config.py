@@ -11,6 +11,11 @@ from typing import Optional
 @dataclass(frozen=True)
 class BrevConfig:
     auto_create: bool = False
+    # Optional explicit instance type (e.g. "n1-standard-4:nvidia-tesla-t4:1").
+    # When set, takes precedence over the constraint-based picker. When None
+    # (default), `brev search` is driven by the function's resource
+    # constraints and the cheapest matching type is picked.
+    instance_type: Optional[str] = None
     api_key_env: str = "BREV_API_KEY"  # env var name for REST fallback; optional
     auth: str = "cli"  # "cli" (default) or "rest" (not implemented)
     # Provisioning mode:
