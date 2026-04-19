@@ -1,9 +1,13 @@
 """Minimal runplz example — trains a trivial PyTorch model.
 
-Run:
+Invoke via the CLI (never `python examples/simple_job.py` directly):
     runplz local  examples/simple_job.py
     runplz brev   --instance my-gpu-box examples/simple_job.py
     runplz modal  examples/simple_job.py
+
+The CLI imports this file, attaches the selected backend to `app`, and
+calls `main()` (the @local_entrypoint). Inside main(), `train.remote()`
+dispatches to the backend.
 """
 
 from runplz import App, BrevConfig, Image
