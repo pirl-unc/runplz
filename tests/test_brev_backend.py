@@ -280,6 +280,27 @@ def test_create_instance_raises_when_picker_returns_none(tmp_path):
             brev._create_instance("x", cfg=cfg, image=fn.image, function=fn)
 
 
+def test_create_instance_explicit_instance_type_bypasses_picker(tmp_path):
+    cfg = BrevConfig(auto_create=True, instance_type="my-explicit-type")
+    app = _app(tmp_path, cfg=cfg)
+    # No constraints AND no function-level picker call should happen.
+    fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+
+    recorded = {}
+    picker_called = {"n": 0}
+
+    def fake_picker(_fn):
+        picker_called["n"] += 1
+        return "SHOULD-NOT-BE-USED"
+
+    with mock.patch("runplz.backends.brev._pick_instance_type", fake_picker):
+        with mock.patch("runplz.backends.brev._sh", lambda c: recorded.setdefault("c", c)):
+            brev._create_instance("x", cfg=cfg, image=fn.image, function=fn)
+
+    assert picker_called["n"] == 0
+    assert "my-explicit-type" in recorded["c"]
+
+
 def test_create_instance_container_mode_adds_image_flag(tmp_path):
     cfg = BrevConfig(mode="container")
     app = _app(tmp_path, cfg=cfg)

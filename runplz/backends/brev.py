@@ -495,33 +495,39 @@ def _instance_exists(name: str) -> bool:
 def _create_instance(name: str, *, cfg=None, image=None, function=None):
     """Provision a Brev instance.
 
-    `function`'s resource requests (cpu/memory/min_gpu_memory/min_disk/gpu)
-    are translated into `brev search` filters and the cheapest match is
-    picked. This is the mechanism that makes `@app.function(gpu="T4",
-    min_memory=26, min_cpu=4)` do the same thing on Brev that it does
-    on Modal.
+    Picks the instance type in this order:
+    1. `cfg.instance_type` — explicit user override (if set).
+    2. Cheapest match from `brev search` driven by `function`'s resource
+       constraints (gpu / min_cpu / min_memory / min_gpu_memory / min_disk).
+
+    Raises if neither is available.
     """
-    if function is None or not any(
-        [
-            function.min_cpu is not None,
-            function.min_memory is not None,
-            function.min_gpu_memory is not None,
-            function.min_disk is not None,
-            function.gpu is not None,
-        ]
-    ):
-        raise RuntimeError(
-            "BrevConfig(auto_create=True) requires resource constraints on the "
-            "function (e.g. gpu=, min_cpu=, min_memory=, min_gpu_memory=, "
-            "min_disk=) to drive `brev search`. Either add constraints or "
-            "pre-create the instance and set auto_create=False."
-        )
-    instance_type = _pick_instance_type(function)
+    instance_type: Optional[str] = cfg.instance_type if cfg is not None else None
     if instance_type is None:
-        raise RuntimeError(
-            "No Brev instance type matched the function's resource constraints. "
-            "Loosen the constraints or pre-create the instance."
+        has_constraints = function is not None and any(
+            [
+                function.min_cpu is not None,
+                function.min_memory is not None,
+                function.min_gpu_memory is not None,
+                function.min_disk is not None,
+                function.gpu is not None,
+            ]
         )
+        if not has_constraints:
+            raise RuntimeError(
+                "BrevConfig(auto_create=True) needs either an explicit "
+                "`instance_type=...` or resource constraints on the function "
+                "(gpu=, min_cpu=, min_memory=, min_gpu_memory=, min_disk=) "
+                "to drive `brev search`. Otherwise, pre-create the instance "
+                "and set auto_create=False."
+            )
+        instance_type = _pick_instance_type(function)
+        if instance_type is None:
+            raise RuntimeError(
+                "No Brev instance type matched the function's resource "
+                "constraints. Loosen the constraints, pass an explicit "
+                "`instance_type=...` on BrevConfig, or pre-create the instance."
+            )
 
     cmd = ["brev", "create", name, "--type", instance_type]
     # Propagate --min-disk from function if set (also controls
