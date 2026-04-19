@@ -26,15 +26,20 @@ def main(argv=None):
         sys.stderr.reconfigure(line_buffering=True)
     except (AttributeError, io.UnsupportedOperation):
         pass
-    p = argparse.ArgumentParser(prog="runplz",
-                                description="Run a Python @app.function on a chosen backend.")
+    p = argparse.ArgumentParser(
+        prog="runplz", description="Run a Python @app.function on a chosen backend."
+    )
     p.add_argument("backend", choices=["local", "brev", "modal"])
     p.add_argument("script", help="Path to a job script defining an App with @local_entrypoint.")
-    p.add_argument("--outputs-dir", default="out",
-                   help="Host directory to collect outputs into (default: out/).")
+    p.add_argument(
+        "--outputs-dir",
+        default="out",
+        help="Host directory to collect outputs into (default: out/).",
+    )
     p.add_argument("--instance", help="[brev] Brev instance name.")
-    p.add_argument("--no-build", action="store_true",
-                   help="[local] Skip docker build (reuse tagged image).")
+    p.add_argument(
+        "--no-build", action="store_true", help="[local] Skip docker build (reuse tagged image)."
+    )
     args = p.parse_args(argv)
 
     script_path = Path(args.script).resolve()
@@ -67,6 +72,7 @@ def _load_app(script_path: Path):
     spec.loader.exec_module(module)
 
     from runplz.app import App
+
     apps = [v for v in vars(module).values() if isinstance(v, App)]
     if not apps:
         raise SystemExit(f"No App found in {script_path}")

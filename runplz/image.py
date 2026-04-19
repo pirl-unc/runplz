@@ -21,9 +21,11 @@ from typing import Optional, Tuple
 
 @dataclass(frozen=True)
 class ImageOp:
-    kind: str                          # "apt_install" | "pip_install" | "pip_install_local_dir" | "run"
+    # kind: "apt_install" | "pip_install" | "pip_install_local_dir" | "run"
+    kind: str
     args: Tuple[str, ...] = ()
-    kwargs: Tuple[Tuple[str, str], ...] = ()   # (key, value) pairs; hashable
+    # (key, value) pairs; tuple form so the dataclass stays hashable
+    kwargs: Tuple[Tuple[str, str], ...] = ()
 
     def kwargs_dict(self) -> dict:
         return dict(self.kwargs)
@@ -45,8 +47,7 @@ class Image:
         return cls(base=ref)
 
     @classmethod
-    def from_dockerfile(cls, dockerfile: str,
-                        context: Optional[str] = None) -> "Image":
+    def from_dockerfile(cls, dockerfile: str, context: Optional[str] = None) -> "Image":
         """Use an existing Dockerfile. No DSL ops are applied on top."""
         return cls(dockerfile=dockerfile, context=context)
 
@@ -55,17 +56,13 @@ class Image:
     def apt_install(self, *packages: str) -> "Image":
         return self._with_op(ImageOp(kind="apt_install", args=tuple(packages)))
 
-    def pip_install(self, *packages: str,
-                    index_url: Optional[str] = None) -> "Image":
+    def pip_install(self, *packages: str, index_url: Optional[str] = None) -> "Image":
         kw: Tuple[Tuple[str, str], ...] = ()
         if index_url is not None:
             kw = (("index_url", index_url),)
-        return self._with_op(
-            ImageOp(kind="pip_install", args=tuple(packages), kwargs=kw)
-        )
+        return self._with_op(ImageOp(kind="pip_install", args=tuple(packages), kwargs=kw))
 
-    def pip_install_local_dir(self, path: str = ".",
-                              editable: bool = True) -> "Image":
+    def pip_install_local_dir(self, path: str = ".", editable: bool = True) -> "Image":
         kw = (("path", path), ("editable", "1" if editable else "0"))
         return self._with_op(ImageOp(kind="pip_install_local_dir", kwargs=kw))
 
@@ -110,6 +107,7 @@ class Image:
         if self.base is None:
             raise ValueError("render_dockerfile() requires from_registry()")
         import json as _json
+
         lines = [f"FROM {self.base}", ""]
         lines.append("ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1")
         for op in self.ops:

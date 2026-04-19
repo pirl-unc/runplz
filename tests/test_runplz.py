@@ -1,9 +1,9 @@
-"""Offline tests for the mhcflurry.runners framework.
+"""Offline tests for runplz.
 
 Covers the pieces we can test without actually provisioning cloud
 resources: DSL rendering, config validation, instance-picker logic,
-CLI arg parsing. Backends that drive real SSH/docker/modal are exercised
-by `jobs/pan_allele_smoketest.py` against the three backends — that's
+CLI arg parsing. Backends that drive real SSH / docker / modal are
+exercised by examples/simple_job.py against the three backends — that's
 the closest thing we have to an integration test.
 """
 
@@ -22,8 +22,8 @@ from runplz.backends.brev import (
     _validate_config,
 )
 
-
 # ---- Image DSL rendering --------------------------------------------------
+
 
 def _sample_image():
     return (
@@ -74,13 +74,14 @@ def test_render_dockerfile_requires_from_registry():
 
 # ---- Brev ops-script rendering --------------------------------------------
 
+
 def test_render_ops_script_uses_shlex_quote_for_packages():
     script = _render_ops_script(_sample_image())
     # Each op becomes a semicolon-joined bash line. Version specifiers
     # with shell metacharacters must be single-quoted by shlex.quote.
     assert "'pandas>=2.0'" in script
     assert "bzip2 rsync" in script
-    assert "pip install --quiet -e \"$HOME/runplz-repo\"" in script
+    assert 'pip install --quiet -e "$HOME/runplz-repo"' in script
 
 
 def test_render_ops_script_rejects_dockerfile_image():
@@ -89,6 +90,7 @@ def test_render_ops_script_rejects_dockerfile_image():
 
 
 # ---- BrevConfig validation ------------------------------------------------
+
 
 def test_brev_validate_default_ok():
     _validate_config(BrevConfig())  # does not raise
@@ -111,25 +113,32 @@ def test_brev_validate_vm_plus_use_docker_false_is_allowed():
 
 # ---- GPU label translation (Modal → Brev) ---------------------------------
 
-@pytest.mark.parametrize("modal_label, expected_brev_name", [
-    ("T4", "T4"),
-    ("L4", "L4"),
-    ("A100-40GB", "A100"),
-    ("A100-80GB", "A100"),
-    ("H100", "H100"),
-    ("a100-40gb", "A100"),  # accept lowercased too
-])
+
+@pytest.mark.parametrize(
+    "modal_label, expected_brev_name",
+    [
+        ("T4", "T4"),
+        ("L4", "L4"),
+        ("A100-40GB", "A100"),
+        ("A100-80GB", "A100"),
+        ("H100", "H100"),
+        ("a100-40gb", "A100"),  # accept lowercased too
+    ],
+)
 def test_brev_gpu_name_strips_vram_suffix(modal_label, expected_brev_name):
     assert _brev_gpu_name(modal_label) == expected_brev_name
 
 
 # ---- Instance picker → `brev search` -------------------------------------
 
-def _fn_with(gpu=None, min_cpu=None, min_memory=None,
-             min_gpu_memory=None, min_disk=None):
+
+def _fn_with(gpu=None, min_cpu=None, min_memory=None, min_gpu_memory=None, min_disk=None):
     return types.SimpleNamespace(
-        gpu=gpu, min_cpu=min_cpu, min_memory=min_memory,
-        min_gpu_memory=min_gpu_memory, min_disk=min_disk,
+        gpu=gpu,
+        min_cpu=min_cpu,
+        min_memory=min_memory,
+        min_gpu_memory=min_gpu_memory,
+        min_disk=min_disk,
     )
 
 
@@ -143,8 +152,7 @@ def test_pick_instance_type_builds_correct_search_cmd():
             stdout=json.dumps([{"type": "n1-highmem-4:nvidia-tesla-t4:1"}]),
         )
 
-    fn = _fn_with(gpu="T4", min_cpu=4, min_memory=26, min_gpu_memory=16,
-                  min_disk=100)
+    fn = _fn_with(gpu="T4", min_cpu=4, min_memory=26, min_gpu_memory=16, min_disk=100)
     with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
         result = _pick_instance_type(fn)
     assert result == "n1-highmem-4:nvidia-tesla-t4:1"
@@ -177,6 +185,7 @@ def test_pick_instance_type_returns_none_on_no_match():
 
 
 # ---- App / @app.function --------------------------------------------------
+
 
 def test_function_decorator_records_resource_requests():
     app = App("t")
@@ -240,10 +249,10 @@ def test_remote_rejects_non_json_args():
 
 # ---- CLI entry ------------------------------------------------------------
 
+
 def test_cli_errors_without_instance_on_brev():
     from runplz import _cli
 
-    with mock.patch.object(sys, "argv",
-                           ["mhcflurry-run", "brev", "examples/simple_job.py"]):
+    with mock.patch.object(sys, "argv", ["mhcflurry-run", "brev", "examples/simple_job.py"]):
         with pytest.raises(SystemExit):
             _cli.main(["brev", "examples/simple_job.py"])

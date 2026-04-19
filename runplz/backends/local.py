@@ -9,14 +9,19 @@ import json
 import subprocess
 from pathlib import Path
 
-
 IMAGE_TAG_DEFAULT = "runplz-train:local"
 
 
-def run(app, function, args, kwargs, *,
-        image_tag: str = IMAGE_TAG_DEFAULT,
-        build: bool = True,
-        outputs_dir: str = "out"):
+def run(
+    app,
+    function,
+    args,
+    kwargs,
+    *,
+    image_tag: str = IMAGE_TAG_DEFAULT,
+    build: bool = True,
+    outputs_dir: str = "out",
+):
     repo = app._repo_root
     if repo is None:
         raise RuntimeError("App repo_root not set (CLI should have set this).")
@@ -31,15 +36,25 @@ def run(app, function, args, kwargs, *,
     script_in_container = _container_path_for(function.module_file, repo)
 
     cmd = [
-        "docker", "run", "--rm",
-        "--name", f"runplz-{app.name}-{function.name}",
-        "-v", f"{host_out}:/out",
-        "-w", "/workspace",
-        "-e", "RUNPLZ_OUT=/out",
-        "-e", f"RUNPLZ_SCRIPT={script_in_container}",
-        "-e", f"RUNPLZ_FUNCTION={function.name}",
-        "-e", f"RUNPLZ_ARGS={json.dumps(args)}",
-        "-e", f"RUNPLZ_KWARGS={json.dumps(kwargs)}",
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        f"runplz-{app.name}-{function.name}",
+        "-v",
+        f"{host_out}:/out",
+        "-w",
+        "/workspace",
+        "-e",
+        "RUNPLZ_OUT=/out",
+        "-e",
+        f"RUNPLZ_SCRIPT={script_in_container}",
+        "-e",
+        f"RUNPLZ_FUNCTION={function.name}",
+        "-e",
+        f"RUNPLZ_ARGS={json.dumps(args)}",
+        "-e",
+        f"RUNPLZ_KWARGS={json.dumps(kwargs)}",
     ]
     if _nvidia_available():
         cmd += ["--gpus", "all"]
@@ -58,8 +73,9 @@ def _docker_build(dockerfile: Path, context: Path, tag: str):
 
 
 def _nvidia_available() -> bool:
-    r = subprocess.run(["docker", "info", "--format", "{{json .Runtimes}}"],
-                       capture_output=True, text=True)
+    r = subprocess.run(
+        ["docker", "info", "--format", "{{json .Runtimes}}"], capture_output=True, text=True
+    )
     return r.returncode == 0 and "nvidia" in r.stdout
 
 

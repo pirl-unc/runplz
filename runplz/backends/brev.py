@@ -18,7 +18,6 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-
 REMOTE_REPO_DIR = "runplz-repo"
 REMOTE_OUT_DIR = "runplz-out"
 REMOTE_IMAGE_TAG = "runplz-train:brev"
@@ -35,11 +34,16 @@ REMOTE_IMAGE_TAG = "runplz-train:brev"
 # individual session alive during idle stretches (docker image pulls,
 # data downloads, between-epoch pauses).
 _SSH_OPTS = [
-    "-o", "ControlMaster=no",
-    "-o", "ControlPath=none",
-    "-o", "ServerAliveInterval=30",
-    "-o", "ServerAliveCountMax=240",
-    "-o", "TCPKeepAlive=yes",
+    "-o",
+    "ControlMaster=no",
+    "-o",
+    "ControlPath=none",
+    "-o",
+    "ServerAliveInterval=30",
+    "-o",
+    "ServerAliveCountMax=240",
+    "-o",
+    "TCPKeepAlive=yes",
 ]
 
 # Brev's CLI hangs on an interactive walkthrough once an instance exists in the
@@ -54,9 +58,7 @@ _BREV_ONBOARDING_DONE = {
 }
 
 
-def run(app, function, args, kwargs, *,
-        instance: str,
-        outputs_dir: str = "out"):
+def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out"):
     _require_brev_cli()
     _skip_onboarding()
 
@@ -64,13 +66,14 @@ def run(app, function, args, kwargs, *,
     _validate_config(cfg)
     if not _instance_exists(instance):
         if cfg.auto_create:
-            _create_instance(instance, cfg.instance_type, cfg=cfg,
-                             image=function.image, function=function)
+            _create_instance(
+                instance, cfg.instance_type, cfg=cfg, image=function.image, function=function
+            )
         else:
             hint = (
                 f"brev create {instance} --type {cfg.instance_type}"
-                if cfg.mode == "vm" else
-                f"brev create {instance} --mode container --type {cfg.instance_type} "
+                if cfg.mode == "vm"
+                else f"brev create {instance} --mode container --type {cfg.instance_type} "
                 f"--container-image {function.image.base or '<base>'}"
             )
             raise RuntimeError(
@@ -191,9 +194,7 @@ def _run_container_mode(*, instance, function, rel_script, args, kwargs):
         f'cd "$HOME/{REMOTE_REPO_DIR}"; '
         "python -m runplz._bootstrap"
     )
-    r = subprocess.run(
-        ["ssh", *_SSH_OPTS, instance, f"bash -lc {shlex.quote(remote)}"]
-    )
+    r = subprocess.run(["ssh", *_SSH_OPTS, instance, f"bash -lc {shlex.quote(remote)}"])
     return r.returncode
 
 
@@ -248,9 +249,7 @@ def _render_ops_script(image) -> str:
             # unquoted so the remote shell expands it; only quote `path`.
             rel = path.lstrip("./")
             sub = f"/{rel}" if rel else ""
-            lines.append(
-                f'pip install --quiet {flags}"$HOME/{REMOTE_REPO_DIR}{sub}"'
-            )
+            lines.append(f'pip install --quiet {flags}"$HOME/{REMOTE_REPO_DIR}{sub}"')
         elif op.kind == "run" and op.args:
             for cmd in op.args:
                 lines.append(cmd)
@@ -265,8 +264,9 @@ def _run_native(*, instance, function, rel_script, args, kwargs, has_nvidia):
     via the bootstrap, with env vars set for this specific invocation.
     """
     torch_index = (
-        "https://download.pytorch.org/whl/cu121" if has_nvidia else
-        "https://download.pytorch.org/whl/cpu"
+        "https://download.pytorch.org/whl/cu121"
+        if has_nvidia
+        else "https://download.pytorch.org/whl/cpu"
     )
     setup = (
         "set -euo pipefail; "
@@ -304,9 +304,7 @@ def _run_native(*, instance, function, rel_script, args, kwargs, has_nvidia):
         f'cd "$HOME/{REMOTE_REPO_DIR}"; '
         "python -m runplz._bootstrap"
     )
-    r = subprocess.run(
-        ["ssh", *_SSH_OPTS, instance, f"bash -lc {shlex.quote(remote)}"]
-    )
+    r = subprocess.run(["ssh", *_SSH_OPTS, instance, f"bash -lc {shlex.quote(remote)}"])
     return r.returncode
 
 
@@ -334,11 +332,10 @@ def _build_image(instance: str, image):
     _ssh(instance, build)
 
 
-def _run_container_detached(*, instance, container_name, function, rel_script,
-                            args, kwargs, gpu_flag):
-    env_flags = " ".join(
-        f"-e {shlex.quote(f'{k}={v}')}" for k, v in function.env.items()
-    )
+def _run_container_detached(
+    *, instance, container_name, function, rel_script, args, kwargs, gpu_flag
+):
+    env_flags = " ".join(f"-e {shlex.quote(f'{k}={v}')}" for k, v in function.env.items())
     runner_env = (
         f"-e RUNPLZ_OUT=/out "
         f"-e RUNPLZ_SCRIPT={shlex.quote('/workspace/' + rel_script)} "
@@ -365,8 +362,7 @@ def _run_container_detached(*, instance, container_name, function, rel_script,
     _ssh(instance, start)
 
 
-def _stream_and_wait(instance: str, container_name: str,
-                     max_reconnects: int = 20) -> int:
+def _stream_and_wait(instance: str, container_name: str, max_reconnects: int = 20) -> int:
     """Stream container logs and return its exit code.
 
     `docker logs -f` exits when the container stops, so we loop across SSH
@@ -375,8 +371,7 @@ def _stream_and_wait(instance: str, container_name: str,
     Gives up after `max_reconnects` consecutive reconnect attempts so we
     don't loop forever if the box is permanently unreachable.
     """
-    print(f"+ streaming logs from {container_name} (resilient to reconnects)",
-          flush=True)
+    print(f"+ streaming logs from {container_name} (resilient to reconnects)", flush=True)
     tail = "all"
     reconnects = 0
     while True:
@@ -399,18 +394,20 @@ def _stream_and_wait(instance: str, container_name: str,
                 flush=True,
             )
             break
-        print(f"+ ssh disconnected (rc={r.returncode}); container still "
-              f"running, reconnecting log stream "
-              f"({reconnects}/{max_reconnects})",
-              flush=True)
+        print(
+            f"+ ssh disconnected (rc={r.returncode}); container still "
+            f"running, reconnecting log stream "
+            f"({reconnects}/{max_reconnects})",
+            flush=True,
+        )
         tail = "0"
         time.sleep(2)
     # Container stopped. Get its exit code (docker wait returns immediately
     # for stopped containers and prints the exit code).
     r = subprocess.run(
-        ["ssh", *_SSH_OPTS, instance,
-         f"sudo docker wait {container_name}"],
-        capture_output=True, text=True,
+        ["ssh", *_SSH_OPTS, instance, f"sudo docker wait {container_name}"],
+        capture_output=True,
+        text=True,
     )
     try:
         return int(r.stdout.strip() or "1")
@@ -424,9 +421,15 @@ def _container_running(instance: str, container_name: str) -> bool:
     # mid-training, docker wait at the end will return its final exit code.
     try:
         r = subprocess.run(
-            ["ssh", *_SSH_OPTS, instance,
-             f"sudo docker inspect --format '{{{{.State.Running}}}}' {container_name}"],
-            capture_output=True, text=True, timeout=30,
+            [
+                "ssh",
+                *_SSH_OPTS,
+                instance,
+                f"sudo docker inspect --format '{{{{.State.Running}}}}' {container_name}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
     except subprocess.TimeoutExpired:
         return True
@@ -438,16 +441,16 @@ def _container_running(instance: str, container_name: str) -> bool:
 def _ssh_capture(instance: str, remote_cmd: str) -> str:
     r = subprocess.run(
         ["ssh", *_SSH_OPTS, instance, remote_cmd],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
     return r.stdout
 
 
 def _validate_config(cfg):
     if cfg.mode not in ("vm", "container"):
-        raise ValueError(
-            f"BrevConfig.mode must be 'vm' or 'container'; got {cfg.mode!r}."
-        )
+        raise ValueError(f"BrevConfig.mode must be 'vm' or 'container'; got {cfg.mode!r}.")
     if cfg.mode == "container" and not cfg.use_docker:
         # `use_docker` is meaningless when mode='container' (the box IS the
         # container — there is no separate docker runtime inside). Flag it so
@@ -484,8 +487,7 @@ def _skip_onboarding():
 
 
 def _instance_exists(name: str) -> bool:
-    r = subprocess.run(["brev", "ls", "--json"], capture_output=True, text=True,
-                       timeout=60)
+    r = subprocess.run(["brev", "ls", "--json"], capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         return False
     try:
@@ -496,8 +498,7 @@ def _instance_exists(name: str) -> bool:
     return any(i.get("name") == name for i in instances)
 
 
-def _create_instance(name: str, instance_type: str, *,
-                     cfg=None, image=None, function=None):
+def _create_instance(name: str, instance_type: str, *, cfg=None, image=None, function=None):
     """Provision a Brev instance.
 
     If `function` carries resource requests (cpu/memory/min_gpu_memory/
@@ -507,13 +508,15 @@ def _create_instance(name: str, instance_type: str, *,
     makes `@app.function(gpu="T4", memory=26000, cpu=4)` do the same
     thing on Brev that it does on Modal.
     """
-    has_resource_request = function is not None and any([
-        function.min_cpu is not None,
-        function.min_memory is not None,
-        function.min_gpu_memory is not None,
-        function.min_disk is not None,
-        function.gpu is not None and instance_type is None,
-    ])
+    has_resource_request = function is not None and any(
+        [
+            function.min_cpu is not None,
+            function.min_memory is not None,
+            function.min_gpu_memory is not None,
+            function.min_disk is not None,
+            function.gpu is not None and instance_type is None,
+        ]
+    )
     if has_resource_request:
         picked = _pick_instance_type(function)
         if picked:
@@ -599,9 +602,16 @@ def _ensure_docker(instance: str, timeout_s: int = 420):
         "done; exit 1"
     )
     r = subprocess.run(
-        ["ssh", *_SSH_OPTS,
-         "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
-         instance, wait_script],
+        [
+            "ssh",
+            *_SSH_OPTS,
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            instance,
+            wait_script,
+        ],
         timeout=timeout_s,
     )
     if r.returncode != 0:
@@ -620,9 +630,10 @@ def _remote_has_nvidia(instance: str) -> bool:
     # the reliable signal is /proc/driver/nvidia, which only exists when the
     # kernel module is loaded against real hardware.
     r = subprocess.run(
-        ["ssh", *_SSH_OPTS, instance,
-         "test -d /proc/driver/nvidia && echo y || echo n"],
-        capture_output=True, text=True, timeout=30,
+        ["ssh", *_SSH_OPTS, instance, "test -d /proc/driver/nvidia && echo y || echo n"],
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     return r.returncode == 0 and r.stdout.strip() == "y"
 
@@ -632,13 +643,21 @@ def _rsync_up(repo: Path, instance: str):
     # ~/runplz-repo/ (logs, probe scripts, local edits) shouldn't have those
     # wiped by the next run. Stale files on the remote are cheap; accidental
     # user-data loss is not.
-    _sh([
-        "rsync", "-az",
-        "--exclude=.git", "--exclude=.venv", "--exclude=__pycache__",
-        "--exclude=*.egg-info", "--exclude=build", "--exclude=dist",
-        "--exclude=out",
-        f"{repo}/", f"{instance}:{REMOTE_REPO_DIR}/",
-    ])
+    _sh(
+        [
+            "rsync",
+            "-az",
+            "--exclude=.git",
+            "--exclude=.venv",
+            "--exclude=__pycache__",
+            "--exclude=*.egg-info",
+            "--exclude=build",
+            "--exclude=dist",
+            "--exclude=out",
+            f"{repo}/",
+            f"{instance}:{REMOTE_REPO_DIR}/",
+        ]
+    )
 
 
 def _rsync_down(instance: str, local_out: Path):

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "runplz"
-version = "1.0.0"
+dynamic = ["version"]
 description = "Tiny Modal-shaped job harness — one declaration, multiple backends (local Docker / Brev / Modal)"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -48,6 +48,12 @@ Repository = "https://github.com/pirl-unc/runplz"
 [tool.setuptools.packages.find]
 include = ["runplz*"]
 exclude = ["tests*", "examples*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "runplz.version.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100

@@ -32,8 +32,8 @@ Run via the CLI:
 from runplz.app import App, Function
 from runplz.config import BrevConfig, ModalConfig
 from runplz.image import Image, ImageOp
+from runplz.version import __version__
 
-__version__ = "1.0.0"
 __all__ = [
     "App",
     "Function",

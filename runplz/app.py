@@ -19,12 +19,20 @@ from runplz.image import Image
 
 
 class Function:
-    def __init__(self, app: "App", fn: Callable, *, image: Image,
-                 gpu: Optional[str], timeout: int, env: dict,
-                 min_cpu: Optional[float] = None,
-                 min_memory: Optional[float] = None,
-                 min_gpu_memory: Optional[float] = None,
-                 min_disk: Optional[float] = None):
+    def __init__(
+        self,
+        app: "App",
+        fn: Callable,
+        *,
+        image: Image,
+        gpu: Optional[str],
+        timeout: int,
+        env: dict,
+        min_cpu: Optional[float] = None,
+        min_memory: Optional[float] = None,
+        min_gpu_memory: Optional[float] = None,
+        min_disk: Optional[float] = None,
+    ):
         self.app = app
         self.fn = fn
         self.image = image
@@ -43,10 +51,10 @@ class Function:
         #   - "H200"          Hopper,  141 GB,   sm_90
         #   - "V100"          Volta,    16 GB,   sm_70
         self.gpu = gpu
-        self.min_cpu = min_cpu                 # vCPUs (float for fractional on Modal)
-        self.min_memory = min_memory           # GB of RAM
-        self.min_gpu_memory = min_gpu_memory   # GB of VRAM per GPU
-        self.min_disk = min_disk               # GB of disk
+        self.min_cpu = min_cpu  # vCPUs (float for fractional on Modal)
+        self.min_memory = min_memory  # GB of RAM
+        self.min_gpu_memory = min_gpu_memory  # GB of VRAM per GPU
+        self.min_disk = min_disk  # GB of disk
         self.timeout = timeout
         self.env = dict(env or {})
         self.name = fn.__name__
@@ -70,9 +78,9 @@ class Function:
 
 
 class App:
-    def __init__(self, name: str, *,
-                 brev: Optional[BrevConfig] = None,
-                 modal: Optional[ModalConfig] = None):
+    def __init__(
+        self, name: str, *, brev: Optional[BrevConfig] = None, modal: Optional[ModalConfig] = None
+    ):
         self.name = name
         self.brev = brev or BrevConfig()
         self.modal = modal or ModalConfig()
@@ -84,45 +92,58 @@ class App:
         self._backend_kwargs: dict = {}
         self._repo_root: Optional[Path] = None
 
-    def function(self, *, image: Image, gpu: Optional[str] = None,
-                 min_cpu: Optional[float] = None,
-                 min_memory: Optional[float] = None,
-                 min_gpu_memory: Optional[float] = None,
-                 min_disk: Optional[float] = None,
-                 timeout: int = 60 * 60, env: Optional[dict] = None):
+    def function(
+        self,
+        *,
+        image: Image,
+        gpu: Optional[str] = None,
+        min_cpu: Optional[float] = None,
+        min_memory: Optional[float] = None,
+        min_gpu_memory: Optional[float] = None,
+        min_disk: Optional[float] = None,
+        timeout: int = 60 * 60,
+        env: Optional[dict] = None,
+    ):
         def decorator(fn: Callable) -> Function:
             f = Function(
-                self, fn,
+                self,
+                fn,
                 image=image,
                 gpu=gpu,
-                min_cpu=min_cpu, min_memory=min_memory,
-                min_gpu_memory=min_gpu_memory, min_disk=min_disk,
-                timeout=timeout, env=env or {},
+                min_cpu=min_cpu,
+                min_memory=min_memory,
+                min_gpu_memory=min_gpu_memory,
+                min_disk=min_disk,
+                timeout=timeout,
+                env=env or {},
             )
             self.functions[f.name] = f
             return f
+
         return decorator
 
     def local_entrypoint(self):
         def decorator(fn: Callable) -> Callable:
             self._entrypoint = fn
             return fn
+
         return decorator
 
     def _dispatch(self, function: Function, args: list, kwargs: dict):
         if self._backend is None:
-            raise RuntimeError(
-                "No backend selected. Invoke via `runplz <backend> <script>`."
-            )
+            raise RuntimeError("No backend selected. Invoke via `runplz <backend> <script>`.")
         backend = self._backend
         if backend == "local":
             from runplz.backends import local
+
             return local.run(self, function, args, kwargs, **self._backend_kwargs)
         if backend == "brev":
             from runplz.backends import brev
+
             return brev.run(self, function, args, kwargs, **self._backend_kwargs)
         if backend == "modal":
             from runplz.backends import modal
+
             return modal.run(self, function, args, kwargs, **self._backend_kwargs)
         raise ValueError(f"Unknown backend: {backend!r}")
 

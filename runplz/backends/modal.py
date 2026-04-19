@@ -32,7 +32,6 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-
 _ENTRYPOINT_TEMPLATE = '''\
 """Generated Modal entrypoint for runplz. Do not edit."""
 
@@ -116,9 +115,7 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
     ).name
 
     # Modal's @app.function accepts memory in MB; our API uses GB. Convert.
-    modal_memory = (
-        int(function.min_memory * 1024) if function.min_memory is not None else None
-    )
+    modal_memory = int(function.min_memory * 1024) if function.min_memory is not None else None
     entrypoint_src = _ENTRYPOINT_TEMPLATE.format(
         app_name=f"{app.name}-{function.name}",
         gpu=function.gpu,
@@ -163,10 +160,7 @@ def _render_modal_image(image, *, repo: Path) -> str:
     """
     if image.dockerfile is not None:
         df, ctx = image.resolve(repo)
-        return (
-            f"image = modal.Image.from_dockerfile({str(df)!r}, "
-            f"context_dir={str(ctx)!r})"
-        )
+        return f"image = modal.Image.from_dockerfile({str(df)!r}, context_dir={str(ctx)!r})"
     if image.base is None:
         raise ValueError("Image has neither base nor dockerfile")
     lines = [f"image = modal.Image.from_registry({image.base!r})"]

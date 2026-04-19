@@ -38,9 +38,7 @@ def main():
 
     fn = getattr(module, function_name, None)
     if fn is None:
-        raise RuntimeError(
-            f"Function {function_name!r} not found in {script_path}"
-        )
+        raise RuntimeError(f"Function {function_name!r} not found in {script_path}")
     # fn is a Function wrapper; call the underlying callable directly.
     result = fn.local(*args, **kwargs)
     if result is not None:

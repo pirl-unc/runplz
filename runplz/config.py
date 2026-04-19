@@ -12,8 +12,8 @@ from typing import Optional
 class BrevConfig:
     instance_type: str = "a100-40gb"
     auto_create: bool = False
-    api_key_env: str = "BREV_API_KEY"   # env var name for REST fallback; optional
-    auth: str = "cli"                    # "cli" (default) or "rest" (not implemented)
+    api_key_env: str = "BREV_API_KEY"  # env var name for REST fallback; optional
+    auth: str = "cli"  # "cli" (default) or "rest" (not implemented)
     # Provisioning mode:
     # - "vm" (default): `brev create` provisions a full VM with Brev's
     #   sidecar stack (grafana, influxdb, jupyter, cloudflared). User code
