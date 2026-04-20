@@ -95,54 +95,91 @@ def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out")
     _rsync_up(repo, instance)
     rel_script = Path(function.module_file).resolve().relative_to(repo)
 
-    if cfg.mode == "container":
-        # Brev `--mode container` box IS the user's container image. Apply
-        # our Image DSL ops inline (apt_install, pip_install,
-        # pip_install_local_dir, run_commands) via ssh, then invoke the
-        # bootstrap. No docker-in-docker, no nvidia-container-toolkit,
-        # no Brev VM sidecar stack.
-        exit_code = _run_container_mode(
-            instance=instance,
-            function=function,
-            rel_script=str(rel_script),
-            args=args,
-            kwargs=kwargs,
-        )
-    elif cfg.use_docker:
-        _ensure_docker(instance)
-        gpu_flag = "--gpus all" if _remote_has_nvidia(instance) else ""
-        container_name = f"runplz-{function.name}-{uuid.uuid4().hex[:8]}"
-        _build_image(instance, function.image)
-        _run_container_detached(
-            instance=instance,
-            container_name=container_name,
-            function=function,
-            rel_script=str(rel_script),
-            args=args,
-            kwargs=kwargs,
-            gpu_flag=gpu_flag,
-        )
-        exit_code = _stream_and_wait(instance, container_name)
-        _ssh_capture(
-            instance,
-            f"sudo docker rm {container_name} >/dev/null 2>&1 || true",
-        )
-    else:
-        # Legacy native path. Skips docker; installs python + torch +
-        # user code into a venv on a plain VM-mode Brev box. Use this only
-        # if you can't use mode="container" (e.g. specific provider flow).
-        exit_code = _run_native(
-            instance=instance,
-            function=function,
-            rel_script=str(rel_script),
-            args=args,
-            kwargs=kwargs,
-            has_nvidia=_remote_has_nvidia(instance),
-        )
-
-    _rsync_down(instance, host_out)
+    container_name: Optional[str] = None
+    exit_code: Optional[int] = None
+    try:
+        if cfg.mode == "container":
+            # Brev `--mode container` box IS the user's container image. Apply
+            # our Image DSL ops inline (apt_install, pip_install,
+            # pip_install_local_dir, run_commands) via ssh, then invoke the
+            # bootstrap. No docker-in-docker, no nvidia-container-toolkit,
+            # no Brev VM sidecar stack.
+            exit_code = _run_container_mode(
+                instance=instance,
+                function=function,
+                rel_script=str(rel_script),
+                args=args,
+                kwargs=kwargs,
+            )
+        elif cfg.use_docker:
+            _ensure_docker(instance)
+            gpu_flag = "--gpus all" if _remote_has_nvidia(instance) else ""
+            container_name = f"runplz-{function.name}-{uuid.uuid4().hex[:8]}"
+            _build_image(instance, function.image)
+            _run_container_detached(
+                instance=instance,
+                container_name=container_name,
+                function=function,
+                rel_script=str(rel_script),
+                args=args,
+                kwargs=kwargs,
+                gpu_flag=gpu_flag,
+            )
+            exit_code = _stream_and_wait(instance, container_name)
+        else:
+            # Legacy native path. Skips docker; installs python + torch +
+            # user code into a venv on a plain VM-mode Brev box. Use this only
+            # if you can't use mode="container" (e.g. specific provider flow).
+            exit_code = _run_native(
+                instance=instance,
+                function=function,
+                rel_script=str(rel_script),
+                args=args,
+                kwargs=kwargs,
+                has_nvidia=_remote_has_nvidia(instance),
+            )
+        _rsync_down(instance, host_out)
+    finally:
+        # Container cleanup first (while the box is definitely up), then
+        # the box itself per cfg.on_finish. Both are best-effort so a
+        # failure in cleanup doesn't mask the real error from the try block.
+        if container_name is not None:
+            try:
+                _ssh_capture(
+                    instance,
+                    f"sudo docker rm -f {container_name} >/dev/null 2>&1 || true",
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"+ warning: failed to remove container {container_name}: {exc}", flush=True)
+        _apply_on_finish(instance=instance, cfg=cfg)
     if exit_code != 0:
         raise RuntimeError(f"Remote run exited with status {exit_code}")
+
+
+def _apply_on_finish(*, instance: str, cfg) -> None:
+    """Stop / delete / leave the Brev box per `cfg.on_finish`.
+
+    Always best-effort: we never want box-cleanup to swallow a real error
+    from the try block. Failures here print a warning and move on.
+    """
+    if cfg.on_finish == "leave":
+        return
+    action = cfg.on_finish  # "stop" or "delete"
+    print(f"+ on_finish={action}: running `brev {action} {instance}`", flush=True)
+    try:
+        subprocess.run(
+            ["brev", action, instance],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"+ warning: `brev {action} {instance}` raised {type(exc).__name__}: {exc}. "
+            f"The box may still be running — check `brev ls`.",
+            flush=True,
+        )
 
 
 _NATIVE_VENV = "$HOME/runplz-venv"
@@ -470,13 +507,34 @@ def _skip_onboarding():
 
 
 def _instance_exists(name: str) -> bool:
+    """True iff `brev ls` lists an instance with this name.
+
+    Raises RuntimeError if the `brev` CLI itself failed (bad auth, network,
+    Brev API outage, malformed JSON) — we refuse to silently treat a degraded
+    listing as "instance doesn't exist," because the caller's fallback is to
+    auto-create a *new billed box*, which may duplicate one the user already
+    has.
+
+    Returns False only when `brev ls` succeeded but the target name is
+    definitively not in the list (including the documented `null` / empty
+    shapes Brev returns for empty orgs).
+    """
     r = subprocess.run(["brev", "ls", "--json"], capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
-        return False
+        raise RuntimeError(
+            f"`brev ls --json` failed with exit code {r.returncode}. "
+            f"Refusing to continue — if we assumed the instance was missing we'd "
+            f"auto-create a duplicate billed box. Run `brev login` / check the "
+            f"`brev` CLI and retry. stderr: {(r.stderr or '').strip()[:500]}"
+        )
     try:
         data = json.loads(r.stdout)
-    except json.JSONDecodeError:
-        return False
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"`brev ls --json` returned unparseable JSON. Refusing to continue "
+            f"(see _instance_exists docstring for why). stdout head: "
+            f"{(r.stdout or '').strip()[:200]!r}"
+        ) from exc
     # `brev ls --json` shape varies: list of instances, dict with an
     # "instances" key, or null when the org has no instances at all.
     if data is None:
@@ -486,7 +544,11 @@ def _instance_exists(name: str) -> bool:
     elif isinstance(data, dict):
         instances = data.get("instances", []) or []
     else:
-        return False
+        # Unknown shape — treat as CLI failure rather than "empty."
+        raise RuntimeError(
+            f"`brev ls --json` returned an unexpected shape ({type(data).__name__}). "
+            f"Refusing to continue (see _instance_exists docstring)."
+        )
     return any(i.get("name") == name for i in instances)
 
 

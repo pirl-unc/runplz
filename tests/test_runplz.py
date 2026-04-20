@@ -116,6 +116,20 @@ def test_brev_rejects_empty_instance_type():
         BrevConfig(instance_type="   ")
 
 
+def test_brev_default_on_finish_is_stop():
+    assert BrevConfig().on_finish == "stop"
+
+
+def test_brev_rejects_unknown_on_finish():
+    with pytest.raises(ValueError, match="on_finish must be one of"):
+        BrevConfig(on_finish="terminate")
+
+
+def test_brev_accepts_all_documented_on_finish_values():
+    for value in ("stop", "delete", "leave"):
+        BrevConfig(on_finish=value)  # does not raise
+
+
 def test_modal_config_constructs_as_noop():
     # ModalConfig has no fields today; just make sure the slot still exists.
     ModalConfig()

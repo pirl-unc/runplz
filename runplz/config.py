@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 _VALID_BREV_MODES = ("vm", "container")
+_VALID_BREV_ON_FINISH = ("stop", "delete", "leave")
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,15 @@ class BrevConfig:
     # directly over ssh. Kept for boxes where mode="container" isn't an
     # option (different provider / legacy flow).
     use_docker: bool = True
+    # What to do with the Brev box when the App exits (success OR failure).
+    # Matches Modal's ephemeral-compute model by default.
+    # - "stop" (default): `brev stop <instance>`. Disk + image cached so the
+    #   next run starts fast. Incurs a small disk charge while stopped.
+    # - "delete": `brev delete <instance>`. Zero ongoing cost; full rebuild
+    #   on next run.
+    # - "leave": never touch the box. Opt-in for interactive workflows where
+    #   you're using the same box for dev + jobs. Current pre-3.2 behavior.
+    on_finish: str = "stop"
 
     def __post_init__(self):
         if self.mode not in _VALID_BREV_MODES:
@@ -61,6 +71,11 @@ class BrevConfig:
             )
         if self.instance_type is not None and not self.instance_type.strip():
             raise ValueError("BrevConfig.instance_type must be a non-empty string (or None).")
+        if self.on_finish not in _VALID_BREV_ON_FINISH:
+            raise ValueError(
+                f"BrevConfig.on_finish must be one of {_VALID_BREV_ON_FINISH}; "
+                f"got {self.on_finish!r}."
+            )
 
 
 @dataclass(frozen=True)
