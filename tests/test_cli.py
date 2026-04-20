@@ -229,6 +229,209 @@ def test_cli_modal_dispatches_to_modal_backend(tmp_path):
     assert called == [True]
 
 
+# -- entrypoint pass-through args (issue #31) ----------------------------
+
+
+def test_cli_passes_typed_kwargs_to_entrypoint(tmp_path):
+    """@local_entrypoint def main(steps: int = 100, dataset: str = 'small'):
+    → CLI `--steps=1000 --dataset=big` maps to main(steps=1000, dataset='big')."""
+    script = _write_job(
+        tmp_path,
+        """
+        from runplz import App, Image
+
+        app = App("t")
+        image = Image.from_registry("ubuntu:22.04")
+
+        @app.function(image=image)
+        def fn(): pass
+
+        received = {}
+
+        @app.local_entrypoint()
+        def main(steps: int = 100, dataset: str = "small", lr: float = 1e-3):
+            received["steps"] = steps
+            received["dataset"] = dataset
+            received["lr"] = lr
+        """,
+    )
+    called = {}
+    # Stash `received` into our test scope by mocking local.run (which never
+    # runs here since main() doesn't touch fn). Instead read it from the
+    # loaded module after the CLI call.
+    import sys as _sys
+
+    with mock.patch("runplz.backends.local.run", lambda *a, **kw: None):
+        _cli.main(["local", str(script), "--steps=1000", "--dataset=big", "--lr=0.01"])
+    mod = _sys.modules["_runplz_user_job"]
+    called.update(mod.received)
+    assert called == {"steps": 1000, "dataset": "big", "lr": 0.01}
+
+
+def test_cli_entrypoint_uses_defaults_when_args_omitted(tmp_path):
+    script = _write_job(
+        tmp_path,
+        """
+        from runplz import App, Image
+
+        app = App("t")
+        image = Image.from_registry("ubuntu:22.04")
+
+        @app.function(image=image)
+        def fn(): pass
+
+        seen = {}
+
+        @app.local_entrypoint()
+        def main(steps: int = 42):
+            seen["steps"] = steps
+        """,
+    )
+    import sys as _sys
+
+    with mock.patch("runplz.backends.local.run", lambda *a, **kw: None):
+        _cli.main(["local", str(script)])
+    assert _sys.modules["_runplz_user_job"].seen == {"steps": 42}
+
+
+def test_cli_entrypoint_missing_required_arg_errors(tmp_path, capsys):
+    script = _write_job(
+        tmp_path,
+        """
+        from runplz import App, Image
+
+        app = App("t")
+        image = Image.from_registry("ubuntu:22.04")
+
+        @app.function(image=image)
+        def fn(): pass
+
+        @app.local_entrypoint()
+        def main(dataset: str):
+            pass
+        """,
+    )
+    with pytest.raises(SystemExit):
+        _cli.main(["local", str(script)])
+    err = capsys.readouterr().err
+    assert "--dataset" in err
+
+
+def test_cli_entrypoint_type_mismatch_errors(tmp_path, capsys):
+    script = _write_job(
+        tmp_path,
+        """
+        from runplz import App, Image
+
+        app = App("t")
+        image = Image.from_registry("ubuntu:22.04")
+
+        @app.function(image=image)
+        def fn(): pass
+
+        @app.local_entrypoint()
+        def main(steps: int = 1):
+            pass
+        """,
+    )
+    with pytest.raises(SystemExit):
+        _cli.main(["local", str(script), "--steps=not-a-number"])
+    err = capsys.readouterr().err
+    assert "--steps" in err
+    assert "int" in err
+
+
+def test_cli_entrypoint_bool_flag_forms(tmp_path):
+    """--flag = True, --no-flag = False, --flag=true/false explicit."""
+    script = _write_job(
+        tmp_path,
+        """
+        from runplz import App, Image
+
+        app = App("t")
+        image = Image.from_registry("ubuntu:22.04")
+
+        @app.function(image=image)
+        def fn(): pass
+
+        seen = {}
+
+        @app.local_entrypoint()
+        def main(verbose: bool = False):
+            seen["verbose"] = verbose
+        """,
+    )
+    import sys as _sys
+
+    for argv, expected in [
+        (["local", str(script)], False),
+        (["local", str(script), "--verbose"], True),
+        (["local", str(script), "--no-verbose"], False),
+        (["local", str(script), "--verbose=true"], True),
+        (["local", str(script), "--verbose=no"], False),
+    ]:
+        with mock.patch("runplz.backends.local.run", lambda *a, **kw: None):
+            _cli.main(argv)
+        assert _sys.modules["_runplz_user_job"].seen["verbose"] is expected, argv
+
+
+def test_cli_entrypoint_optional_annotation_unwrapped(tmp_path):
+    """Optional[int] should coerce to int, not choke on None default."""
+    script = _write_job(
+        tmp_path,
+        """
+        from typing import Optional
+        from runplz import App, Image
+
+        app = App("t")
+        image = Image.from_registry("ubuntu:22.04")
+
+        @app.function(image=image)
+        def fn(): pass
+
+        seen = {}
+
+        @app.local_entrypoint()
+        def main(steps: Optional[int] = None):
+            seen["steps"] = steps
+        """,
+    )
+    import sys as _sys
+
+    with mock.patch("runplz.backends.local.run", lambda *a, **kw: None):
+        _cli.main(["local", str(script), "--steps=7"])
+    assert _sys.modules["_runplz_user_job"].seen == {"steps": 7}
+
+    with mock.patch("runplz.backends.local.run", lambda *a, **kw: None):
+        _cli.main(["local", str(script)])
+    assert _sys.modules["_runplz_user_job"].seen == {"steps": None}
+
+
+def test_cli_zero_arg_entrypoint_rejects_extras(tmp_path, capsys):
+    """An entrypoint with no params shouldn't silently eat extra flags —
+    it's almost always a typo."""
+    script = _write_job(
+        tmp_path,
+        """
+        from runplz import App, Image
+
+        app = App("t")
+        image = Image.from_registry("ubuntu:22.04")
+
+        @app.function(image=image)
+        def fn(): pass
+
+        @app.local_entrypoint()
+        def main():
+            pass
+        """,
+    )
+    with pytest.raises(SystemExit):
+        _cli.main(["local", str(script), "--foo=bar"])
+    err = capsys.readouterr().err
+    assert "takes no arguments" in err
+
+
 def test_repo_root_walks_up_to_git(tmp_path):
     (tmp_path / ".git").mkdir()
     sub = tmp_path / "nested" / "deeper"
