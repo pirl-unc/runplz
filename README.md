@@ -232,9 +232,15 @@ How they're honored per backend:
 `local` ignores these — it uses whatever your machine has and auto-detects
 NVIDIA runtime via `docker info`.
 
-On brev, the constraints drive `brev search --sort price` and runplz picks
-the cheapest match. Override with `BrevConfig(instance_type="...")` when
-you need a specific shape.
+On brev, the constraints drive `brev search --sort price`. runplz picks
+the cheapest match, with one refinement: when the top few candidates
+are within **5% on price**, preference goes to whichever has the lowest
+availability/start-latency hint (when `brev search` exposes one — field
+names tried: `estimated_start_seconds`, `eta_seconds`, `eta_s`,
+`queue_wait_seconds`, `availability_rank`). A $0.01/hr difference isn't
+worth a job sitting 5 minutes in a queue. If no candidate has a hint,
+plain cheapest wins. Override the whole picker with
+`BrevConfig(instance_type="...")` when you need a specific shape.
 
 ### Multiple functions, multiple shapes?
 
