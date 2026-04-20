@@ -14,7 +14,7 @@ from runplz import App, BrevConfig, Image
 
 app = App(
     "runplz-simple",
-    brev=BrevConfig(auto_create=False, mode="vm"),
+    brev=BrevConfig(auto_create_instances=False, mode="vm"),
 )
 
 image = (

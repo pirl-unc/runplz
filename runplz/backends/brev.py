@@ -63,13 +63,13 @@ def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out")
     _skip_onboarding()
 
     cfg = app.brev
-    _validate_config(cfg)
     if not _instance_exists(instance):
-        if cfg.auto_create:
+        if cfg.auto_create_instances:
             _create_instance(instance, cfg=cfg, image=function.image, function=function)
         else:
             raise RuntimeError(
-                f"Brev instance {instance!r} not found and auto_create=False. "
+                f"Brev instance {instance!r} not found and "
+                f"BrevConfig(auto_create_instances=False). "
                 f"Create it first (e.g. `brev create {instance} --type <TYPE>` for vm mode, "
                 f"or `brev create {instance} --mode container --type <TYPE> "
                 f"--container-image <IMAGE>` for container mode)."
@@ -444,20 +444,6 @@ def _ssh_capture(instance: str, remote_cmd: str) -> str:
         timeout=60,
     )
     return r.stdout
-
-
-def _validate_config(cfg):
-    if cfg.mode not in ("vm", "container"):
-        raise ValueError(f"BrevConfig.mode must be 'vm' or 'container'; got {cfg.mode!r}.")
-    if cfg.mode == "container" and not cfg.use_docker:
-        # `use_docker` is meaningless when mode='container' (the box IS the
-        # container — there is no separate docker runtime inside). Flag it so
-        # users don't silently get surprising behavior.
-        raise ValueError(
-            "BrevConfig(mode='container', use_docker=False) is contradictory. "
-            "use_docker only applies to mode='vm'. In mode='container' the "
-            "box itself is the user's image — there's no inner docker to skip."
-        )
 
 
 def _require_brev_cli():

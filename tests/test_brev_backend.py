@@ -62,7 +62,7 @@ def _job_inside(tmp_path, name="jobs/train.py"):
     return p
 
 
-# -- _validate_config already covered in test_runplz.py; skipping here ----
+# -- BrevConfig validation lives in __post_init__; covered in test_runplz.py --
 
 
 # -- _brev_gpu_name covered in test_runplz.py; skipping ------------------
@@ -349,7 +349,7 @@ def test_create_instance_no_constraints_falls_through_to_picker(tmp_path):
     """When no instance_type is pinned and no constraints are declared, we
     still call the picker — it defaults to `brev search cpu --sort price`
     and returns the cheapest available box rather than raising."""
-    cfg = BrevConfig(auto_create=True)
+    cfg = BrevConfig(auto_create_instances=True)
     app = _app(tmp_path, cfg=cfg)
     fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
 
@@ -362,7 +362,7 @@ def test_create_instance_no_constraints_falls_through_to_picker(tmp_path):
 
 
 def test_create_instance_raises_when_picker_returns_none(tmp_path):
-    cfg = BrevConfig(auto_create=True)
+    cfg = BrevConfig(auto_create_instances=True)
     app = _app(tmp_path, cfg=cfg)
     fn = _function(
         app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path), gpu="T4"
@@ -373,7 +373,7 @@ def test_create_instance_raises_when_picker_returns_none(tmp_path):
 
 
 def test_create_instance_explicit_instance_type_bypasses_picker(tmp_path):
-    cfg = BrevConfig(auto_create=True, instance_type="my-explicit-type")
+    cfg = BrevConfig(auto_create_instances=True, instance_type="my-explicit-type")
     app = _app(tmp_path, cfg=cfg)
     # No constraints AND no function-level picker call should happen.
     fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
@@ -672,7 +672,7 @@ def test_container_running_true_on_running_output():
 
 
 def test_run_fails_when_instance_missing_without_auto_create(tmp_path):
-    cfg = BrevConfig(auto_create=False, mode="vm")
+    cfg = BrevConfig(auto_create_instances=False, mode="vm")
     app = _app(tmp_path, cfg=cfg)
     fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
 
@@ -777,7 +777,7 @@ def test_run_container_mode_end_to_end(tmp_path):
 
 
 def test_run_creates_instance_when_auto_create(tmp_path):
-    cfg = BrevConfig(auto_create=True, mode="vm")
+    cfg = BrevConfig(auto_create_instances=True, mode="vm")
     app = _app(tmp_path, cfg=cfg)
     fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
 

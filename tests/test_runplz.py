@@ -14,12 +14,11 @@ from unittest import mock
 
 import pytest
 
-from runplz import App, BrevConfig, Image
+from runplz import App, BrevConfig, Image, ModalConfig
 from runplz.backends.brev import (
     _brev_gpu_name,
     _pick_instance_type,
     _render_ops_script,
-    _validate_config,
 )
 
 # ---- Image DSL rendering --------------------------------------------------
@@ -89,26 +88,36 @@ def test_render_ops_script_rejects_dockerfile_image():
         _render_ops_script(Image.from_dockerfile("docker/Dockerfile.train"))
 
 
-# ---- BrevConfig validation ------------------------------------------------
+# ---- BrevConfig validation (at construction time) ------------------------
 
 
-def test_brev_validate_default_ok():
-    _validate_config(BrevConfig())  # does not raise
+def test_brev_default_constructs_ok():
+    BrevConfig()  # does not raise
 
 
-def test_brev_validate_unknown_mode():
+def test_brev_rejects_unknown_mode():
     with pytest.raises(ValueError, match="mode must be"):
-        _validate_config(BrevConfig(mode="kubernetes"))
+        BrevConfig(mode="kubernetes")
 
 
-def test_brev_validate_container_plus_use_docker_false():
+def test_brev_rejects_container_plus_use_docker_false():
     with pytest.raises(ValueError, match="contradictory"):
-        _validate_config(BrevConfig(mode="container", use_docker=False))
+        BrevConfig(mode="container", use_docker=False)
 
 
-def test_brev_validate_vm_plus_use_docker_false_is_allowed():
+def test_brev_allows_vm_plus_use_docker_false():
     # Legacy escape hatch for mode=vm.
-    _validate_config(BrevConfig(mode="vm", use_docker=False))
+    BrevConfig(mode="vm", use_docker=False)
+
+
+def test_brev_rejects_empty_instance_type():
+    with pytest.raises(ValueError, match="non-empty"):
+        BrevConfig(instance_type="   ")
+
+
+def test_modal_config_constructs_as_noop():
+    # ModalConfig has no fields today; just make sure the slot still exists.
+    ModalConfig()
 
 
 # ---- GPU label translation (Modal → Brev) ---------------------------------
@@ -256,3 +265,196 @@ def test_cli_errors_without_instance_on_brev():
     with mock.patch.object(sys, "argv", ["mhcflurry-run", "brev", "examples/simple_job.py"]):
         with pytest.raises(SystemExit):
             _cli.main(["brev", "examples/simple_job.py"])
+
+
+# ---- App.bind() — pure-Python invocation ---------------------------------
+
+
+def test_bind_local_sets_backend_and_kwargs():
+    app = App("t")
+
+    @app.function(image=_sample_image())
+    def train():
+        pass
+
+    app.bind("local")
+    assert app._backend == "local"
+    assert app._backend_kwargs["outputs_dir"] == "out"
+    assert "build" not in app._backend_kwargs  # default build=True, no override
+
+
+def test_bind_local_with_no_build_flag():
+    app = App("t")
+
+    @app.function(image=_sample_image())
+    def train():
+        pass
+
+    app.bind("local", build=False)
+    assert app._backend_kwargs["build"] is False
+
+
+def test_bind_brev_requires_instance():
+    app = App("t")
+
+    @app.function(image=_sample_image(), gpu="T4")
+    def train():
+        pass
+
+    with pytest.raises(ValueError, match="instance=... is required"):
+        app.bind("brev")
+
+    app.bind("brev", instance="my-box")
+    assert app._backend == "brev"
+    assert app._backend_kwargs["instance"] == "my-box"
+
+
+def test_bind_rejects_unknown_backend():
+    app = App("t")
+
+    @app.function(image=_sample_image())
+    def train():
+        pass
+
+    with pytest.raises(ValueError, match="must be 'local', 'brev', or 'modal'"):
+        app.bind("k8s")
+
+
+def test_bind_requires_a_function_to_locate_repo_root():
+    app = App("t")
+    with pytest.raises(RuntimeError, match="at least one @app.function"):
+        app.bind("local")
+
+
+def test_bind_rejects_instance_on_non_brev_backend():
+    app = App("t")
+
+    @app.function(image=_sample_image())
+    def train():
+        pass
+
+    with pytest.raises(ValueError, match="only applies to backend='brev'"):
+        app.bind("local", instance="stray-box")
+
+
+def test_bind_rejects_no_build_on_non_local_backend():
+    app = App("t")
+
+    @app.function(image=_sample_image(), gpu="T4")
+    def train():
+        pass
+
+    with pytest.raises(ValueError, match="build=False only applies to backend='local'"):
+        app.bind("brev", instance="b", build=False)
+
+
+def test_bind_returns_self_for_chaining():
+    app = App("t")
+
+    @app.function(image=_sample_image())
+    def train():
+        pass
+
+    assert app.bind("local") is app
+
+
+def test_bind_rejects_empty_outputs_dir():
+    app = App("t")
+
+    @app.function(image=_sample_image())
+    def train():
+        pass
+
+    with pytest.raises(ValueError, match="outputs_dir"):
+        app.bind("local", outputs_dir="   ")
+
+
+def test_bind_threads_outputs_dir():
+    app = App("t")
+
+    @app.function(image=_sample_image())
+    def train():
+        pass
+
+    app.bind("local", outputs_dir="custom/out")
+    assert app._backend_kwargs["outputs_dir"] == "custom/out"
+
+
+# ---- @app.function() resource validation --------------------------------
+
+
+def test_function_rejects_non_positive_min_cpu():
+    app = App("t")
+    with pytest.raises(ValueError, match="min_cpu must be > 0"):
+
+        @app.function(image=_sample_image(), min_cpu=0)
+        def train():
+            pass
+
+
+def test_function_rejects_non_positive_timeout():
+    app = App("t")
+    with pytest.raises(ValueError, match="timeout must be a positive int"):
+
+        @app.function(image=_sample_image(), timeout=0)
+        def train():
+            pass
+
+
+def test_function_rejects_min_gpu_memory_without_gpu():
+    app = App("t")
+    with pytest.raises(ValueError, match="min_gpu_memory=.* requires gpu"):
+
+        @app.function(image=_sample_image(), min_gpu_memory=16)
+        def train():
+            pass
+
+
+def test_function_rejects_empty_gpu_string():
+    app = App("t")
+    with pytest.raises(ValueError, match="gpu must be a non-empty"):
+
+        @app.function(image=_sample_image(), gpu="")
+        def train():
+            pass
+
+
+# ---- CLI tightened flag/backend enforcement -----------------------------
+
+
+def test_cli_errors_on_instance_with_non_brev_backend(tmp_path):
+    from runplz import _cli
+
+    script = tmp_path / "job.py"
+    script.write_text(
+        "from runplz import App, Image\n"
+        "app = App('t')\n"
+        "image = Image.from_registry('ubuntu:22.04')\n"
+        "@app.function(image=image)\n"
+        "def f():\n"
+        "    pass\n"
+        "@app.local_entrypoint()\n"
+        "def main():\n"
+        "    pass\n"
+    )
+    with pytest.raises(SystemExit):
+        _cli.main(["local", str(script), "--instance", "stray"])
+
+
+def test_cli_errors_on_no_build_with_non_local_backend(tmp_path):
+    from runplz import _cli
+
+    script = tmp_path / "job.py"
+    script.write_text(
+        "from runplz import App, Image\n"
+        "app = App('t')\n"
+        "image = Image.from_registry('ubuntu:22.04')\n"
+        "@app.function(image=image)\n"
+        "def f():\n"
+        "    pass\n"
+        "@app.local_entrypoint()\n"
+        "def main():\n"
+        "    pass\n"
+    )
+    with pytest.raises(SystemExit):
+        _cli.main(["brev", str(script), "--instance", "b", "--no-build"])

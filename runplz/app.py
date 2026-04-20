@@ -33,6 +33,15 @@ class Function:
         min_gpu_memory: Optional[float] = None,
         min_disk: Optional[float] = None,
     ):
+        _validate_resources(
+            fn_name=fn.__name__,
+            gpu=gpu,
+            min_cpu=min_cpu,
+            min_memory=min_memory,
+            min_gpu_memory=min_gpu_memory,
+            min_disk=min_disk,
+            timeout=timeout,
+        )
         self.app = app
         self.fn = fn
         self.image = image
@@ -129,6 +138,64 @@ class App:
 
         return decorator
 
+    def bind(
+        self,
+        backend: str,
+        *,
+        instance: Optional[str] = None,
+        outputs_dir: str = "out",
+        build: bool = True,
+    ) -> "App":
+        """Attach a backend to this App from pure Python, no CLI needed.
+
+        Args:
+          backend: "local", "brev", or "modal".
+          instance: required for `backend="brev"`; rejected for others.
+          outputs_dir: host dir to collect `/out` into. Applies to all backends.
+          build: local-only. `False` skips `docker build` and reuses the last
+            tagged image. Rejected for non-local backends (Brev rebuilds on
+            the remote; Modal manages its own layer cache).
+
+        Use from a `if __name__ == "__main__":` guard in your script:
+
+            app.bind("local")
+            train.remote()
+
+        …which is what `runplz local jobs/train.py` does under the hood.
+        The CLI is still the preferred invocation for CI/shared scripts —
+        this is for notebooks and one-off runs where you already have
+        `app` in scope.
+        """
+        if backend not in ("local", "brev", "modal"):
+            raise ValueError(f"backend must be 'local', 'brev', or 'modal'; got {backend!r}")
+        if backend == "brev" and not instance:
+            raise ValueError("instance=... is required when backend='brev'")
+        if backend != "brev" and instance is not None:
+            raise ValueError(
+                f"instance={instance!r} only applies to backend='brev'; got backend={backend!r}."
+            )
+        if backend != "local" and not build:
+            raise ValueError(
+                f"build=False only applies to backend='local' (it skips `docker "
+                f"build`). On backend={backend!r} it would be silently ignored."
+            )
+        if not outputs_dir or not str(outputs_dir).strip():
+            raise ValueError("outputs_dir must be a non-empty path string.")
+        if not self.functions:
+            raise RuntimeError(
+                "App.bind() needs at least one @app.function() declared so we "
+                "can locate the script's repo root."
+            )
+        any_fn = next(iter(self.functions.values()))
+        self._repo_root = _repo_root_for(Path(any_fn.module_file))
+        self._backend = backend
+        self._backend_kwargs = {"outputs_dir": outputs_dir}
+        if backend == "brev":
+            self._backend_kwargs["instance"] = instance
+        if backend == "local" and not build:
+            self._backend_kwargs["build"] = False
+        return self
+
     def _dispatch(self, function: Function, args: list, kwargs: dict):
         if self._backend is None:
             raise RuntimeError(
@@ -163,3 +230,44 @@ def _ensure_json_safe(args, kwargs):
             "Function.remote(...) args must be JSON-serializable. "
             "Use primitives/lists/dicts, not closures or custom objects."
         ) from exc
+
+
+def _repo_root_for(script_path: Path) -> Path:
+    for parent in [script_path.parent, *script_path.parents]:
+        if (parent / ".git").exists():
+            return parent
+    return script_path.parent
+
+
+def _validate_resources(
+    *,
+    fn_name: str,
+    gpu: Optional[str],
+    min_cpu: Optional[float],
+    min_memory: Optional[float],
+    min_gpu_memory: Optional[float],
+    min_disk: Optional[float],
+    timeout: int,
+):
+    if gpu is not None and (not isinstance(gpu, str) or not gpu.strip()):
+        raise ValueError(f"@app.function({fn_name}): gpu must be a non-empty string or None.")
+    positive = {
+        "min_cpu": min_cpu,
+        "min_memory": min_memory,
+        "min_gpu_memory": min_gpu_memory,
+        "min_disk": min_disk,
+    }
+    for label, value in positive.items():
+        if value is not None and value <= 0:
+            raise ValueError(
+                f"@app.function({fn_name}): {label} must be > 0 when set; got {value!r}."
+            )
+    if min_gpu_memory is not None and gpu is None:
+        raise ValueError(
+            f"@app.function({fn_name}): min_gpu_memory={min_gpu_memory} requires gpu=... "
+            "(can't filter VRAM without asking for a GPU)."
+        )
+    if not isinstance(timeout, int) or timeout <= 0:
+        raise ValueError(
+            f"@app.function({fn_name}): timeout must be a positive int (seconds); got {timeout!r}."
+        )

@@ -8,7 +8,7 @@ Tiny Modal-shaped job harness — one Python decoration, multiple backends.
 # jobs/train.py
 from runplz import App, BrevConfig, Image
 
-app = App("my-job", brev=BrevConfig(auto_create=True))
+app = App("my-job", brev=BrevConfig())  # auto-creates the Brev box if missing
 
 image = (
     Image.from_registry("pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime")
@@ -32,11 +32,26 @@ def main():
     train.remote()
 ```
 
+Invoke via the CLI:
+
 ```bash
 runplz local  jobs/train.py
 runplz brev   --instance my-box jobs/train.py
 runplz modal  jobs/train.py
 ```
+
+…or from pure Python (notebook, REPL, `python jobs/train.py`):
+
+```python
+# at the bottom of jobs/train.py
+if __name__ == "__main__":
+    app.bind("brev", instance="my-box")   # or "local" / "modal"
+    train.remote()
+```
+
+`app.bind(...)` is the programmatic equivalent of the CLI — it attaches a
+backend (plus the same flags: `instance=`, `outputs_dir=`, `build=`) so
+`.remote()` knows where to dispatch.
 
 ## How it's structured
 
@@ -75,13 +90,57 @@ selected backend. Args and kwargs must be JSON-serializable.
 ### What the CLI flags do
 
 - `--instance <name>` — **required** for `brev`; the Brev box to attach
-  to. If it doesn't exist and `BrevConfig(auto_create=True)`, runplz
-  provisions it (using the cheapest match for your resource constraints,
-  or an explicit `BrevConfig(instance_type=...)` if you pinned one).
+  to. If it doesn't exist and `BrevConfig(auto_create_instances=True)`
+  (the default), runplz provisions it for you (cheapest match for your
+  resource constraints, or an explicit `BrevConfig(instance_type=...)`
+  if you pinned one).
 - `--no-build` — **local only**; reuse the last tagged docker image
   instead of rebuilding.
 - `--outputs-dir <path>` — where to collect `/out` back to on the host
   (default `./out/`).
+
+All three have `app.bind(...)` equivalents (`instance=`, `build=False`,
+`outputs_dir=`) for the pure-Python invocation path.
+
+## Backend config
+
+`App(..., brev=BrevConfig(...), modal=ModalConfig(...))`. Both default
+to instances of their respective config class, so you only pass one when
+you need to override something.
+
+### BrevConfig
+
+All fields are validated at construction time — an invalid config raises
+`ValueError` immediately, not later during dispatch.
+
+| field                    | default | what it does                                                                                                                                      |
+| ------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `auto_create_instances`  | `True`  | If `--instance` points at a non-existent box, `brev create` it. Set `False` to hard-fail instead of auto-provisioning.                            |
+| `instance_type`          | `None`  | Pin a specific Brev instance type string (e.g. `"n1-standard-4:nvidia-tesla-t4:1"`). Skips the constraint-based picker.                           |
+| `mode`                   | `"vm"`  | `"vm"` = full Brev VM + docker-in-VM. `"container"` = the box IS the base image; runplz applies Image DSL ops inline over ssh (lighter, no DinD). |
+| `use_docker`             | `True`  | VM-mode only. `False` skips docker and installs a native venv on the box. Legacy escape hatch for providers where container mode isn't available. |
+
+Invalid combinations (rejected at construction):
+
+- `mode` not in `{"vm", "container"}`
+- `mode="container"` with `use_docker=False` (contradictory — the box *is* the image)
+- `instance_type=""` (must be a non-empty string or `None`)
+
+### ModalConfig
+
+`ModalConfig()` is a no-op today. Modal reads auth from `~/.modal.toml`
+and schedules resources from `@app.function(gpu=..., cpu=..., memory=...)`;
+we don't expose Modal-specific knobs. The class exists as a slot in
+`App(modal=...)` so the signature doesn't break when fields are added.
+
+### Why not one unified config?
+
+Surveyed the fields — there is no genuine overlap today. Brev has real
+provisioning knobs (mode, instance type, docker-or-native); Modal has
+nothing we expose. A shared base class would be empty. If/when a
+genuinely cross-backend concept shows up (e.g. per-App secrets, a shared
+retry policy), we'll factor it into a `BaseConfig` then. Until then, the
+split is the honest API.
 
 ## Image DSL
 

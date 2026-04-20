@@ -7,7 +7,7 @@ Write a job script:
     # jobs/train.py
     from runplz import App, BrevConfig, Image
 
-    app = App("my-job", brev=BrevConfig(auto_create=True))
+    app = App("my-job", brev=BrevConfig())  # auto_create_instances=True by default
     image = (
         Image.from_registry("pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime")
         .pip_install("pandas", "scikit-learn")
