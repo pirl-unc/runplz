@@ -4,6 +4,7 @@ each of the three modes (docker vm, native vm, container).
 """
 
 import json
+import subprocess
 import types
 from pathlib import Path
 from unittest import mock
@@ -117,20 +118,33 @@ def test_instance_exists_handles_non_list_json():
         assert brev._instance_exists("x") is True
 
 
-def test_instance_exists_false_on_cli_failure():
+def test_instance_exists_raises_on_cli_failure():
+    # Silently returning False here would let the caller auto-create a
+    # duplicate billed box. See brev._instance_exists docstring.
     with mock.patch(
         "runplz.backends.brev.subprocess.run",
-        return_value=mock.Mock(returncode=1, stdout=""),
+        return_value=mock.Mock(returncode=1, stdout="", stderr="auth expired"),
     ):
-        assert brev._instance_exists("x") is False
+        with pytest.raises(RuntimeError, match="brev ls"):
+            brev._instance_exists("x")
 
 
-def test_instance_exists_false_on_invalid_json():
+def test_instance_exists_raises_on_invalid_json():
     with mock.patch(
         "runplz.backends.brev.subprocess.run",
-        return_value=mock.Mock(returncode=0, stdout="not-json"),
+        return_value=mock.Mock(returncode=0, stdout="not-json", stderr=""),
     ):
-        assert brev._instance_exists("x") is False
+        with pytest.raises(RuntimeError, match="unparseable JSON"):
+            brev._instance_exists("x")
+
+
+def test_instance_exists_raises_on_unexpected_shape():
+    with mock.patch(
+        "runplz.backends.brev.subprocess.run",
+        return_value=mock.Mock(returncode=0, stdout='"a-bare-string"', stderr=""),
+    ):
+        with pytest.raises(RuntimeError, match="unexpected shape"):
+            brev._instance_exists("x")
 
 
 def test_instance_exists_false_when_json_null():
@@ -696,6 +710,7 @@ def test_run_vm_docker_mode_end_to_end(tmp_path):
         _stream_and_wait=mock.Mock(return_value=0),
         _ssh_capture=mock.DEFAULT,
         _rsync_down=mock.DEFAULT,
+        _apply_on_finish=mock.DEFAULT,
     ):
         brev.run(app, fn, [], {}, instance="box")
 
@@ -720,6 +735,7 @@ def test_run_vm_docker_mode_nonzero_exit_raises(tmp_path):
         _stream_and_wait=mock.Mock(return_value=137),
         _ssh_capture=mock.DEFAULT,
         _rsync_down=mock.DEFAULT,
+        _apply_on_finish=mock.DEFAULT,
     ):
         with pytest.raises(RuntimeError, match="exited with status 137"):
             brev.run(app, fn, [], {}, instance="box")
@@ -741,6 +757,7 @@ def test_run_vm_native_mode_end_to_end(tmp_path):
         _remote_has_nvidia=mock.Mock(return_value=False),
         _run_native=mock.Mock(return_value=0),
         _rsync_down=mock.DEFAULT,
+        _apply_on_finish=mock.DEFAULT,
     ):
         brev.run(app, fn, [], {}, instance="box")
 
@@ -765,6 +782,7 @@ def test_run_container_mode_end_to_end(tmp_path):
         _rsync_up=mock.DEFAULT,
         _run_container_mode=mock.Mock(return_value=0),
         _rsync_down=mock.DEFAULT,
+        _apply_on_finish=mock.DEFAULT,
     ):
         brev.run(app, fn, [], {}, instance="box")
 
@@ -796,11 +814,221 @@ def test_run_creates_instance_when_auto_create(tmp_path):
         _stream_and_wait=mock.Mock(return_value=0),
         _ssh_capture=mock.DEFAULT,
         _rsync_down=mock.DEFAULT,
+        _apply_on_finish=mock.DEFAULT,
     ):
         brev.run(app, fn, [], {}, instance="newbox")
 
     assert created["name"] == "newbox"
     assert created["function"] is fn
+
+
+# -- on_finish lifecycle --------------------------------------------------
+
+
+def _full_run_mocks():
+    """Shared mock.multiple kwargs for brev.run() end-to-end with a clean VM-
+    docker-mode path. Callers override `_stream_and_wait` to control exit code
+    (and can wrap in another context to assert _apply_on_finish calls)."""
+    return dict(
+        _require_brev_cli=mock.DEFAULT,
+        _skip_onboarding=mock.DEFAULT,
+        _instance_exists=mock.Mock(return_value=True),
+        _refresh_ssh=mock.DEFAULT,
+        _wait_until_ssh_reachable=mock.DEFAULT,
+        _ensure_docker=mock.DEFAULT,
+        _rsync_up=mock.DEFAULT,
+        _remote_has_nvidia=mock.Mock(return_value=False),
+        _build_image=mock.DEFAULT,
+        _run_container_detached=mock.DEFAULT,
+        _stream_and_wait=mock.Mock(return_value=0),
+        _ssh_capture=mock.DEFAULT,
+        _rsync_down=mock.DEFAULT,
+    )
+
+
+def test_on_finish_default_stop_calls_brev_stop(tmp_path):
+    cfg = BrevConfig(mode="vm", use_docker=True)  # on_finish default = "stop"
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+
+    captured = {"calls": []}
+
+    def fake_sub(cmd, *a, **kw):
+        captured["calls"].append(list(cmd))
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch.multiple("runplz.backends.brev", **_full_run_mocks()):
+        with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+            brev.run(app, fn, [], {}, instance="box")
+
+    stop_calls = [c for c in captured["calls"] if c[:2] == ["brev", "stop"]]
+    assert stop_calls == [["brev", "stop", "box"]]
+
+
+def test_on_finish_delete_calls_brev_delete(tmp_path):
+    cfg = BrevConfig(mode="vm", use_docker=True, on_finish="delete")
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+
+    captured = {"calls": []}
+
+    def fake_sub(cmd, *a, **kw):
+        captured["calls"].append(list(cmd))
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch.multiple("runplz.backends.brev", **_full_run_mocks()):
+        with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+            brev.run(app, fn, [], {}, instance="box")
+
+    delete_calls = [c for c in captured["calls"] if c[:2] == ["brev", "delete"]]
+    assert delete_calls == [["brev", "delete", "box"]]
+
+
+def test_on_finish_leave_never_touches_box(tmp_path):
+    cfg = BrevConfig(mode="vm", use_docker=True, on_finish="leave")
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+
+    captured = {"calls": []}
+
+    def fake_sub(cmd, *a, **kw):
+        captured["calls"].append(list(cmd))
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch.multiple("runplz.backends.brev", **_full_run_mocks()):
+        with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+            brev.run(app, fn, [], {}, instance="box")
+
+    for c in captured["calls"]:
+        assert c[:2] != ["brev", "stop"], f"unexpected stop: {c}"
+        assert c[:2] != ["brev", "delete"], f"unexpected delete: {c}"
+
+
+def test_on_finish_fires_even_when_remote_run_fails(tmp_path):
+    """The whole point of putting cleanup in `finally` — a failed remote
+    run must still trigger the configured lifecycle action."""
+    cfg = BrevConfig(mode="vm", use_docker=True)  # default on_finish="stop"
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+
+    captured = {"calls": []}
+
+    def fake_sub(cmd, *a, **kw):
+        captured["calls"].append(list(cmd))
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    # Simulate non-zero exit from the remote container.
+    mocks = _full_run_mocks()
+    mocks["_stream_and_wait"] = mock.Mock(return_value=137)
+
+    with mock.patch.multiple("runplz.backends.brev", **mocks):
+        with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+            with pytest.raises(RuntimeError, match="status 137"):
+                brev.run(app, fn, [], {}, instance="box")
+
+    stop_calls = [c for c in captured["calls"] if c[:2] == ["brev", "stop"]]
+    assert stop_calls == [["brev", "stop", "box"]], "on_finish must fire even on failure"
+
+
+def test_container_rm_force_called_in_finally_on_failure(tmp_path):
+    """Orphaned-container guard: a failing `_stream_and_wait` used to leak the
+    container on the remote box. With the finally wrap, `docker rm -f` fires."""
+    cfg = BrevConfig(mode="vm", use_docker=True, on_finish="leave")
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+
+    ssh_calls = {"cmds": []}
+
+    def fake_ssh_capture(instance, cmd):
+        ssh_calls["cmds"].append(cmd)
+        return ""
+
+    mocks = _full_run_mocks()
+    # Simulate an exception in the middle of the run (after container start).
+    mocks["_rsync_down"] = mock.Mock(side_effect=RuntimeError("rsync exploded"))
+    mocks["_ssh_capture"] = fake_ssh_capture
+
+    with mock.patch.multiple("runplz.backends.brev", **mocks):
+        with pytest.raises(RuntimeError, match="rsync exploded"):
+            brev.run(app, fn, [], {}, instance="box")
+
+    assert any("docker rm -f runplz-train-" in c for c in ssh_calls["cmds"]), ssh_calls["cmds"]
+
+
+def test_on_finish_fires_in_container_mode(tmp_path):
+    """`mode="container"` has no local docker container to rm, but the box
+    itself still needs to be stopped/deleted. Guards against future
+    refactors of the try/finally that might skip _apply_on_finish on the
+    container-mode branch."""
+    cfg = BrevConfig(mode="container", on_finish="delete")
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+
+    captured = {"calls": []}
+
+    def fake_sub(cmd, *a, **kw):
+        captured["calls"].append(list(cmd))
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch.multiple(
+        "runplz.backends.brev",
+        _require_brev_cli=mock.DEFAULT,
+        _skip_onboarding=mock.DEFAULT,
+        _instance_exists=mock.Mock(return_value=True),
+        _refresh_ssh=mock.DEFAULT,
+        _wait_until_ssh_reachable=mock.DEFAULT,
+        _ensure_remote_rsync=mock.DEFAULT,
+        _rsync_up=mock.DEFAULT,
+        _run_container_mode=mock.Mock(return_value=0),
+        _rsync_down=mock.DEFAULT,
+    ):
+        with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+            brev.run(app, fn, [], {}, instance="box")
+
+    delete_calls = [c for c in captured["calls"] if c[:2] == ["brev", "delete"]]
+    assert delete_calls == [["brev", "delete", "box"]]
+
+
+def test_apply_on_finish_warns_on_nonzero_exit(capsys):
+    """A non-zero `brev stop/delete` is a billing-leak signal and must not
+    be silent — that's the whole point of on_finish existing."""
+    cfg = BrevConfig(mode="vm", use_docker=True)  # on_finish default = "stop"
+    with mock.patch(
+        "runplz.backends.brev.subprocess.run",
+        return_value=mock.Mock(returncode=1, stdout="", stderr="brev api 503"),
+    ):
+        brev._apply_on_finish(instance="box", cfg=cfg)
+
+    out = capsys.readouterr().out
+    assert "exited 1" in out
+    assert "check `brev ls`" in out
+    assert "brev api 503" in out
+
+
+def test_apply_on_finish_silent_on_success(capsys):
+    cfg = BrevConfig(mode="vm", use_docker=True)
+    with mock.patch(
+        "runplz.backends.brev.subprocess.run",
+        return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+    ):
+        brev._apply_on_finish(instance="box", cfg=cfg)
+
+    # Only the "+ on_finish=stop: running ..." line; no warning.
+    out = capsys.readouterr().out
+    assert "warning" not in out.lower()
+
+
+def test_apply_on_finish_warns_on_subprocess_exception(capsys):
+    cfg = BrevConfig(mode="vm", use_docker=True)
+    with mock.patch(
+        "runplz.backends.brev.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd="brev stop", timeout=120),
+    ):
+        brev._apply_on_finish(instance="box", cfg=cfg)
+
+    out = capsys.readouterr().out
+    assert "TimeoutExpired" in out
+    assert "check `brev ls`" in out
 
 
 # -- _run_native and _run_container_mode remote commands ------------------
