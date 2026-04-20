@@ -4,6 +4,7 @@ each of the three modes (docker vm, native vm, container).
 """
 
 import json
+import subprocess
 import types
 from pathlib import Path
 from unittest import mock
@@ -952,6 +953,82 @@ def test_container_rm_force_called_in_finally_on_failure(tmp_path):
             brev.run(app, fn, [], {}, instance="box")
 
     assert any("docker rm -f runplz-train-" in c for c in ssh_calls["cmds"]), ssh_calls["cmds"]
+
+
+def test_on_finish_fires_in_container_mode(tmp_path):
+    """`mode="container"` has no local docker container to rm, but the box
+    itself still needs to be stopped/deleted. Guards against future
+    refactors of the try/finally that might skip _apply_on_finish on the
+    container-mode branch."""
+    cfg = BrevConfig(mode="container", on_finish="delete")
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+
+    captured = {"calls": []}
+
+    def fake_sub(cmd, *a, **kw):
+        captured["calls"].append(list(cmd))
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch.multiple(
+        "runplz.backends.brev",
+        _require_brev_cli=mock.DEFAULT,
+        _skip_onboarding=mock.DEFAULT,
+        _instance_exists=mock.Mock(return_value=True),
+        _refresh_ssh=mock.DEFAULT,
+        _wait_until_ssh_reachable=mock.DEFAULT,
+        _ensure_remote_rsync=mock.DEFAULT,
+        _rsync_up=mock.DEFAULT,
+        _run_container_mode=mock.Mock(return_value=0),
+        _rsync_down=mock.DEFAULT,
+    ):
+        with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+            brev.run(app, fn, [], {}, instance="box")
+
+    delete_calls = [c for c in captured["calls"] if c[:2] == ["brev", "delete"]]
+    assert delete_calls == [["brev", "delete", "box"]]
+
+
+def test_apply_on_finish_warns_on_nonzero_exit(capsys):
+    """A non-zero `brev stop/delete` is a billing-leak signal and must not
+    be silent — that's the whole point of on_finish existing."""
+    cfg = BrevConfig(mode="vm", use_docker=True)  # on_finish default = "stop"
+    with mock.patch(
+        "runplz.backends.brev.subprocess.run",
+        return_value=mock.Mock(returncode=1, stdout="", stderr="brev api 503"),
+    ):
+        brev._apply_on_finish(instance="box", cfg=cfg)
+
+    out = capsys.readouterr().out
+    assert "exited 1" in out
+    assert "check `brev ls`" in out
+    assert "brev api 503" in out
+
+
+def test_apply_on_finish_silent_on_success(capsys):
+    cfg = BrevConfig(mode="vm", use_docker=True)
+    with mock.patch(
+        "runplz.backends.brev.subprocess.run",
+        return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+    ):
+        brev._apply_on_finish(instance="box", cfg=cfg)
+
+    # Only the "+ on_finish=stop: running ..." line; no warning.
+    out = capsys.readouterr().out
+    assert "warning" not in out.lower()
+
+
+def test_apply_on_finish_warns_on_subprocess_exception(capsys):
+    cfg = BrevConfig(mode="vm", use_docker=True)
+    with mock.patch(
+        "runplz.backends.brev.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd="brev stop", timeout=120),
+    ):
+        brev._apply_on_finish(instance="box", cfg=cfg)
+
+    out = capsys.readouterr().out
+    assert "TimeoutExpired" in out
+    assert "check `brev ls`" in out
 
 
 # -- _run_native and _run_container_mode remote commands ------------------

@@ -167,7 +167,7 @@ def _apply_on_finish(*, instance: str, cfg) -> None:
     action = cfg.on_finish  # "stop" or "delete"
     print(f"+ on_finish={action}: running `brev {action} {instance}`", flush=True)
     try:
-        subprocess.run(
+        r = subprocess.run(
             ["brev", action, instance],
             check=False,
             capture_output=True,
@@ -178,6 +178,17 @@ def _apply_on_finish(*, instance: str, cfg) -> None:
         print(
             f"+ warning: `brev {action} {instance}` raised {type(exc).__name__}: {exc}. "
             f"The box may still be running — check `brev ls`.",
+            flush=True,
+        )
+        return
+    if r.returncode != 0:
+        # Don't raise — we're in a finally block and must not mask the real
+        # error. But DO shout: a silent non-zero here is a billing leak,
+        # which is exactly what on_finish exists to prevent.
+        print(
+            f"+ warning: `brev {action} {instance}` exited {r.returncode}. "
+            f"The box may still be running — check `brev ls`. "
+            f"stderr: {(r.stderr or '').strip()[:500]}",
             flush=True,
         )
 
