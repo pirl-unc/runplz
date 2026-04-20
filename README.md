@@ -8,7 +8,7 @@ Tiny Modal-shaped job harness — one Python decoration, multiple backends.
 # jobs/train.py
 from runplz import App, Image
 
-app = App("my-job")  # default BrevConfig auto-creates the Brev box on first run
+app = App("my-job")  # default BrevConfig: safe — no auto-create on typo
 
 image = (
     Image.from_registry("pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime")
@@ -36,8 +36,17 @@ Invoke via the CLI:
 
 ```bash
 runplz local  jobs/train.py
-runplz brev   --instance my-box jobs/train.py
+runplz brev   jobs/train.py                       # ephemeral: runplz picks a box, runs, deletes
+runplz brev   --instance my-box jobs/train.py     # attach to an existing named Brev box
+runplz ssh    --host gpu.example.com jobs/train.py
 runplz modal  jobs/train.py
+```
+
+Entrypoint params are parsed from the tail of argv, modal-style:
+
+```bash
+runplz local jobs/train.py --steps=1000 --dataset=big
+# calls main(steps=1000, dataset="big")
 ```
 
 …or from pure Python (notebook, REPL, `python jobs/train.py`):
@@ -45,13 +54,13 @@ runplz modal  jobs/train.py
 ```python
 # at the bottom of jobs/train.py
 if __name__ == "__main__":
-    app.bind("brev", instance="my-box")   # or "local" / "modal"
+    app.bind("brev", instance="my-box")   # or "local" / "modal" / ssh with host=
     train.remote()
 ```
 
 `app.bind(...)` is the programmatic equivalent of the CLI — it attaches a
-backend (plus the same flags: `instance=`, `outputs_dir=`, `build=`) so
-`.remote()` knows where to dispatch.
+backend (plus the same flags: `instance=`, `host=`, `outputs_dir=`, `build=`)
+so `.remote()` knows where to dispatch.
 
 ## How it's structured
 
@@ -71,14 +80,26 @@ backend yourself, then call `.remote()` directly — no CLI, no
 
 ```python
 app.bind("local")                         # or "modal"
+app.bind("brev")                          # ephemeral: runplz creates + deletes
 app.bind("brev", instance="my-gpu-box")   # an existing Brev instance
-train.remote()                            #   (same name `brev ls` shows)
+app.bind("ssh",  host="gpu.example.com")  # user-owned remote box
+train.remote()
 ```
 
-The Brev `instance=` string is whatever you named the box in Brev — it
-must already exist in your Brev account, or `auto_create_instances=True`
-must be set on your `BrevConfig`. Brev's managed SSH config adds a
-`Host <name>` alias so `ssh <name>` works without further setup.
+Brev has three instance paths:
+
+1. **Omit `instance=`** (ephemeral) — runplz auto-names a box sized to
+   your function, creates it, runs, and `brev delete`s it on exit.
+2. **`instance="my-box"`, box exists** — attach and run. If a previous
+   run's `on_finish="stop"` paused it, runplz `brev start`s it first.
+3. **`instance="my-box"`, box doesn't exist** — runplz **fails** by
+   default (typo guard). Opt in to auto-create with
+   `BrevConfig(auto_create_instances=True)`.
+
+Brev's managed SSH config adds a `Host <name>` alias so `ssh <name>`
+works without further setup. The SSH backend (`host=`) works with any
+ssh endpoint reachable from your shell — an alias, `user@host`, or a
+bare hostname.
 
 Either way, `.remote()` serializes a minimal dispatch (env vars + a
 path to your script) and runs on the selected backend. Args and
@@ -158,6 +179,10 @@ Invalid combinations (raised eagerly):
 - `mode="container"` with `Image.from_dockerfile(...)` — at Brev dispatch (container mode has no Dockerfile step)
 - `mode="vm", use_docker=False` with `Image.from_dockerfile(...)` — at Brev dispatch (native path ignores the Dockerfile)
 
+Image/mode checks fire at **Brev dispatch**, not at function decoration,
+so local/Modal users aren't constrained by the default Brev config on a
+shared `App`.
+
 ### SshConfig
 
 `App(..., ssh_config=SshConfig(...))` plus `--host <target>` (CLI) or
@@ -184,13 +209,11 @@ overcommit, etc.).
 
 ### What runplz does NOT ship to the remote
 
-To keep local secrets local, runplz excludes these patterns by default from every host → remote transfer (both Brev's `rsync_up` and Modal's image build context):
+To keep local secrets local, runplz excludes these patterns by default from every host → remote transfer (Brev's and SSH's `rsync_up`, plus Modal's image build context):
 
 `.env`, `.env.local`, `.env.*.local`, `.env.production`, `.env.development`, `*.pem`, `*.key`, `id_rsa`, `id_rsa.*`, `id_ed25519`, `id_ed25519.*`, `credentials.json`, `.aws`, `.ssh`, `.netrc`, `.git-credentials`
 
 If you *need* a secret inside the remote environment, inject it via `@app.function(env={"X": ...})` or Modal Secrets rather than by relaxing this list.
-
-Image/mode checks fire at **Brev dispatch**, not at function decoration, so local/Modal users aren't constrained by the default Brev config on a shared `App`.
 
 ### ModalConfig
 
@@ -252,13 +275,14 @@ All memory/disk fields in **GB**:
 
 How they're honored per backend:
 
-| constraint        | local | brev                        | modal                         |
-| ----------------- | ----- | --------------------------- | ----------------------------- |
-| `gpu`             |  —    | `brev search --gpu-name`    | `@app.function(gpu=...)`      |
-| `min_cpu`         |  —    | `--min-vcpu`                | `cpu=`                        |
-| `min_memory`      |  —    | `--min-ram`                 | `memory=` (converted to MB)   |
-| `min_gpu_memory`  |  —    | `--min-vram`                | baked into gpu string: `A100-80GB` |
-| `min_disk`        |  —    | `--min-disk` (filter + provision) | warned, dropped (no modal kwarg) |
+| constraint        | local | brev                              | modal                                   | ssh                              |
+| ----------------- | ----- | --------------------------------- | --------------------------------------- | -------------------------------- |
+| `gpu`             |  —    | `brev search --gpu-name`          | `@app.function(gpu=...)`                | spec-probe warn on model/absent  |
+| `num_gpus`        |  —    | `--min-gpus` (when N > 1)         | `:N` suffix on gpu string (`A100:4`)    | spec-probe warn on count         |
+| `min_cpu`         |  —    | `--min-vcpu`                      | `cpu=`                                  | spec-probe warn on nproc         |
+| `min_memory`      |  —    | `--min-ram`                       | `memory=` (converted to MB)             | spec-probe warn on meminfo       |
+| `min_gpu_memory`  |  —    | `--min-vram`                      | `-NGB` suffix on gpu string             | spec-probe warn on VRAM          |
+| `min_disk`        |  —    | `--min-disk` (filter + provision) | **raises** `ValueError` (use a Volume)  | —                                |
 
 `local` ignores these — it uses whatever your machine has and auto-detects
 NVIDIA runtime via `docker info`.
@@ -296,19 +320,25 @@ Depends on the backend:
 - **Modal**: yes — each `.remote()` schedules independently against Modal's
   pool. A `cpu_prep()` and a `gpu_train()` on the same `App` can land on
   completely different boxes.
-- **Brev**: no. One `runplz brev --instance my-box <script>` invocation
-  targets a single named Brev box. If you have multiple functions with
-  different specs, they all share that box. When `auto_create_instances=True`
-  and the box doesn't exist, the **first function that dispatches** determines
-  the provisioned shape — subsequent functions reuse it, even if their
-  specs would demand something bigger. Workaround: separate invocations
-  with different `--instance` names, or pre-create the box yourself.
+- **Brev (ephemeral, `instance=None`)**: yes — each `.remote()` call spins
+  up its own auto-named box sized to that function's specs and deletes it
+  on exit. The cost of that isolation is per-function provisioning
+  overhead (minutes of cold-start each).
+- **Brev (named `--instance my-box`)**: no. One named box serves the whole
+  invocation, so all functions share its shape. When
+  `auto_create_instances=True` and the box doesn't exist, the **first
+  function that dispatches** pins the provisioned shape — subsequent
+  functions reuse it even if their specs would demand something bigger.
+  Workaround: separate invocations with different names, pre-create the
+  box, or drop `--instance` to go ephemeral.
+- **SSH**: no. The box is fixed at dispatch (you own it). Spec mismatches
+  surface as warnings from the probe.
 - **Local**: specs are ignored; your machine is your machine.
 
 ## Install
 
 ```bash
-pip install runplz                 # core (local + brev)
+pip install runplz                 # core (local + brev + ssh)
 pip install 'runplz[modal]'        # add Modal support
 ```
 
@@ -316,15 +346,23 @@ The core dependency set is empty. Backends shell out to system CLIs:
 
 - `local` → `docker`
 - `brev`  → `brev`, `docker` (or skipped in `mode="container"`), `ssh`, `rsync`
+- `ssh`   → `ssh`, `rsync` (docker on the remote if `use_docker=True`)
 - `modal` → `modal>=1.1,<2` Python package
 
 ## Outputs
 
 Write to `$RUNPLZ_OUT` inside your function. runplz collects that directory
-back to `./out/` on the host (rsync on brev, tar-return on modal, bind-mount
-on local). On modal, returns are capped at ~256 MB — if you're writing
-more, switch to `modal.Volume` for now (a runplz-native volume abstraction
-is TODO).
+back to `./out/` on the host:
+
+- **local** — bind-mount (no size cap).
+- **brev / ssh** — `rsync` from the remote (no size cap beyond disk).
+- **modal** — the remote returns `/out` as a tar.gz blob, subject to
+  Modal's ~256 MB return-value cap. runplz measures the blob before
+  extracting: **warns at 200 MB**, **raises `RuntimeError` at 256 MB**
+  (the archive may already be truncated, and silently unpacking a
+  truncated tar would lose data). For anything bigger, write to
+  `modal.Volume.from_name("...", create_if_missing=True)` mounted at
+  `/out` and download via `volume.batch_iter(...)` after the run.
 
 ## Caveats
 
@@ -341,8 +379,12 @@ is TODO).
 pytest tests/
 ```
 
-~120 offline tests — DSL rendering, BrevConfig validation, Modal GPU-label
-translation, instance picker with mocked subprocess, CLI guards.
+~250 offline tests — DSL rendering, config validation across all four
+backends, Modal GPU-label / count-suffix translation, instance picker
+with cost-tolerance + availability tiebreaker, CLI guards + entrypoint
+arg pass-through, SSH spec-mismatch probe, Brev lifecycle (auto-start,
+ephemeral, on_finish). All backends are mocked — no cloud calls.
+CI runs on Python 3.10 / 3.11 / 3.12 via GitHub Actions.
 
 ## License
 
