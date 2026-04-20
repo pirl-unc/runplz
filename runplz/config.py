@@ -10,7 +10,10 @@ from typing import Optional
 
 @dataclass(frozen=True)
 class BrevConfig:
-    auto_create: bool = False
+    # When True (default) and `--instance <name>` points at a box that does
+    # not exist, runplz provisions it via `brev create`. When False, a
+    # missing instance is a hard error.
+    auto_create_instances: bool = True
     # Optional explicit instance type (e.g. "n1-standard-4:nvidia-tesla-t4:1").
     # When set, takes precedence over the constraint-based picker. When None
     # (default), `brev search` is driven by the function's resource

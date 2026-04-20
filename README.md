@@ -8,7 +8,7 @@ Tiny Modal-shaped job harness — one Python decoration, multiple backends.
 # jobs/train.py
 from runplz import App, BrevConfig, Image
 
-app = App("my-job", brev=BrevConfig(auto_create=True))
+app = App("my-job", brev=BrevConfig())  # auto-creates the Brev box if missing
 
 image = (
     Image.from_registry("pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime")
@@ -32,11 +32,26 @@ def main():
     train.remote()
 ```
 
+Invoke via the CLI:
+
 ```bash
 runplz local  jobs/train.py
 runplz brev   --instance my-box jobs/train.py
 runplz modal  jobs/train.py
 ```
+
+…or from pure Python (notebook, REPL, `python jobs/train.py`):
+
+```python
+# at the bottom of jobs/train.py
+if __name__ == "__main__":
+    app.bind("brev", instance="my-box")   # or "local" / "modal"
+    train.remote()
+```
+
+`app.bind(...)` is the programmatic equivalent of the CLI — it attaches a
+backend (plus the same flags: `instance=`, `outputs_dir=`, `build=`) so
+`.remote()` knows where to dispatch.
 
 ## How it's structured
 
@@ -75,13 +90,48 @@ selected backend. Args and kwargs must be JSON-serializable.
 ### What the CLI flags do
 
 - `--instance <name>` — **required** for `brev`; the Brev box to attach
-  to. If it doesn't exist and `BrevConfig(auto_create=True)`, runplz
-  provisions it (using the cheapest match for your resource constraints,
-  or an explicit `BrevConfig(instance_type=...)` if you pinned one).
+  to. If it doesn't exist and `BrevConfig(auto_create_instances=True)`
+  (the default), runplz provisions it for you (cheapest match for your
+  resource constraints, or an explicit `BrevConfig(instance_type=...)`
+  if you pinned one).
 - `--no-build` — **local only**; reuse the last tagged docker image
   instead of rebuilding.
 - `--outputs-dir <path>` — where to collect `/out` back to on the host
   (default `./out/`).
+
+All three have `app.bind(...)` equivalents (`instance=`, `build=False`,
+`outputs_dir=`) for the pure-Python invocation path.
+
+## Backend config
+
+`App(..., brev=BrevConfig(...), modal=ModalConfig(...))`. Both default
+to instances of their respective config class, so you only pass one when
+you need to override something.
+
+### BrevConfig
+
+| field                    | default        | what it does                                                                                                                                      |
+| ------------------------ | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `auto_create_instances`  | `True`         | If `--instance` points at a non-existent box, `brev create` it. Set `False` to hard-fail instead of auto-provisioning.                            |
+| `instance_type`          | `None`         | Pin a specific Brev instance type string (e.g. `"n1-standard-4:nvidia-tesla-t4:1"`). Skips the constraint-based picker.                           |
+| `mode`                   | `"vm"`         | `"vm"` = full Brev VM + docker-in-VM. `"container"` = the box IS the base image; runplz applies Image DSL ops inline over ssh (lighter, no DinD). |
+| `use_docker`             | `True`         | VM-mode only. `False` skips docker and installs a native venv on the box. Legacy escape hatch for providers where container mode isn't available. |
+| `api_key_env`            | `"BREV_API_KEY"` | Placeholder for a REST fallback; unused today (auth goes through `brev login`).                                                                 |
+| `auth`                   | `"cli"`        | `"cli"` uses the logged-in `brev` CLI. `"rest"` is reserved / not implemented.                                                                    |
+
+### ModalConfig
+
+| field        | default | what it does                                                                                                 |
+| ------------ | ------- | ------------------------------------------------------------------------------------------------------------ |
+| `app_prefix` | `None`  | Placeholder; Modal reads `~/.modal.toml` and currently needs nothing else. Slot exists for future symmetry. |
+
+### Why not one unified config?
+
+The fields don't really overlap: Brev's knobs are all about how the VM is
+provisioned (mode, instance type, docker-or-native), while Modal has
+essentially nothing to configure (it manages its own runtime). A single
+union would be ~90% Brev-only fields with a `# modal: ignored` next to
+each. Kept separate to make it obvious which knob applies where.
 
 ## Image DSL
 

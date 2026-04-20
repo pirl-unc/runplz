@@ -15,6 +15,8 @@ import io
 import sys
 from pathlib import Path
 
+from runplz.app import _repo_root_for
+
 
 def main(argv=None):
     # Line-buffer stdout/stderr so subprocess output and Python prints interleave
@@ -79,14 +81,6 @@ def _load_app(script_path: Path):
     if len(apps) > 1:
         raise SystemExit(f"Multiple Apps found in {script_path}; expected exactly one.")
     return apps[0]
-
-
-def _repo_root_for(script_path: Path) -> Path:
-    # Walk up looking for a .git dir; fall back to script's parent's parent.
-    for parent in [script_path.parent, *script_path.parents]:
-        if (parent / ".git").exists():
-            return parent
-    return script_path.parent
 
 
 if __name__ == "__main__":

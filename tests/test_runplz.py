@@ -256,3 +256,62 @@ def test_cli_errors_without_instance_on_brev():
     with mock.patch.object(sys, "argv", ["mhcflurry-run", "brev", "examples/simple_job.py"]):
         with pytest.raises(SystemExit):
             _cli.main(["brev", "examples/simple_job.py"])
+
+
+# ---- App.bind() — pure-Python invocation ---------------------------------
+
+
+def test_bind_local_sets_backend_and_kwargs():
+    app = App("t")
+
+    @app.function(image=_sample_image())
+    def train():
+        pass
+
+    app.bind("local")
+    assert app._backend == "local"
+    assert app._backend_kwargs["outputs_dir"] == "out"
+    assert "build" not in app._backend_kwargs  # default build=True, no override
+
+
+def test_bind_local_with_no_build_flag():
+    app = App("t")
+
+    @app.function(image=_sample_image())
+    def train():
+        pass
+
+    app.bind("local", build=False)
+    assert app._backend_kwargs["build"] is False
+
+
+def test_bind_brev_requires_instance():
+    app = App("t")
+
+    @app.function(image=_sample_image(), gpu="T4")
+    def train():
+        pass
+
+    with pytest.raises(ValueError, match="instance=... is required"):
+        app.bind("brev")
+
+    app.bind("brev", instance="my-box")
+    assert app._backend == "brev"
+    assert app._backend_kwargs["instance"] == "my-box"
+
+
+def test_bind_rejects_unknown_backend():
+    app = App("t")
+
+    @app.function(image=_sample_image())
+    def train():
+        pass
+
+    with pytest.raises(ValueError, match="must be 'local', 'brev', or 'modal'"):
+        app.bind("k8s")
+
+
+def test_bind_requires_a_function_to_locate_repo_root():
+    app = App("t")
+    with pytest.raises(RuntimeError, match="at least one @app.function"):
+        app.bind("local")

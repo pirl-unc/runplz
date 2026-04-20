@@ -129,6 +129,45 @@ class App:
 
         return decorator
 
+    def bind(
+        self,
+        backend: str,
+        *,
+        instance: Optional[str] = None,
+        outputs_dir: str = "out",
+        build: bool = True,
+    ) -> "App":
+        """Attach a backend to this App from pure Python, no CLI needed.
+
+        Use from a `if __name__ == "__main__":` guard in your script:
+
+            app.bind("local")
+            train.remote()
+
+        …which is what `runplz local jobs/train.py` does under the hood.
+        The CLI is still the preferred invocation for CI/shared scripts —
+        this is for notebooks and one-off runs where you already have
+        `app` in scope.
+        """
+        if backend not in ("local", "brev", "modal"):
+            raise ValueError(f"backend must be 'local', 'brev', or 'modal'; got {backend!r}")
+        if backend == "brev" and not instance:
+            raise ValueError("instance=... is required when backend='brev'")
+        if not self.functions:
+            raise RuntimeError(
+                "App.bind() needs at least one @app.function() declared so we "
+                "can locate the script's repo root."
+            )
+        any_fn = next(iter(self.functions.values()))
+        self._repo_root = _repo_root_for(Path(any_fn.module_file))
+        self._backend = backend
+        self._backend_kwargs = {"outputs_dir": outputs_dir}
+        if backend == "brev":
+            self._backend_kwargs["instance"] = instance
+        if backend == "local" and not build:
+            self._backend_kwargs["build"] = False
+        return self
+
     def _dispatch(self, function: Function, args: list, kwargs: dict):
         if self._backend is None:
             raise RuntimeError(
@@ -163,3 +202,10 @@ def _ensure_json_safe(args, kwargs):
             "Function.remote(...) args must be JSON-serializable. "
             "Use primitives/lists/dicts, not closures or custom objects."
         ) from exc
+
+
+def _repo_root_for(script_path: Path) -> Path:
+    for parent in [script_path.parent, *script_path.parents]:
+        if (parent / ".git").exists():
+            return parent
+    return script_path.parent
