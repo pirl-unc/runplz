@@ -16,6 +16,10 @@ from typing import Optional
 _VALID_BREV_MODES = ("vm", "container")
 _VALID_BREV_ON_FINISH = ("stop", "delete", "leave")
 
+# SSH-backend on_finish: user owns the VM lifecycle, so runplz never
+# stops/deletes on our end. "leave" is the only valid option.
+_VALID_SSH_ON_FINISH = ("leave",)
+
 
 @dataclass(frozen=True)
 class BrevConfig:
@@ -88,6 +92,56 @@ class BrevConfig:
         if self.max_runtime_seconds is not None and self.max_runtime_seconds <= 0:
             raise ValueError(
                 f"BrevConfig.max_runtime_seconds must be a positive int (or None); "
+                f"got {self.max_runtime_seconds!r}."
+            )
+
+
+@dataclass(frozen=True)
+class SshConfig:
+    """Config for the `ssh` backend — dispatch to a user-owned remote box.
+
+    The actual ssh target (hostname / alias) isn't stored here; it comes
+    through `App.bind("ssh", host=...)` or `runplz ssh --host ...`, same
+    shape as `BrevConfig` + `--instance`. This dataclass holds everything
+    that's shape-of-the-remote, not which remote.
+
+    Lifecycle is minimal: runplz never provisions and never tears down.
+    We assume the user manages their own box. `on_finish` is pinned to
+    `"leave"` for that reason.
+    """
+
+    # Optional ssh user. When None, the local ssh config / URL is used.
+    user: Optional[str] = None
+    # Optional ssh port. When None, ssh's default (22 or whatever the user's
+    # config sets).
+    port: Optional[int] = None
+    # True (default): build/pull a docker image on the remote and `docker
+    # run` the bootstrap. Mirrors BrevConfig(mode="vm", use_docker=True).
+    # False: install a python venv on the remote and run the bootstrap
+    # natively. Mirrors BrevConfig(mode="vm", use_docker=False).
+    use_docker: bool = True
+    # The user owns the box; runplz never stops or deletes it.
+    on_finish: str = "leave"
+    # Wall-clock kill-switch on the remote run. Same semantics as
+    # BrevConfig.max_runtime_seconds.
+    max_runtime_seconds: Optional[int] = None
+
+    def __post_init__(self):
+        if self.port is not None and not (0 < self.port < 65536):
+            raise ValueError(
+                f"SshConfig.port must be a valid TCP port (1-65535) or None; got {self.port!r}."
+            )
+        if self.user is not None and not self.user.strip():
+            raise ValueError("SshConfig.user must be a non-empty string (or None).")
+        if self.on_finish not in _VALID_SSH_ON_FINISH:
+            raise ValueError(
+                f"SshConfig.on_finish must be one of {_VALID_SSH_ON_FINISH}; "
+                f"got {self.on_finish!r}. (runplz never stops/deletes a "
+                f"user-owned SSH box.)"
+            )
+        if self.max_runtime_seconds is not None and self.max_runtime_seconds <= 0:
+            raise ValueError(
+                f"SshConfig.max_runtime_seconds must be a positive int (or None); "
                 f"got {self.max_runtime_seconds!r}."
             )
 

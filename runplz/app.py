@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import Callable, Optional
 
-from runplz.config import BrevConfig, ModalConfig
+from runplz.config import BrevConfig, ModalConfig, SshConfig
 from runplz.image import Image
 
 
@@ -93,10 +93,12 @@ class App:
         *,
         brev_config: Optional[BrevConfig] = None,
         modal_config: Optional[ModalConfig] = None,
+        ssh_config: Optional[SshConfig] = None,
     ):
         self.name = name
         self.brev_config = brev_config or BrevConfig()
         self.modal_config = modal_config or ModalConfig()
+        self.ssh_config = ssh_config or SshConfig()
         self.functions: dict[str, Function] = {}
         self._entrypoint: Optional[Callable] = None
 
@@ -147,14 +149,17 @@ class App:
         backend: str,
         *,
         instance: Optional[str] = None,
+        host: Optional[str] = None,
         outputs_dir: str = "out",
         build: bool = True,
     ) -> "App":
         """Attach a backend to this App from pure Python, no CLI needed.
 
         Args:
-          backend: "local", "brev", or "modal".
+          backend: "local", "brev", "ssh", or "modal".
           instance: required for `backend="brev"`; rejected for others.
+          host: required for `backend="ssh"`; rejected for others. The
+            ssh endpoint (hostname, user@host, or an ssh config alias).
           outputs_dir: host dir to collect `/out` into. Applies to all backends.
           build: local-only. `False` skips `docker build` and reuses the last
             tagged image. Rejected for non-local backends (Brev rebuilds on
@@ -163,20 +168,27 @@ class App:
         Use from a `if __name__ == "__main__":` guard in your script:
 
             app.bind("local")
+            app.bind("brev", instance="my-gpu-box")
+            app.bind("ssh",  host="gpu.example.com")
             train.remote()
 
-        …which is what `runplz local jobs/train.py` does under the hood.
-        The CLI is still the preferred invocation for CI/shared scripts —
-        this is for notebooks and one-off runs where you already have
-        `app` in scope.
+        …which is what `runplz <backend> jobs/train.py` does under the hood.
+        The CLI is preferred for CI/shared scripts; this is for notebooks
+        and one-off runs where you already have `app` in scope.
         """
-        if backend not in ("local", "brev", "modal"):
-            raise ValueError(f"backend must be 'local', 'brev', or 'modal'; got {backend!r}")
+        if backend not in ("local", "brev", "modal", "ssh"):
+            raise ValueError(f"backend must be 'local', 'brev', 'modal', or 'ssh'; got {backend!r}")
         if backend == "brev" and not instance:
             raise ValueError("instance=... is required when backend='brev'")
         if backend != "brev" and instance is not None:
             raise ValueError(
                 f"instance={instance!r} only applies to backend='brev'; got backend={backend!r}."
+            )
+        if backend == "ssh" and not host:
+            raise ValueError("host=... is required when backend='ssh'")
+        if backend != "ssh" and host is not None:
+            raise ValueError(
+                f"host={host!r} only applies to backend='ssh'; got backend={backend!r}."
             )
         if backend != "local" and not build:
             raise ValueError(
@@ -196,6 +208,8 @@ class App:
         self._backend_kwargs = {"outputs_dir": outputs_dir}
         if backend == "brev":
             self._backend_kwargs["instance"] = instance
+        if backend == "ssh":
+            self._backend_kwargs["host"] = host
         if backend == "local" and not build:
             self._backend_kwargs["build"] = False
         return self
@@ -223,6 +237,10 @@ class App:
             from runplz.backends import modal
 
             return modal.run(self, function, args, kwargs, **self._backend_kwargs)
+        if backend == "ssh":
+            from runplz.backends import ssh
+
+            return ssh.run(self, function, args, kwargs, **self._backend_kwargs)
         raise ValueError(f"Unknown backend: {backend!r}")
 
 
