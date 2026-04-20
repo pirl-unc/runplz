@@ -832,6 +832,224 @@ def test_run_container_mode_nonzero_exit_includes_remote_log_tail(tmp_path):
     assert "ValueError: bad tensor shape" in msg
 
 
+# -- _start_instance_if_stopped / _instance_status (issue: auto-start) ----
+
+
+def test_instance_status_returns_none_when_instance_not_listed():
+    with mock.patch(
+        "runplz.backends.brev.subprocess.run",
+        return_value=mock.Mock(
+            returncode=0, stdout=json.dumps([{"name": "other-box", "status": "RUNNING"}])
+        ),
+    ):
+        assert brev._instance_status("gone") is None
+
+
+def test_instance_status_returns_status_field():
+    with mock.patch(
+        "runplz.backends.brev.subprocess.run",
+        return_value=mock.Mock(
+            returncode=0, stdout=json.dumps([{"name": "my-box", "status": "STOPPED"}])
+        ),
+    ):
+        assert brev._instance_status("my-box") == "STOPPED"
+
+
+def test_instance_status_tolerates_alternate_field_names():
+    # Brev has used "state" and "power_state" in past schema versions.
+    with mock.patch(
+        "runplz.backends.brev.subprocess.run",
+        return_value=mock.Mock(
+            returncode=0, stdout=json.dumps([{"name": "my-box", "power_state": "paused"}])
+        ),
+    ):
+        assert brev._instance_status("my-box") == "paused"
+
+
+def test_start_instance_if_stopped_issues_brev_start():
+    calls = []
+
+    def fake_run(cmd, *a, **kw):
+        calls.append(list(cmd))
+        if cmd[:2] == ["brev", "ls"]:
+            return mock.Mock(
+                returncode=0, stdout=json.dumps([{"name": "my-box", "status": "STOPPED"}])
+            )
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        brev._start_instance_if_stopped("my-box")
+
+    start_calls = [c for c in calls if c[:2] == ["brev", "start"]]
+    assert start_calls == [["brev", "start", "my-box"]]
+
+
+def test_start_instance_if_stopped_noop_when_running():
+    calls = []
+
+    def fake_run(cmd, *a, **kw):
+        calls.append(list(cmd))
+        return mock.Mock(returncode=0, stdout=json.dumps([{"name": "my-box", "status": "RUNNING"}]))
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        brev._start_instance_if_stopped("my-box")
+
+    # Only the ls probe; never a `brev start`.
+    assert all(c[:2] != ["brev", "start"] for c in calls)
+
+
+def test_start_instance_if_stopped_silent_when_status_unknown():
+    # Missing status field → skip (SSH reachability loop will handle it).
+    calls = []
+
+    def fake_run(cmd, *a, **kw):
+        calls.append(list(cmd))
+        return mock.Mock(returncode=0, stdout=json.dumps([{"name": "my-box"}]))
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        brev._start_instance_if_stopped("my-box")
+    assert all(c[:2] != ["brev", "start"] for c in calls)
+
+
+# -- ephemeral mode (instance=None) --------------------------------------
+
+
+def test_make_ephemeral_name_shape():
+    name = brev._make_ephemeral_name("My App", "train_step")
+    assert name.startswith("runplz-my-app-train-step-")
+    # 8-char uuid suffix = 32 hex chars / 4
+    suffix = name.rsplit("-", 1)[-1]
+    assert len(suffix) == 8
+    assert all(c in "0123456789abcdef" for c in suffix)
+
+
+def test_make_ephemeral_name_sanitizes_slashes_and_dots():
+    # App/function names can have characters Brev won't accept.
+    name = brev._make_ephemeral_name("openvax/runplz", "train.v2")
+    assert " " not in name
+    assert "/" not in name
+    assert "." not in name
+    assert name.startswith("runplz-openvax-runplz-train-v2-")
+
+
+def test_run_ephemeral_mode_generates_name_and_forces_delete(tmp_path):
+    """instance=None → runplz generates a name, forces auto_create + delete."""
+    cfg = BrevConfig(mode="vm", use_docker=True)  # default on_finish="stop"
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+
+    captured = {}
+
+    def capture_create(name, *, cfg=None, image=None, function=None):
+        captured["create_name"] = name
+        captured["create_cfg"] = cfg
+
+    captured_finish = {}
+
+    def capture_finish(*, instance, cfg):
+        captured_finish["instance"] = instance
+        captured_finish["on_finish"] = cfg.on_finish
+
+    with mock.patch.multiple(
+        "runplz.backends.brev",
+        _require_brev_cli=mock.DEFAULT,
+        _skip_onboarding=mock.DEFAULT,
+        _instance_exists=mock.Mock(return_value=False),
+        _create_instance=capture_create,
+        _refresh_ssh=mock.DEFAULT,
+        _wait_until_ssh_reachable=mock.DEFAULT,
+        _ensure_docker=mock.DEFAULT,
+        _rsync_up=mock.DEFAULT,
+        _remote_has_nvidia=mock.Mock(return_value=False),
+        _build_image=mock.DEFAULT,
+        _run_container_detached=mock.DEFAULT,
+        _stream_and_wait=mock.Mock(return_value=0),
+        _ssh_capture=mock.DEFAULT,
+        _rsync_down=mock.DEFAULT,
+        _apply_on_finish=capture_finish,
+    ):
+        brev.run(app, fn, [], {}, instance=None)
+
+    # Name was generated — `_app` helper uses app name "panalle".
+    assert captured["create_name"].startswith("runplz-panalle-train-")
+    # Auto-create was forced on for the ephemeral path even though the App's
+    # BrevConfig defaults it to False.
+    assert captured["create_cfg"].auto_create_instances is True
+    # And "stop" was upgraded to "delete" so we don't leak a billed box
+    # that nothing will ever reuse.
+    assert captured_finish["on_finish"] == "delete"
+
+
+def test_run_ephemeral_preserves_explicit_on_finish_leave(tmp_path):
+    """If the user pinned on_finish='leave' explicitly, respect it — they're
+    probably debugging and want the box to stick around."""
+    cfg = BrevConfig(mode="vm", use_docker=True, on_finish="leave")
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+
+    captured_finish = {}
+
+    def capture_finish(*, instance, cfg):
+        captured_finish["on_finish"] = cfg.on_finish
+
+    with mock.patch.multiple(
+        "runplz.backends.brev",
+        _require_brev_cli=mock.DEFAULT,
+        _skip_onboarding=mock.DEFAULT,
+        _instance_exists=mock.Mock(return_value=False),
+        _create_instance=mock.DEFAULT,
+        _refresh_ssh=mock.DEFAULT,
+        _wait_until_ssh_reachable=mock.DEFAULT,
+        _ensure_docker=mock.DEFAULT,
+        _rsync_up=mock.DEFAULT,
+        _remote_has_nvidia=mock.Mock(return_value=False),
+        _build_image=mock.DEFAULT,
+        _run_container_detached=mock.DEFAULT,
+        _stream_and_wait=mock.Mock(return_value=0),
+        _ssh_capture=mock.DEFAULT,
+        _rsync_down=mock.DEFAULT,
+        _apply_on_finish=capture_finish,
+    ):
+        brev.run(app, fn, [], {}, instance=None)
+
+    assert captured_finish["on_finish"] == "leave"
+
+
+def test_run_named_instance_triggers_auto_start_when_stopped(tmp_path):
+    """Existing instance that's stopped (from a prior on_finish='stop' run)
+    must be `brev start`-ed before the dispatch tries to SSH."""
+    cfg = BrevConfig(mode="vm", use_docker=True, on_finish="leave")
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+
+    start_calls = []
+
+    def fake_start(name):
+        start_calls.append(name)
+
+    with mock.patch.multiple(
+        "runplz.backends.brev",
+        _require_brev_cli=mock.DEFAULT,
+        _skip_onboarding=mock.DEFAULT,
+        _instance_exists=mock.Mock(return_value=True),
+        _start_instance_if_stopped=fake_start,
+        _refresh_ssh=mock.DEFAULT,
+        _wait_until_ssh_reachable=mock.DEFAULT,
+        _ensure_docker=mock.DEFAULT,
+        _rsync_up=mock.DEFAULT,
+        _remote_has_nvidia=mock.Mock(return_value=False),
+        _build_image=mock.DEFAULT,
+        _run_container_detached=mock.DEFAULT,
+        _stream_and_wait=mock.Mock(return_value=0),
+        _ssh_capture=mock.DEFAULT,
+        _rsync_down=mock.DEFAULT,
+        _apply_on_finish=mock.DEFAULT,
+    ):
+        brev.run(app, fn, [], {}, instance="my-box")
+
+    assert start_calls == ["my-box"], "existing-instance path must call _start_instance_if_stopped"
+
+
 def test_fetch_failure_tail_returns_empty_on_ssh_error():
     """_fetch_failure_tail must never raise — the caller is already about
     to raise the real error and we don't want to mask it."""

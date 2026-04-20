@@ -32,6 +32,7 @@ class Function:
         min_memory: Optional[float] = None,
         min_gpu_memory: Optional[float] = None,
         min_disk: Optional[float] = None,
+        num_gpus: int = 1,
     ):
         _validate_resources(
             fn_name=fn.__name__,
@@ -40,6 +41,7 @@ class Function:
             min_memory=min_memory,
             min_gpu_memory=min_gpu_memory,
             min_disk=min_disk,
+            num_gpus=num_gpus,
             timeout=timeout,
         )
         self.app = app
@@ -64,6 +66,12 @@ class Function:
         self.min_memory = min_memory  # GB of RAM
         self.min_gpu_memory = min_gpu_memory  # GB of VRAM per GPU
         self.min_disk = min_disk  # GB of disk
+        # Number of GPUs. Maps to `brev search --min-gpus N`, Modal's
+        # `gpu="A100-80GB:4"` count-suffix syntax, and the SSH backend's
+        # spec-mismatch probe. Default 1 means "give me one of whatever
+        # `gpu=...` asks for" when `gpu` is set. With gpu=None, this is
+        # ignored (we don't allocate GPU-less multi-GPU boxes).
+        self.num_gpus = num_gpus
         self.timeout = timeout
         self.env = dict(env or {})
         self.name = fn.__name__
@@ -116,6 +124,7 @@ class App:
         min_memory: Optional[float] = None,
         min_gpu_memory: Optional[float] = None,
         min_disk: Optional[float] = None,
+        num_gpus: int = 1,
         timeout: int = 60 * 60,
         env: Optional[dict] = None,
     ):
@@ -129,6 +138,7 @@ class App:
                 min_memory=min_memory,
                 min_gpu_memory=min_gpu_memory,
                 min_disk=min_disk,
+                num_gpus=num_gpus,
                 timeout=timeout,
                 env=env or {},
             )
@@ -178,8 +188,8 @@ class App:
         """
         if backend not in ("local", "brev", "modal", "ssh"):
             raise ValueError(f"backend must be 'local', 'brev', 'modal', or 'ssh'; got {backend!r}")
-        if backend == "brev" and not instance:
-            raise ValueError("instance=... is required when backend='brev'")
+        # brev accepts instance=None → ephemeral mode (runplz auto-creates
+        # a box sized to the function and deletes it on exit).
         if backend != "brev" and instance is not None:
             raise ValueError(
                 f"instance={instance!r} only applies to backend='brev'; got backend={backend!r}."
@@ -295,6 +305,7 @@ def _validate_resources(
     min_memory: Optional[float],
     min_gpu_memory: Optional[float],
     min_disk: Optional[float],
+    num_gpus: int,
     timeout: int,
 ):
     if gpu is not None and (not isinstance(gpu, str) or not gpu.strip()):
@@ -314,6 +325,15 @@ def _validate_resources(
         raise ValueError(
             f"@app.function({fn_name}): min_gpu_memory={min_gpu_memory} requires gpu=... "
             "(can't filter VRAM without asking for a GPU)."
+        )
+    if not isinstance(num_gpus, int) or num_gpus < 1:
+        raise ValueError(
+            f"@app.function({fn_name}): num_gpus must be a positive int; got {num_gpus!r}."
+        )
+    if num_gpus > 1 and gpu is None:
+        raise ValueError(
+            f"@app.function({fn_name}): num_gpus={num_gpus} requires gpu=... "
+            "(can't request multiple GPUs without a model)."
         )
     if not isinstance(timeout, int) or timeout <= 0:
         raise ValueError(

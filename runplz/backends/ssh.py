@@ -251,6 +251,12 @@ def _check_gpu(nvidia_out: str, function) -> list[str]:
             f"Function declares gpu={function.gpu!r} but `nvidia-smi` on "
             f"the remote returned no GPUs (is this the right box?)."
         )
+    # Count check (num_gpus > 1).
+    num_gpus = getattr(function, "num_gpus", 1) or 1
+    if num_gpus > 1 and len(gpus) < num_gpus:
+        warnings.append(
+            f"Function declares num_gpus={num_gpus} but the remote has {len(gpus)} GPU(s)."
+        )
     if function.min_gpu_memory is not None and gpus:
         need_mib = int(function.min_gpu_memory * 1024)
         best_mib = max(mib for _, mib in gpus)

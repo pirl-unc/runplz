@@ -163,12 +163,13 @@ def _probe_output(nproc=None, mem_kb=None, gpus=None):
     return "\n".join(lines)
 
 
-def _fn(min_cpu=None, min_memory=None, gpu=None, min_gpu_memory=None):
+def _fn(min_cpu=None, min_memory=None, gpu=None, min_gpu_memory=None, num_gpus=1):
     return types.SimpleNamespace(
         min_cpu=min_cpu,
         min_memory=min_memory,
         gpu=gpu,
         min_gpu_memory=min_gpu_memory,
+        num_gpus=num_gpus,
     )
 
 
@@ -217,6 +218,16 @@ def test_spec_probe_warns_on_insufficient_vram(capsys):
     out = capsys.readouterr().out
     assert "min_gpu_memory=40" in out
     assert "16.0 GB" in out
+
+
+def test_spec_probe_warns_when_num_gpus_exceeds_available(capsys):
+    """3.6: num_gpus=4 on a box with 1 GPU → warn."""
+    probe = _probe_output(nproc=16, mem_kb=128 * 1024 * 1024, gpus=[("NVIDIA A100 80GB", 81920)])
+    with mock.patch("runplz.backends.ssh._ssh_capture", return_value=probe):
+        ssh._warn_on_spec_mismatch("box", _fn(gpu="A100", num_gpus=4))
+    out = capsys.readouterr().out
+    assert "num_gpus=4" in out
+    assert "1 GPU" in out
 
 
 def test_spec_probe_silent_when_everything_matches(capsys):
