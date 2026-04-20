@@ -75,6 +75,10 @@ def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out")
                 f"--container-image <IMAGE>` for container mode)."
             )
     _refresh_ssh()
+    # `brev create` has its own internal wait-for-ready loop, but on some
+    # providers (8-GPU boxes, slow pull of large container images) that
+    # loop times out before SSH is actually reachable. Poll explicitly.
+    _wait_until_ssh_reachable(instance)
 
     repo = app._repo_root
     host_out = (repo / outputs_dir).resolve()
@@ -587,6 +591,68 @@ def _pick_instance_type(function) -> Optional[str]:
 
 def _refresh_ssh():
     _sh(["brev", "refresh"])
+
+
+def _wait_until_ssh_reachable(
+    instance: str, *, max_wait_s: int = 1200, probe_interval_s: int = 15
+) -> None:
+    """Block until an SSH session to `instance` succeeds, or raise.
+
+    `brev create` has its own internal readiness check, but on slow-boot
+    providers (8-GPU boxes, large container image pulls) it frequently
+    times out before the SSH daemon inside the instance is listening.
+    This polls with short-timeout SSH probes and refreshes Brev's SSH
+    config mid-loop in case the port changes (which it does when Brev
+    promotes an instance from the bootstrap-shim port to the real one).
+    """
+    import time
+
+    print(
+        f"+ waiting for {instance} SSH to become reachable (up to {max_wait_s}s)...",
+        flush=True,
+    )
+    deadline = time.time() + max_wait_s
+    last_err = ""
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        probe = subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                f"ConnectTimeout={probe_interval_s}",
+                *_SSH_OPTS,
+                instance,
+                "true",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode == 0:
+            print(f"+ {instance} SSH ready (attempt {attempt})", flush=True)
+            return
+        last_err = (probe.stderr or probe.stdout or "").strip().splitlines()[-1:] or [""]
+        last_err = last_err[0]
+        # Every ~minute, re-run `brev refresh` in case the SSH config
+        # needs updating (new port, new hostname).
+        if attempt % 4 == 0:
+            print(
+                f"+ {instance} still unreachable after {attempt} probes "
+                f"(last: {last_err}); refreshing brev config...",
+                flush=True,
+            )
+            try:
+                subprocess.run(["brev", "refresh"], check=False, capture_output=True, timeout=60)
+            except subprocess.TimeoutExpired:
+                pass
+        time.sleep(probe_interval_s)
+    raise RuntimeError(
+        f"SSH to {instance} never became reachable within {max_wait_s}s "
+        f"(last error: {last_err!r}). The instance may still be booting; "
+        f"try again, or check `brev ls` for its status."
+    )
 
 
 def _ensure_docker(instance: str, timeout_s: int = 420):
