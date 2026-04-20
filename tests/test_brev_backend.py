@@ -150,6 +150,74 @@ def test_instance_exists_handles_dict_with_null_instances():
         assert brev._instance_exists("x") is False
 
 
+# -- _wait_until_ssh_reachable --------------------------------------------
+
+
+def test_wait_until_ssh_reachable_returns_on_first_success(monkeypatch):
+    """First probe succeeds → helper returns immediately, no sleep."""
+    monkeypatch.setattr(brev, "_SSH_OPTS", [])
+    calls = []
+
+    def fake_run(cmd, *a, **kw):
+        calls.append(cmd)
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    sleeps = []
+    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        brev._wait_until_ssh_reachable("box", max_wait_s=60, probe_interval_s=1)
+
+    assert len(calls) == 1
+    assert calls[0][:1] == ["ssh"]
+    assert sleeps == []  # no retries needed
+
+
+def test_wait_until_ssh_reachable_raises_after_deadline(monkeypatch):
+    """SSH never reachable → raises with informative error."""
+    monkeypatch.setattr(brev, "_SSH_OPTS", [])
+    clock = [0.0]
+    monkeypatch.setattr("time.time", lambda: clock[0])
+    monkeypatch.setattr(
+        "time.sleep",
+        lambda s: clock.__setitem__(0, clock[0] + s),
+    )
+
+    def fake_run(cmd, *a, **kw):
+        return mock.Mock(returncode=255, stdout="", stderr="Connection refused")
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        with pytest.raises(RuntimeError, match="never became reachable"):
+            brev._wait_until_ssh_reachable("box", max_wait_s=5, probe_interval_s=1)
+
+
+def test_wait_until_ssh_reachable_refreshes_periodically(monkeypatch):
+    """Every 4 failed probes, `brev refresh` is invoked to re-fetch the
+    SSH config (port may have changed when the instance fully came up)."""
+    monkeypatch.setattr(brev, "_SSH_OPTS", [])
+    clock = [0.0]
+    monkeypatch.setattr("time.time", lambda: clock[0])
+    monkeypatch.setattr("time.sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+
+    call_log = []
+
+    def fake_run(cmd, *a, **kw):
+        call_log.append(cmd[0])
+        # SSH always fails; `brev refresh` succeeds.
+        if cmd[0] == "ssh":
+            return mock.Mock(returncode=255, stdout="", stderr="refused")
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        with pytest.raises(RuntimeError):
+            brev._wait_until_ssh_reachable("box", max_wait_s=10, probe_interval_s=1)
+
+    # Should have tried ssh at least 4 times; after every 4 we fire `brev refresh`.
+    ssh_probes = sum(1 for c in call_log if c == "ssh")
+    brev_refreshes = sum(1 for c in call_log if c == "brev")
+    assert ssh_probes >= 4
+    assert brev_refreshes >= 1
+
+
 # -- _require_brev_cli ----------------------------------------------------
 
 
@@ -626,6 +694,7 @@ def test_run_vm_docker_mode_end_to_end(tmp_path):
         _skip_onboarding=mock.DEFAULT,
         _instance_exists=mock.Mock(return_value=True),
         _refresh_ssh=mock.DEFAULT,
+        _wait_until_ssh_reachable=mock.DEFAULT,
         _ensure_docker=mock.DEFAULT,
         _rsync_up=mock.DEFAULT,
         _remote_has_nvidia=mock.Mock(return_value=True),
@@ -649,6 +718,7 @@ def test_run_vm_docker_mode_nonzero_exit_raises(tmp_path):
         _skip_onboarding=mock.DEFAULT,
         _instance_exists=mock.Mock(return_value=True),
         _refresh_ssh=mock.DEFAULT,
+        _wait_until_ssh_reachable=mock.DEFAULT,
         _ensure_docker=mock.DEFAULT,
         _rsync_up=mock.DEFAULT,
         _remote_has_nvidia=mock.Mock(return_value=False),
@@ -673,6 +743,7 @@ def test_run_vm_native_mode_end_to_end(tmp_path):
         _skip_onboarding=mock.DEFAULT,
         _instance_exists=mock.Mock(return_value=True),
         _refresh_ssh=mock.DEFAULT,
+        _wait_until_ssh_reachable=mock.DEFAULT,
         _rsync_up=mock.DEFAULT,
         _remote_has_nvidia=mock.Mock(return_value=False),
         _run_native=mock.Mock(return_value=0),
@@ -696,6 +767,7 @@ def test_run_container_mode_end_to_end(tmp_path):
         _skip_onboarding=mock.DEFAULT,
         _instance_exists=mock.Mock(return_value=True),
         _refresh_ssh=mock.DEFAULT,
+        _wait_until_ssh_reachable=mock.DEFAULT,
         _ensure_remote_rsync=mock.DEFAULT,
         _rsync_up=mock.DEFAULT,
         _run_container_mode=mock.Mock(return_value=0),
@@ -722,6 +794,7 @@ def test_run_creates_instance_when_auto_create(tmp_path):
         _instance_exists=mock.Mock(return_value=False),
         _create_instance=fake_create,
         _refresh_ssh=mock.DEFAULT,
+        _wait_until_ssh_reachable=mock.DEFAULT,
         _ensure_docker=mock.DEFAULT,
         _rsync_up=mock.DEFAULT,
         _remote_has_nvidia=mock.Mock(return_value=False),
