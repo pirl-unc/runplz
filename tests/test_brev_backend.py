@@ -411,16 +411,9 @@ def test_create_instance_container_mode_adds_image_flag(tmp_path):
     assert "pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime" in cmd
 
 
-def test_create_instance_container_mode_requires_from_registry(tmp_path):
-    cfg = BrevConfig(mode="container")
-    app = _app(tmp_path, cfg=cfg)
-    image = Image.from_dockerfile("Dockerfile")
-    fn = _function(app, image, module_file=_job_inside(tmp_path), gpu="T4")
-
-    with mock.patch("runplz.backends.brev._pick_instance_type", return_value="picked-type"):
-        with mock.patch("runplz.backends.brev._sh", lambda c: None):
-            with pytest.raises(RuntimeError, match="from_registry"):
-                brev._create_instance("x", cfg=cfg, image=image, function=fn)
+# `_create_instance` used to guard against Dockerfile + container mode
+# here; that's now rejected at function-decoration time by runplz.app
+# (see tests/test_runplz.py::test_function_rejects_dockerfile_image_on_container_mode).
 
 
 # -- _ensure_docker -------------------------------------------------------

@@ -118,14 +118,18 @@ All fields are validated at construction time — an invalid config raises
 | ------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `auto_create_instances`  | `True`  | If `--instance` points at a non-existent box, `brev create` it. Set `False` to hard-fail instead of auto-provisioning.                            |
 | `instance_type`          | `None`  | Pin a specific Brev instance type string (e.g. `"n1-standard-4:nvidia-tesla-t4:1"`). Skips the constraint-based picker.                           |
-| `mode`                   | `"vm"`  | `"vm"` = full Brev VM + docker-in-VM. `"container"` = the box IS the base image; runplz applies Image DSL ops inline over ssh (lighter, no DinD). |
+| `mode`                   | `"container"` | `"container"` (default) = the Brev box IS the base image; runplz applies Image DSL ops inline over ssh. Lighter, no DinD, sidesteps a known GPU+docker SSH-wedging bug. Requires `Image.from_registry(...)`. `"vm"` = full Brev VM + docker-in-VM; use when you need a user Dockerfile or the legacy native path. |
 | `use_docker`             | `True`  | VM-mode only. `False` skips docker and installs a native venv on the box. Legacy escape hatch for providers where container mode isn't available. |
 
-Invalid combinations (rejected at construction):
+Invalid combinations (raised eagerly):
 
-- `mode` not in `{"vm", "container"}`
-- `mode="container"` with `use_docker=False` (contradictory — the box *is* the image)
-- `instance_type=""` (must be a non-empty string or `None`)
+- `mode` not in `{"vm", "container"}` — at config construction
+- `mode="container"` with `use_docker=False` — at config construction (contradictory; the box *is* the image)
+- `instance_type=""` — at config construction
+- `mode="container"` with `Image.from_dockerfile(...)` — at Brev dispatch (container mode has no Dockerfile step)
+- `mode="vm", use_docker=False` with `Image.from_dockerfile(...)` — at Brev dispatch (native path ignores the Dockerfile)
+
+Image/mode checks fire at **Brev dispatch**, not at function decoration, so local/Modal users aren't constrained by the default Brev config on a shared `App`.
 
 ### ModalConfig
 
@@ -201,6 +205,24 @@ NVIDIA runtime via `docker info`.
 On brev, the constraints drive `brev search --sort price` and runplz picks
 the cheapest match. Override with `BrevConfig(instance_type="...")` when
 you need a specific shape.
+
+### Multiple functions, multiple shapes?
+
+Resources live on the `@app.function` (Modal-shaped), not on the `App`.
+Can different functions land on different hardware within one `App`?
+Depends on the backend:
+
+- **Modal**: yes — each `.remote()` schedules independently against Modal's
+  pool. A `cpu_prep()` and a `gpu_train()` on the same `App` can land on
+  completely different boxes.
+- **Brev**: no. One `runplz brev --instance my-box <script>` invocation
+  targets a single named Brev box. If you have multiple functions with
+  different specs, they all share that box. When `auto_create_instances=True`
+  and the box doesn't exist, the **first function that dispatches** determines
+  the provisioned shape — subsequent functions reuse it, even if their
+  specs would demand something bigger. Workaround: separate invocations
+  with different `--instance` names, or pre-create the box yourself.
+- **Local**: specs are ignored; your machine is your machine.
 
 ## Install
 

@@ -28,16 +28,20 @@ class BrevConfig:
     # constraints and the cheapest matching type is picked.
     instance_type: Optional[str] = None
     # Provisioning mode:
-    # - "vm" (default): `brev create` provisions a full VM with Brev's
-    #   sidecar stack (grafana, influxdb, jupyter, cloudflared). User code
-    #   runs inside `docker run --gpus all ...` on top of that.
-    # - "container": `brev create --mode container --container-image <base>`
-    #   where `<base>` comes from Image.from_registry(...). The box *is*
-    #   the user's image; our backend skips docker entirely and runs the
+    # - "container" (default): `brev create --mode container --container-image
+    #   <base>` where `<base>` comes from Image.from_registry(...). The box
+    #   *is* the user's image; our backend skips docker entirely and runs the
     #   declared apt/pip layer ops inline over ssh. Lighter host footprint
     #   and sidesteps the `docker run --gpus all` path that historically
     #   wedged SSH on Brev GPU boxes (see docs/brev-ssh-bug-report.md).
-    mode: str = "vm"
+    #   Requires Image.from_registry(...) — Dockerfile images don't
+    #   translate to inline installs.
+    # - "vm": `brev create` provisions a full VM with Brev's sidecar stack
+    #   (grafana, influxdb, jupyter, cloudflared). User code runs inside
+    #   `docker run --gpus all ...` on top of that. Use when you need a
+    #   user Dockerfile (`Image.from_dockerfile`) or the legacy native path
+    #   (`use_docker=False`).
+    mode: str = "container"
     # Legacy escape hatch for VM mode — skip docker, install the training
     # environment natively (apt + python3-venv + pip) and run the user's job
     # directly over ssh. Kept for boxes where mode="container" isn't an

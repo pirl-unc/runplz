@@ -63,6 +63,9 @@ def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out")
     _skip_onboarding()
 
     cfg = app.brev_config
+    from runplz.app import validate_image_vs_brev_mode
+
+    validate_image_vs_brev_mode(fn_name=function.name, image=function.image, brev_config=cfg)
     if not _instance_exists(instance):
         if cfg.auto_create_instances:
             _create_instance(instance, cfg=cfg, image=function.image, function=function)
@@ -199,16 +202,12 @@ def _run_container_mode(*, instance, function, rel_script, args, kwargs):
 def _render_ops_script(image) -> str:
     """Translate Image DSL ops into a bash script that runs them in
     sequence on the remote container-mode box. Idempotent: apt/pip on
-    already-present packages is a cheap no-op."""
-    if image.dockerfile is not None:
-        # Dockerfile-based images don't translate to inline ops. Caller
-        # must either switch to Image.from_registry(...) + DSL, or use
-        # mode="vm" with use_docker=True.
-        raise RuntimeError(
-            "BrevConfig(mode='container') requires Image.from_registry(...) "
-            "with DSL ops. Image.from_dockerfile() doesn't translate to "
-            "inline installs."
-        )
+    already-present packages is a cheap no-op.
+
+    The image is guaranteed to be `Image.from_registry(...)` — the
+    decoration-time validator in runplz.app rejects Dockerfile images
+    when `brev_config.mode == "container"`.
+    """
     lines = ["set -euo pipefail"]
     # Start on an apt-free note: wait for any apt from box bootstrap.
     lines.append(
@@ -520,11 +519,8 @@ def _create_instance(name: str, *, cfg=None, image=None, function=None):
     if function is not None and function.min_disk is not None:
         cmd += ["--min-disk", str(function.min_disk)]
     if cfg is not None and cfg.mode == "container":
-        if image is None or image.base is None:
-            raise RuntimeError(
-                "BrevConfig(mode='container') requires Image.from_registry(...) "
-                "so we know which container image to provision the box from."
-            )
+        # `image.base` is guaranteed to be set here — Dockerfile images are
+        # rejected at function-decoration time by runplz.app's validator.
         cmd += ["--mode", "container", "--container-image", image.base]
     _sh(cmd)
 
