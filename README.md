@@ -6,9 +6,9 @@ Tiny Modal-shaped job harness — one Python decoration, multiple backends.
 
 ```python
 # jobs/train.py
-from runplz import App, BrevConfig, Image
+from runplz import App, Image
 
-app = App("my-job", brev=BrevConfig())  # auto-creates the Brev box if missing
+app = App("my-job")  # default BrevConfig auto-creates the Brev box on first run
 
 image = (
     Image.from_registry("pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime")
@@ -104,9 +104,10 @@ All three have `app.bind(...)` equivalents (`instance=`, `build=False`,
 
 ## Backend config
 
-`App(..., brev=BrevConfig(...), modal=ModalConfig(...))`. Both default
-to instances of their respective config class, so you only pass one when
-you need to override something.
+`App(..., brev_config=BrevConfig(...), modal_config=ModalConfig(...))`.
+Both default to instances of their respective config class, so you only
+pass one when you need to override something — the headline example
+above omits both and relies on defaults.
 
 ### BrevConfig
 
@@ -131,7 +132,7 @@ Invalid combinations (rejected at construction):
 `ModalConfig()` is a no-op today. Modal reads auth from `~/.modal.toml`
 and schedules resources from `@app.function(gpu=..., cpu=..., memory=...)`;
 we don't expose Modal-specific knobs. The class exists as a slot in
-`App(modal=...)` so the signature doesn't break when fields are added.
+`App(modal_config=...)` so the signature doesn't break when fields are added.
 
 ### Why not one unified config?
 

@@ -65,8 +65,8 @@ class ModalConfig:
 
     Modal reads auth from `~/.modal.toml` and schedules resources from
     `@app.function(gpu=..., cpu=..., memory=...)`. This class exists as
-    a slot in `App(modal=...)` so we don't break the signature when we
-    add real fields. Until then, `ModalConfig()` is a no-op.
+    a slot in `App(modal_config=...)` so we don't break the signature
+    when we add real fields. Until then, `ModalConfig()` is a no-op.
     """
 
     pass
