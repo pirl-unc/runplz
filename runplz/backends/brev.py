@@ -488,7 +488,16 @@ def _instance_exists(name: str) -> bool:
         data = json.loads(r.stdout)
     except json.JSONDecodeError:
         return False
-    instances = data if isinstance(data, list) else data.get("instances", [])
+    # `brev ls --json` shape varies: list of instances, dict with an
+    # "instances" key, or null when the org has no instances at all.
+    if data is None:
+        return False
+    if isinstance(data, list):
+        instances = data
+    elif isinstance(data, dict):
+        instances = data.get("instances", []) or []
+    else:
+        return False
     return any(i.get("name") == name for i in instances)
 
 
