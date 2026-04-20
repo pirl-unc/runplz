@@ -493,6 +493,20 @@ def test_rsync_up_excludes_and_no_delete(tmp_path):
     assert "--exclude=out" in cmd
 
 
+def test_rsync_up_excludes_default_secret_files(tmp_path):
+    """Issue #18: a repo with .env / ssh keys / credentials.json must not
+    ship those to the remote box by default."""
+    from runplz._excludes import DEFAULT_TRANSFER_EXCLUDES
+
+    recorded = {}
+    with mock.patch("runplz.backends.brev._sh", lambda c: recorded.setdefault("c", c)):
+        brev._rsync_up(tmp_path, "my-box")
+
+    cmd = recorded["c"]
+    for pat in DEFAULT_TRANSFER_EXCLUDES:
+        assert f"--exclude={pat}" in cmd, f"missing --exclude={pat}"
+
+
 def test_rsync_down_runs_correct_cmd(tmp_path):
     recorded = {}
     with mock.patch("runplz.backends.brev._sh", lambda c: recorded.setdefault("c", c)):
@@ -686,8 +700,14 @@ def test_run_fails_when_instance_missing_without_auto_create(tmp_path):
     with mock.patch("runplz.backends.brev._require_brev_cli"):
         with mock.patch("runplz.backends.brev._skip_onboarding"):
             with mock.patch("runplz.backends.brev._instance_exists", return_value=False):
-                with pytest.raises(RuntimeError, match="not found"):
+                with pytest.raises(RuntimeError) as ei:
                     brev.run(app, fn, [], {}, instance="gone")
+
+    msg = str(ei.value)
+    assert "not found" in msg
+    # 3.3: surface the exact override so users don't grep the docs.
+    assert "auto_create_instances=True" in msg
+    assert "brev ls" in msg
 
 
 def test_run_vm_docker_mode_end_to_end(tmp_path):
@@ -716,9 +736,20 @@ def test_run_vm_docker_mode_end_to_end(tmp_path):
 
 
 def test_run_vm_docker_mode_nonzero_exit_raises(tmp_path):
+    """Issue #17: non-zero exit must surface the remote log tail in the
+    RuntimeError so users don't have to ssh in to see what actually broke."""
     cfg = BrevConfig(mode="vm", use_docker=True)
     app = _app(tmp_path, cfg=cfg)
     fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+
+    tail_output = "Traceback (most recent call last):\n  File 'x.py'\nRuntimeError: oops"
+
+    def fake_ssh_capture(instance, cmd):
+        # The _fetch_failure_tail helper issues `docker logs --tail N ...`
+        # for VM+docker mode. Return our canned tail to that call.
+        if "docker logs --tail" in cmd:
+            return tail_output
+        return ""
 
     with mock.patch.multiple(
         "runplz.backends.brev",
@@ -733,12 +764,186 @@ def test_run_vm_docker_mode_nonzero_exit_raises(tmp_path):
         _build_image=mock.DEFAULT,
         _run_container_detached=mock.DEFAULT,
         _stream_and_wait=mock.Mock(return_value=137),
-        _ssh_capture=mock.DEFAULT,
+        _ssh_capture=fake_ssh_capture,
         _rsync_down=mock.DEFAULT,
         _apply_on_finish=mock.DEFAULT,
     ):
-        with pytest.raises(RuntimeError, match="exited with status 137"):
+        with pytest.raises(RuntimeError) as ei:
             brev.run(app, fn, [], {}, instance="box")
+
+    msg = str(ei.value)
+    assert "exited with status 137" in msg
+    assert "RuntimeError: oops" in msg
+    assert "--- last" in msg and "lines of remote output ---" in msg
+
+
+def test_run_container_mode_nonzero_exit_includes_remote_log_tail(tmp_path):
+    """Container-mode tees bootstrap output to $HOME/.runplz-last.log;
+    _fetch_failure_tail tails that file when no docker container exists."""
+    cfg = BrevConfig(mode="container", on_finish="leave")
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(
+        app,
+        Image.from_registry("pytorch/pytorch:2.4.0"),
+        module_file=_job_inside(tmp_path),
+    )
+
+    tail_output = "ValueError: bad tensor shape"
+
+    def fake_ssh_capture(instance, cmd):
+        # Container-mode dispatch issues `tail -n N "$HOME/.runplz-last.log"`.
+        if ".runplz-last.log" in cmd:
+            return tail_output
+        return ""
+
+    with mock.patch.multiple(
+        "runplz.backends.brev",
+        _require_brev_cli=mock.DEFAULT,
+        _skip_onboarding=mock.DEFAULT,
+        _instance_exists=mock.Mock(return_value=True),
+        _refresh_ssh=mock.DEFAULT,
+        _wait_until_ssh_reachable=mock.DEFAULT,
+        _ensure_remote_rsync=mock.DEFAULT,
+        _rsync_up=mock.DEFAULT,
+        _run_container_mode=mock.Mock(return_value=1),
+        _ssh_capture=fake_ssh_capture,
+        _rsync_down=mock.DEFAULT,
+    ):
+        with mock.patch(
+            "runplz.backends.brev.subprocess.run",
+            return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+        ):
+            with pytest.raises(RuntimeError) as ei:
+                brev.run(app, fn, [], {}, instance="box")
+
+    msg = str(ei.value)
+    assert "exited with status 1" in msg
+    assert "ValueError: bad tensor shape" in msg
+
+
+def test_fetch_failure_tail_returns_empty_on_ssh_error():
+    """_fetch_failure_tail must never raise — the caller is already about
+    to raise the real error and we don't want to mask it."""
+
+    def boom(*a, **kw):
+        raise RuntimeError("ssh went away")
+
+    with mock.patch("runplz.backends.brev._ssh_capture", boom):
+        out = brev._fetch_failure_tail(instance="box", container_name=None)
+    # Helper swallows the error and returns a diagnostic string.
+    assert "could not fetch remote log tail" in out
+    assert "ssh went away" in out
+
+
+# -- max_runtime_seconds wall-clock cap (issue #16) -----------------------
+
+
+def test_raise_for_runtime_cap_kills_container_and_raises():
+    """VM+docker path: trip ⇒ docker kill + RuntimeError."""
+    calls = []
+
+    def fake_sub(cmd, *a, **kw):
+        calls.append(list(cmd))
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+        with pytest.raises(RuntimeError) as ei:
+            brev._raise_for_runtime_cap("box", 60, container_name="c-abc")
+
+    # Kill was attempted.
+    kill_cmds = [c for c in calls if any("docker kill" in tok for tok in c)]
+    assert kill_cmds, f"no docker kill issued; saw: {calls}"
+    assert any("c-abc" in tok for tok in kill_cmds[0])
+    # Error is clear about the cap.
+    assert "max_runtime_seconds=60" in str(ei.value)
+
+
+def test_raise_for_runtime_cap_pkills_bootstrap_in_native_or_container_mode():
+    """No container_name ⇒ pkill the bootstrap process tree."""
+    calls = []
+
+    def fake_sub(cmd, *a, **kw):
+        calls.append(list(cmd))
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+        with pytest.raises(RuntimeError):
+            brev._raise_for_runtime_cap("box", 30, container_name=None)
+
+    pkill_cmds = [c for c in calls if any("pkill" in tok for tok in c)]
+    assert pkill_cmds, f"no pkill issued; saw: {calls}"
+    assert any("runplz._bootstrap" in tok for tok in pkill_cmds[0])
+
+
+def test_run_container_mode_timeout_triggers_cap():
+    """A TimeoutExpired from the ssh subprocess in container-mode must route
+    through _raise_for_runtime_cap → RuntimeError."""
+
+    def fake_sub(cmd, *a, **kw):
+        # Only the bootstrap ssh call has timeout set; that's the one we
+        # want to simulate expiring. Other ssh calls (pkill cleanup) are
+        # fine.
+        if kw.get("timeout") is not None:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kw["timeout"])
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    fn = types.SimpleNamespace(
+        name="train",
+        image=Image.from_registry("ubuntu:22.04"),
+        env={},
+    )
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+        with mock.patch("runplz.backends.brev._render_ops_script", return_value=""):
+            with pytest.raises(RuntimeError, match="max_runtime_seconds=5"):
+                brev._run_container_mode(
+                    instance="box",
+                    function=fn,
+                    rel_script="jobs/j.py",
+                    args=[],
+                    kwargs={},
+                    max_runtime_seconds=5,
+                )
+
+
+def test_stream_and_wait_raises_when_cap_exceeded():
+    """_stream_and_wait should trip the cap when docker logs -f keeps
+    streaming past the deadline."""
+
+    def fake_sub(cmd, *a, **kw):
+        # Simulate a never-ending logs stream: the `docker logs -f` ssh
+        # call (has timeout=remaining_s) expires.
+        if "docker logs -f" in " ".join(cmd):
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kw.get("timeout", 0))
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+        with pytest.raises(RuntimeError, match="max_runtime_seconds=2"):
+            brev._stream_and_wait("box", "container-xyz", max_runtime_seconds=2)
+
+
+def test_stream_and_wait_no_cap_passes_none_timeout():
+    """Regression: when max_runtime_seconds is None, the ssh subprocess.run
+    call must get timeout=None (not 0, not a negative number), so normal
+    long jobs aren't killed."""
+    seen_timeouts = []
+
+    def fake_sub(cmd, *a, **kw):
+        if "docker logs -f" in " ".join(cmd):
+            seen_timeouts.append(kw.get("timeout"))
+            # Pretend the container stopped immediately after this.
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        if "docker inspect" in " ".join(cmd):
+            # _container_running should see False → loop breaks.
+            return mock.Mock(returncode=0, stdout="false", stderr="")
+        if "docker wait" in " ".join(cmd):
+            return mock.Mock(returncode=0, stdout="0", stderr="")
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+        exit_code = brev._stream_and_wait("box", "c-1", max_runtime_seconds=None)
+
+    assert exit_code == 0
+    assert seen_timeouts == [None], f"expected None, got {seen_timeouts}"
 
 
 def test_run_vm_native_mode_end_to_end(tmp_path):

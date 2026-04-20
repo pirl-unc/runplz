@@ -18,9 +18,19 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from runplz._excludes import DEFAULT_TRANSFER_EXCLUDES
+
 REMOTE_REPO_DIR = "runplz-repo"
 REMOTE_OUT_DIR = "runplz-out"
 REMOTE_IMAGE_TAG = "runplz-train:brev"
+
+# container-mode / native paths tee the bootstrap's combined stdout+stderr
+# into this file so we can `tail` it for failure context (issue #17). Lives
+# under $HOME so no sudo needed and survives across ssh reconnects.
+REMOTE_LAST_LOG = ".runplz-last.log"
+
+# How many lines of remote log to include in a failure RuntimeError.
+FAILURE_TAIL_LINES = 50
 
 # Brev's ~/.brev/ssh_config sets `ControlMaster auto` (connection
 # multiplexing). That's fast for short repeated calls but catastrophic
@@ -70,12 +80,17 @@ def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out")
         if cfg.auto_create_instances:
             _create_instance(instance, cfg=cfg, image=function.image, function=function)
         else:
+            # Default path (auto_create_instances=False). A typoed --instance
+            # name used to silently provision a brand-new billed box; now we
+            # stop and make the user confirm the name OR opt into auto-create.
             raise RuntimeError(
-                f"Brev instance {instance!r} not found and "
-                f"BrevConfig(auto_create_instances=False). "
-                f"Create it first (e.g. `brev create {instance} --type <TYPE>` for vm mode, "
-                f"or `brev create {instance} --mode container --type <TYPE> "
-                f"--container-image <IMAGE>` for container mode)."
+                f"Brev instance {instance!r} not found. Nothing was created.\n"
+                f"  - If you mistyped the name, run `brev ls` to see your boxes.\n"
+                f"  - If you want runplz to create it for you, pass "
+                f"`BrevConfig(auto_create_instances=True)` on your App.\n"
+                f"  - Or pre-create it yourself: "
+                f"`brev create {instance} --mode container --type <TYPE> "
+                f"--container-image <IMAGE>` (or --type <TYPE> for vm mode)."
             )
     _refresh_ssh()
     # `brev create` has its own internal wait-for-ready loop, but on some
@@ -110,6 +125,7 @@ def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out")
                 rel_script=str(rel_script),
                 args=args,
                 kwargs=kwargs,
+                max_runtime_seconds=cfg.max_runtime_seconds,
             )
         elif cfg.use_docker:
             _ensure_docker(instance)
@@ -125,7 +141,9 @@ def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out")
                 kwargs=kwargs,
                 gpu_flag=gpu_flag,
             )
-            exit_code = _stream_and_wait(instance, container_name)
+            exit_code = _stream_and_wait(
+                instance, container_name, max_runtime_seconds=cfg.max_runtime_seconds
+            )
         else:
             # Legacy native path. Skips docker; installs python + torch +
             # user code into a venv on a plain VM-mode Brev box. Use this only
@@ -137,9 +155,20 @@ def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out")
                 args=args,
                 kwargs=kwargs,
                 has_nvidia=_remote_has_nvidia(instance),
+                max_runtime_seconds=cfg.max_runtime_seconds,
             )
         _rsync_down(instance, host_out)
     finally:
+        # Fetch a log tail BEFORE container/box cleanup — afterwards the
+        # logs are gone (docker rm wipes container state; brev stop/delete
+        # makes the box unreachable). Only do this on failure; no need to
+        # round-trip on the success path.
+        failure_tail = ""
+        if exit_code is not None and exit_code != 0:
+            failure_tail = _fetch_failure_tail(
+                instance=instance,
+                container_name=container_name,
+            )
         # Container cleanup first (while the box is definitely up), then
         # the box itself per cfg.on_finish. Both are best-effort so a
         # failure in cleanup doesn't mask the real error from the try block.
@@ -153,7 +182,43 @@ def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out")
                 print(f"+ warning: failed to remove container {container_name}: {exc}", flush=True)
         _apply_on_finish(instance=instance, cfg=cfg)
     if exit_code != 0:
-        raise RuntimeError(f"Remote run exited with status {exit_code}")
+        msg = f"Remote run exited with status {exit_code}"
+        if failure_tail:
+            msg += (
+                f"\n--- last {FAILURE_TAIL_LINES} lines of remote output ---\n"
+                f"{failure_tail}\n"
+                f"--- end remote output ---"
+            )
+        raise RuntimeError(msg)
+
+
+def _fetch_failure_tail(*, instance: str, container_name: Optional[str]) -> str:
+    """Fetch the last N lines of remote output for a failed run.
+
+    Two sources:
+    - VM + docker path (`container_name` is set): `docker logs --tail N
+      <name>`. Docker persists logs until `docker rm`, so this works even
+      after a crash.
+    - container-mode + native paths: the bootstrap's combined stdout+stderr
+      was teed into `$HOME/{REMOTE_LAST_LOG}` during the run. `tail` that.
+
+    Best-effort: if ssh is wedged or the log file isn't there, return an
+    empty string rather than masking the original error with a tail-fetch
+    traceback.
+    """
+    try:
+        if container_name is not None:
+            cmd = f"sudo docker logs --tail {FAILURE_TAIL_LINES} {container_name} 2>&1"
+        else:
+            cmd = (
+                f'if [ -f "$HOME/{REMOTE_LAST_LOG}" ]; then '
+                f'tail -n {FAILURE_TAIL_LINES} "$HOME/{REMOTE_LAST_LOG}"; '
+                f"fi"
+            )
+        out = _ssh_capture(instance, cmd)
+        return (out or "").rstrip()
+    except Exception as exc:  # noqa: BLE001
+        return f"[runplz: could not fetch remote log tail — {type(exc).__name__}: {exc}]"
 
 
 def _apply_on_finish(*, instance: str, cfg) -> None:
@@ -209,7 +274,7 @@ def _ensure_remote_rsync(instance: str):
     _ssh(instance, cmd)
 
 
-def _run_container_mode(*, instance, function, rel_script, args, kwargs):
+def _run_container_mode(*, instance, function, rel_script, args, kwargs, max_runtime_seconds=None):
     """Brev `--mode container`: the SSH box IS the user's container image.
 
     Runs the user's Image DSL ops (apt_install, pip_install, ...) inline
@@ -241,9 +306,18 @@ def _run_container_mode(*, instance, function, rel_script, args, kwargs):
         # cd to the rsync'd repo so user-level `subprocess.run(["bash",
         # "scripts/..."])` calls with relative paths find their scripts.
         f'cd "$HOME/{REMOTE_REPO_DIR}"; '
-        "python -m runplz._bootstrap"
+        # Tee combined stdout+stderr to a remote file so we can tail it for
+        # failure context (issue #17). `pipefail` + `set -e` above ensure the
+        # bootstrap's exit code (not tee's) is what escapes this block.
+        f'python -m runplz._bootstrap 2>&1 | tee "$HOME/{REMOTE_LAST_LOG}"'
     )
-    r = subprocess.run(["ssh", *_SSH_OPTS, instance, f"bash -lc {shlex.quote(remote)}"])
+    try:
+        r = subprocess.run(
+            ["ssh", *_SSH_OPTS, instance, f"bash -lc {shlex.quote(remote)}"],
+            timeout=max_runtime_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        _raise_for_runtime_cap(instance, max_runtime_seconds, container_name=None)
     return r.returncode
 
 
@@ -301,7 +375,9 @@ def _render_ops_script(image) -> str:
     return "; ".join(lines)
 
 
-def _run_native(*, instance, function, rel_script, args, kwargs, has_nvidia):
+def _run_native(
+    *, instance, function, rel_script, args, kwargs, has_nvidia, max_runtime_seconds=None
+):
     """Install user code natively and run the job over ssh.
 
     Two ssh sessions: (1) idempotent setup — wait for Brev's own apt, then
@@ -347,10 +423,48 @@ def _run_native(*, instance, function, rel_script, args, kwargs, has_nvidia):
         f"{user_env_exports} "
         'mkdir -p "$RUNPLZ_OUT"; '
         f'cd "$HOME/{REMOTE_REPO_DIR}"; '
-        "python -m runplz._bootstrap"
+        # Tee output to a remote log file for failure-tail capture (#17).
+        f'python -m runplz._bootstrap 2>&1 | tee "$HOME/{REMOTE_LAST_LOG}"'
     )
-    r = subprocess.run(["ssh", *_SSH_OPTS, instance, f"bash -lc {shlex.quote(remote)}"])
+    try:
+        r = subprocess.run(
+            ["ssh", *_SSH_OPTS, instance, f"bash -lc {shlex.quote(remote)}"],
+            timeout=max_runtime_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        _raise_for_runtime_cap(instance, max_runtime_seconds, container_name=None)
     return r.returncode
+
+
+def _raise_for_runtime_cap(instance: str, cap_s, container_name):
+    """Shared timeout-path cleanup + raise for issue #16.
+
+    container_name: set for VM+docker mode (kill the container with docker kill);
+    None for container-mode / native (pkill the bootstrap process tree).
+
+    Best-effort cleanup: if the kill ssh hangs or fails, still raise — the
+    on_finish action in run()'s finally block will nuke the box anyway.
+    """
+    if container_name is not None:
+        cleanup = f"sudo docker kill {container_name}"
+    else:
+        cleanup = "pkill -f 'runplz._bootstrap' || true"
+    try:
+        subprocess.run(
+            ["ssh", *_SSH_OPTS, instance, cleanup],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    raise RuntimeError(
+        f"Remote run exceeded max_runtime_seconds={cap_s}; "
+        f"issued remote cleanup ({cleanup!r}). "
+        f"Raise or remove BrevConfig.max_runtime_seconds if the job "
+        f"legitimately needs longer."
+    )
 
 
 def _build_image(instance: str, image):
@@ -407,7 +521,12 @@ def _run_container_detached(
     _ssh(instance, start)
 
 
-def _stream_and_wait(instance: str, container_name: str, max_reconnects: int = 20) -> int:
+def _stream_and_wait(
+    instance: str,
+    container_name: str,
+    max_reconnects: int = 20,
+    max_runtime_seconds: Optional[int] = None,
+) -> int:
     """Stream container logs and return its exit code.
 
     `docker logs -f` exits when the container stops, so we loop across SSH
@@ -415,20 +534,38 @@ def _stream_and_wait(instance: str, container_name: str, max_reconnects: int = 2
     pick up where we left off, then call `docker wait` for the exit code.
     Gives up after `max_reconnects` consecutive reconnect attempts so we
     don't loop forever if the box is permanently unreachable.
+
+    `max_runtime_seconds` is the user-set wall-clock cap (issue #16).
+    Tracked across reconnects so a job that keeps streaming can't dodge
+    it. On trip we `docker kill` the container and raise.
     """
     print(f"+ streaming logs from {container_name} (resilient to reconnects)", flush=True)
+    started = time.monotonic()
+
+    def _remaining_s() -> Optional[float]:
+        if max_runtime_seconds is None:
+            return None
+        left = max_runtime_seconds - (time.monotonic() - started)
+        return max(1.0, left)
+
     tail = "all"
     reconnects = 0
     while True:
         cmd = f"sudo docker logs -f --tail {tail} {container_name}"
-        r = subprocess.run(
-            ["ssh", *_SSH_OPTS, instance, cmd],
-        )
+        try:
+            r = subprocess.run(
+                ["ssh", *_SSH_OPTS, instance, cmd],
+                timeout=_remaining_s(),
+            )
+        except subprocess.TimeoutExpired:
+            _raise_for_runtime_cap(instance, max_runtime_seconds, container_name=container_name)
         # Container may have exited cleanly (rc=0) or ssh may have dropped.
         # Either way, check whether the container is still running.
         running = _container_running(instance, container_name)
         if not running:
             break
+        if max_runtime_seconds is not None and (time.monotonic() - started) >= max_runtime_seconds:
+            _raise_for_runtime_cap(instance, max_runtime_seconds, container_name=container_name)
         reconnects += 1
         if reconnects > max_reconnects:
             print(
@@ -766,21 +903,17 @@ def _rsync_up(repo: Path, instance: str):
     # ~/runplz-repo/ (logs, probe scripts, local edits) shouldn't have those
     # wiped by the next run. Stale files on the remote are cheap; accidental
     # user-data loss is not.
-    _sh(
-        [
-            "rsync",
-            "-az",
-            "--exclude=.git",
-            "--exclude=.venv",
-            "--exclude=__pycache__",
-            "--exclude=*.egg-info",
-            "--exclude=build",
-            "--exclude=dist",
-            "--exclude=out",
-            f"{repo}/",
-            f"{instance}:{REMOTE_REPO_DIR}/",
-        ]
-    )
+    cmd = ["rsync", "-az"]
+    # Noise: cache + build directories that make the remote repo messy
+    # without being useful.
+    for pat in (".git", ".venv", "__pycache__", "*.egg-info", "build", "dist", "out"):
+        cmd.append(f"--exclude={pat}")
+    # Safety: never ship local secrets / dotenv / SSH keys to a remote box.
+    # See runplz/_excludes.py for the rationale.
+    for pat in DEFAULT_TRANSFER_EXCLUDES:
+        cmd.append(f"--exclude={pat}")
+    cmd.extend([f"{repo}/", f"{instance}:{REMOTE_REPO_DIR}/"])
+    _sh(cmd)
 
 
 def _rsync_down(instance: str, local_out: Path):
