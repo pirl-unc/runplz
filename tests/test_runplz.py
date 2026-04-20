@@ -83,16 +83,17 @@ def test_render_ops_script_uses_shlex_quote_for_packages():
     assert 'pip install --quiet -e "$HOME/runplz-repo"' in script
 
 
-def test_render_ops_script_rejects_dockerfile_image():
-    with pytest.raises(RuntimeError, match="from_dockerfile"):
-        _render_ops_script(Image.from_dockerfile("docker/Dockerfile.train"))
+# `_render_ops_script` is never reached with a Dockerfile image — the
+# Function-level validator in runplz.app rejects that combo at decoration
+# time (see test_function_rejects_dockerfile_image_on_container_mode below).
 
 
 # ---- BrevConfig validation (at construction time) ------------------------
 
 
-def test_brev_default_constructs_ok():
-    BrevConfig()  # does not raise
+def test_brev_default_constructs_ok_and_uses_container_mode():
+    cfg = BrevConfig()  # does not raise
+    assert cfg.mode == "container"
 
 
 def test_brev_rejects_unknown_mode():
@@ -417,6 +418,70 @@ def test_function_rejects_empty_gpu_string():
         @app.function(image=_sample_image(), gpu="")
         def train():
             pass
+
+
+# ---- Brev dispatch-time image vs mode validation -------------------------
+# These checks live in the Brev backend's run() (not at decoration) so that
+# local/modal users aren't forced to set brev_config just to use a Dockerfile
+# image. Local/modal dispatch ignores brev_config entirely.
+
+
+def test_validate_image_vs_brev_mode_rejects_dockerfile_on_container():
+    from runplz.app import validate_image_vs_brev_mode
+
+    with pytest.raises(ValueError, match="mode='container'"):
+        validate_image_vs_brev_mode(
+            fn_name="train",
+            image=Image.from_dockerfile("Dockerfile"),
+            brev_config=BrevConfig(mode="container"),
+        )
+
+
+def test_validate_image_vs_brev_mode_rejects_dockerfile_on_vm_native():
+    from runplz.app import validate_image_vs_brev_mode
+
+    with pytest.raises(ValueError, match="use_docker=False"):
+        validate_image_vs_brev_mode(
+            fn_name="train",
+            image=Image.from_dockerfile("Dockerfile"),
+            brev_config=BrevConfig(mode="vm", use_docker=False),
+        )
+
+
+def test_validate_image_vs_brev_mode_allows_dockerfile_on_vm_docker():
+    from runplz.app import validate_image_vs_brev_mode
+
+    # Returns None, no raise.
+    validate_image_vs_brev_mode(
+        fn_name="train",
+        image=Image.from_dockerfile("Dockerfile"),
+        brev_config=BrevConfig(mode="vm", use_docker=True),
+    )
+
+
+def test_validate_image_vs_brev_mode_allows_registry_on_container():
+    from runplz.app import validate_image_vs_brev_mode
+
+    validate_image_vs_brev_mode(
+        fn_name="train",
+        image=Image.from_registry("ubuntu:22.04"),
+        brev_config=BrevConfig(mode="container"),
+    )
+
+
+def test_local_backend_accepts_dockerfile_with_default_container_mode(tmp_path):
+    """Regression: using Image.from_dockerfile with a local-only App must not
+    be blocked just because the (unused) default brev_config is mode='container'.
+    """
+    app = App("t")  # defaults: brev_config.mode == "container"
+
+    # Function decoration must succeed — the image/mode check only fires when
+    # actually dispatching to Brev.
+    @app.function(image=Image.from_dockerfile("Dockerfile"))
+    def train():
+        pass
+
+    assert "train" in app.functions
 
 
 # ---- CLI tightened flag/backend enforcement -----------------------------

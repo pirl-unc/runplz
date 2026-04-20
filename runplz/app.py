@@ -243,6 +243,32 @@ def _repo_root_for(script_path: Path) -> Path:
     return script_path.parent
 
 
+def validate_image_vs_brev_mode(*, fn_name: str, image: Image, brev_config: BrevConfig):
+    """Catch image/Brev-mode mismatches before we ssh anywhere.
+
+    Called from the Brev backend's `run()` entrypoint — not at function
+    decoration — because local/modal users shouldn't be constrained by
+    the Brev config on a shared App. A Dockerfile image is fine with
+    Modal and local regardless of what `brev_config.mode` says.
+    """
+    if image.dockerfile is None:
+        return  # registry-based images work with every mode
+    if brev_config.mode == "container":
+        raise ValueError(
+            f"@app.function({fn_name}): BrevConfig(mode='container') requires "
+            f"Image.from_registry(...). Image.from_dockerfile(...) can't "
+            f"translate to inline installs on a container-mode Brev box. "
+            f"Either switch the image to Image.from_registry(...) + DSL ops, "
+            f"or set brev_config=BrevConfig(mode='vm')."
+        )
+    if brev_config.mode == "vm" and not brev_config.use_docker:
+        raise ValueError(
+            f"@app.function({fn_name}): BrevConfig(mode='vm', use_docker=False) "
+            f"runs the function natively over ssh and ignores any Dockerfile. "
+            f"Use Image.from_registry(...) or flip use_docker=True."
+        )
+
+
 def _validate_resources(
     *,
     fn_name: str,
