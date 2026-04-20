@@ -53,7 +53,14 @@ def main(argv=None):
         default="out",
         help="Host directory to collect outputs into (default: out/).",
     )
-    p.add_argument("--instance", help="[brev] Brev instance name.")
+    p.add_argument(
+        "--instance",
+        help=(
+            "[brev] Brev instance name. Omit for ephemeral mode: runplz "
+            "auto-creates a box sized to your function's specs and deletes "
+            "it on exit."
+        ),
+    )
     p.add_argument(
         "--host",
         help="[ssh] SSH endpoint (hostname, user@host, or ~/.ssh/config alias).",
@@ -75,8 +82,7 @@ def main(argv=None):
     app._backend_kwargs = {"outputs_dir": args.outputs_dir}
 
     if args.backend == "brev":
-        if not args.instance:
-            p.error("--instance is required for the brev backend")
+        # args.instance can legitimately be None now — triggers ephemeral mode.
         app._backend_kwargs["instance"] = args.instance
     elif args.instance:
         p.error(f"--instance only applies to the brev backend (got {args.backend!r}).")

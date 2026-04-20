@@ -27,7 +27,9 @@ def test_cli_script_not_found_errors(tmp_path, capsys):
     assert "script not found" in err
 
 
-def test_cli_brev_requires_instance(tmp_path, capsys):
+def test_cli_brev_without_instance_threads_none_for_ephemeral(tmp_path):
+    """3.6: `runplz brev script.py` without --instance is valid now; the
+    backend interprets instance=None as ephemeral mode."""
     script = _write_job(
         tmp_path,
         """
@@ -43,9 +45,13 @@ def test_cli_brev_requires_instance(tmp_path, capsys):
         def main(): fn.remote()
         """,
     )
-    with pytest.raises(SystemExit):
+    captured = {}
+    with mock.patch(
+        "runplz.backends.brev.run",
+        lambda app, function, args, kwargs, **kw: captured.update({"kw": kw}),
+    ):
         _cli.main(["brev", str(script)])
-    assert "--instance is required" in capsys.readouterr().err
+    assert captured["kw"]["instance"] is None
 
 
 def test_cli_rejects_script_with_no_app(tmp_path):

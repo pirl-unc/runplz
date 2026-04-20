@@ -10,8 +10,11 @@ managed SSH config (`brev refresh` populates ~/.brev/ssh_config, which
 ~/.ssh/config Includes).
 """
 
+import dataclasses
 import json
+import re
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -51,6 +54,25 @@ _ = (  # noqa: F841 — held for test-mocking compatibility
 __all__ = ["run"]
 
 
+# Brev instance names must be slug-ish. Lowercase, ASCII, hyphen-separated.
+# Some providers cap names around 30-40 chars; keep the generated part short
+# enough that typical app/function names fit comfortably.
+_BREV_NAME_SAFE_RE = re.compile(r"[^a-z0-9-]+")
+
+
+def _make_ephemeral_name(app_name: str, fn_name: str) -> str:
+    """Generate a Brev-safe instance name for an ephemeral run.
+
+    Shape: ``runplz-<app>-<fn>-<uuid8>``. Trailing uuid makes the name
+    unique per dispatch so two concurrent runs don't collide.
+    """
+
+    def _slug(s: str) -> str:
+        return _BREV_NAME_SAFE_RE.sub("-", s.lower()).strip("-") or "x"
+
+    return f"runplz-{_slug(app_name)}-{_slug(fn_name)}-{uuid.uuid4().hex[:8]}"
+
+
 # Brev's CLI hangs on an interactive walkthrough once an instance exists in the
 # org, blocking `brev ls`/`brev refresh`. Overwriting this file with the
 # completed state skips it. The file lives under the user's home — cheap and
@@ -63,7 +85,15 @@ _BREV_ONBOARDING_DONE = {
 }
 
 
-def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out"):
+def run(
+    app,
+    function,
+    args,
+    kwargs,
+    *,
+    instance: Optional[str] = None,
+    outputs_dir: str = "out",
+):
     _require_brev_cli()
     _skip_onboarding()
 
@@ -71,6 +101,24 @@ def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out")
     from runplz.app import validate_image_vs_brev_mode
 
     validate_image_vs_brev_mode(fn_name=function.name, image=function.image, brev_config=cfg)
+
+    # Ephemeral mode: no name pinned by the caller. Generate one, force
+    # auto-create (there's nothing existing to target), and switch on_finish
+    # to "delete" so we don't leak a billed stopped box — nothing will
+    # ever reuse this name. If the user has explicitly asked for "leave"
+    # they're probably debugging; respect that.
+    if instance is None:
+        instance = _make_ephemeral_name(app.name, function.name)
+        overrides = {"auto_create_instances": True}
+        if cfg.on_finish == "stop":
+            overrides["on_finish"] = "delete"
+        cfg = dataclasses.replace(cfg, **overrides)
+        print(
+            f"+ ephemeral mode: instance={instance!r}, "
+            f"auto_create_instances=True, on_finish={cfg.on_finish!r}",
+            flush=True,
+        )
+
     if not _instance_exists(instance):
         if cfg.auto_create_instances:
             _create_instance(instance, cfg=cfg, image=function.image, function=function)
@@ -87,6 +135,10 @@ def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out")
                 f"`brev create {instance} --mode container --type <TYPE> "
                 f"--container-image <IMAGE>` (or --type <TYPE> for vm mode)."
             )
+    else:
+        # Existing instance — may have been stopped by a previous run's
+        # `on_finish="stop"`. Resume it before we try to SSH.
+        _start_instance_if_stopped(instance)
     _refresh_ssh()
     # `brev create` has its own internal wait-for-ready loop, but on some
     # providers (8-GPU boxes, slow pull of large container images) that
@@ -244,6 +296,91 @@ def _instance_exists(name: str) -> bool:
             f"Refusing to continue (see _instance_exists docstring)."
         )
     return any(i.get("name") == name for i in instances)
+
+
+# Field names we accept when pulling a power-state string out of a
+# `brev ls --json` row. Brev has used more than one over time.
+_BREV_STATUS_FIELDS = ("status", "state", "power_state", "lifecycle_status")
+
+# Status values treated as "needs a `brev start` first." Lower-cased for
+# case-insensitive matching.
+_BREV_STOPPED_STATES = {"stopped", "paused", "hibernated", "suspended"}
+
+
+def _instance_status(name: str) -> Optional[str]:
+    """Return the raw status string for `name` from `brev ls --json`, or
+    None if the instance isn't listed or no recognized status field is
+    present. Best-effort — used only to decide whether we need to call
+    `brev start` before SSH."""
+    try:
+        r = subprocess.run(["brev", "ls", "--json"], capture_output=True, text=True, timeout=60)
+    except Exception:  # noqa: BLE001
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None
+    if data is None:
+        return None
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        rows = data.get("instances", []) or []
+    else:
+        return None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("name") != name:
+            continue
+        for key in _BREV_STATUS_FIELDS:
+            v = row.get(key)
+            if v:
+                return str(v)
+        return None
+    return None
+
+
+def _start_instance_if_stopped(name: str) -> None:
+    """If the Brev box for `name` is in a stopped / paused state, run
+    `brev start` before the dispatch tries to SSH.
+
+    The 3.2 default of `on_finish="stop"` means every previous runplz run
+    leaves the box powered off — without this, the next run silently hangs
+    in `_wait_until_ssh_reachable` until the 20-minute deadline. Best-
+    effort: if Brev's schema doesn't expose a status we can recognize, we
+    skip and let the SSH reachability loop figure it out (or time out).
+    """
+    status = _instance_status(name)
+    if status is None:
+        return
+    if status.strip().lower() not in _BREV_STOPPED_STATES:
+        return
+    print(f"+ instance {name!r} is {status!r}; running `brev start {name}`", flush=True)
+    try:
+        r = subprocess.run(
+            ["brev", "start", name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"+ warning: `brev start {name}` raised {type(exc).__name__}: {exc}. "
+            f"SSH reachability probe will decide whether to continue.",
+            flush=True,
+        )
+        return
+    if r.returncode != 0:
+        print(
+            f"+ warning: `brev start {name}` exited {r.returncode}. "
+            f"stderr: {(r.stderr or '').strip()[:500]}. "
+            f"SSH reachability probe will decide whether to continue.",
+            flush=True,
+        )
 
 
 def _create_instance(name: str, *, cfg=None, image=None, function=None):
@@ -416,6 +553,9 @@ def _pick_instance_type(function) -> Optional[str]:
     cmd = ["brev", "search", mode, "--json", "--sort", "price"]
     if function.gpu:
         cmd += ["--gpu-name", _brev_gpu_name(function.gpu)]
+    num_gpus = getattr(function, "num_gpus", 1) or 1
+    if num_gpus > 1:
+        cmd += ["--min-gpus", str(num_gpus)]
     if function.min_gpu_memory is not None:
         cmd += ["--min-vram", str(function.min_gpu_memory)]
     if function.min_cpu is not None:

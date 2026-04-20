@@ -124,7 +124,9 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
     # (e.g. "A100-80GB"). Translate our min_gpu_memory constraint onto the
     # gpu string when set; leave the gpu string alone if it already carries
     # a size suffix.
-    modal_gpu = _modal_gpu_string(function.gpu, function.min_gpu_memory)
+    modal_gpu = _modal_gpu_string(
+        function.gpu, function.min_gpu_memory, getattr(function, "num_gpus", 1) or 1
+    )
 
     if function.min_disk is not None:
         # Issue #20: the previous `print()` let users believe their disk
@@ -214,24 +216,28 @@ def _check_output_blob_size(blob_path: str) -> None:
         )
 
 
-_MODAL_GPU_SUFFIX_RE = re.compile(r"-\d+GB$", re.IGNORECASE)
+_MODAL_GPU_VRAM_RE = re.compile(r"-\d+GB\b", re.IGNORECASE)
+_MODAL_GPU_COUNT_RE = re.compile(r":\d+$")
 
 
-def _modal_gpu_string(gpu, min_gpu_memory):
-    """Translate our (gpu, min_gpu_memory) pair into Modal's gpu string.
+def _modal_gpu_string(gpu, min_gpu_memory, num_gpus: int = 1):
+    """Translate (gpu, min_gpu_memory, num_gpus) into Modal's gpu string.
 
-    Modal expresses GPU memory by baking a suffix into the gpu string
-    (e.g. "A100-80GB"). If the user already pinned a size ("A100-80GB"),
-    respect it. Otherwise, when `min_gpu_memory` is set, append a "-NGB"
-    suffix so Modal schedules onto a box with at least that VRAM.
+    Modal's gpu string encodes VRAM as a "-NGB" suffix ("A100-80GB") and
+    count as a ":N" suffix ("A100-80GB:4"). We build the string VRAM-first
+    then count-last; if the user already pinned either suffix we leave it
+    alone (explicit wins over our augmentation).
     """
     if gpu is None:
         return None
-    if min_gpu_memory is None:
-        return gpu
-    if _MODAL_GPU_SUFFIX_RE.search(gpu):
-        return gpu
-    return f"{gpu}-{int(min_gpu_memory)}GB"
+    result = gpu
+    # VRAM check scans anywhere in the string so "A100-80GB:2" is recognized
+    # as already-sized even though the ":2" count suffix sits at the end.
+    if min_gpu_memory is not None and not _MODAL_GPU_VRAM_RE.search(result):
+        result = f"{result}-{int(min_gpu_memory)}GB"
+    if num_gpus > 1 and not _MODAL_GPU_COUNT_RE.search(result):
+        result = f"{result}:{int(num_gpus)}"
+    return result
 
 
 def _render_modal_image(image, *, repo: Path) -> str:

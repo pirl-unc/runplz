@@ -36,6 +36,24 @@ def test_modal_gpu_string_respects_existing_suffix():
     assert modal_backend._modal_gpu_string("L4-24gb", 16) == "L4-24gb"
 
 
+def test_modal_gpu_string_appends_count_when_num_gpus_gt_1():
+    """3.6: num_gpus > 1 maps to Modal's `:N` count suffix."""
+    assert modal_backend._modal_gpu_string("A100", None, 4) == "A100:4"
+    assert modal_backend._modal_gpu_string("A100", 80, 4) == "A100-80GB:4"
+    assert modal_backend._modal_gpu_string("H100", None, 8) == "H100:8"
+
+
+def test_modal_gpu_string_respects_existing_count_suffix():
+    # User pinned "A100:2" already — don't double-suffix.
+    assert modal_backend._modal_gpu_string("A100-80GB:2", 80, 4) == "A100-80GB:2"
+
+
+def test_modal_gpu_string_num_gpus_one_omits_count():
+    # Default num_gpus=1 shouldn't add ":1" noise.
+    assert modal_backend._modal_gpu_string("A100", None, 1) == "A100"
+    assert modal_backend._modal_gpu_string("A100", 80, 1) == "A100-80GB"
+
+
 # --- render_modal_image ---------------------------------------------------
 
 

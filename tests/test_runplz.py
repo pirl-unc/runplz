@@ -8,7 +8,6 @@ the closest thing we have to an integration test.
 """
 
 import json
-import sys
 import types
 from unittest import mock
 
@@ -179,13 +178,21 @@ def test_brev_gpu_name_strips_vram_suffix(modal_label, expected_brev_name):
 # ---- Instance picker → `brev search` -------------------------------------
 
 
-def _fn_with(gpu=None, min_cpu=None, min_memory=None, min_gpu_memory=None, min_disk=None):
+def _fn_with(
+    gpu=None,
+    min_cpu=None,
+    min_memory=None,
+    min_gpu_memory=None,
+    min_disk=None,
+    num_gpus=1,
+):
     return types.SimpleNamespace(
         gpu=gpu,
         min_cpu=min_cpu,
         min_memory=min_memory,
         min_gpu_memory=min_gpu_memory,
         min_disk=min_disk,
+        num_gpus=num_gpus,
     )
 
 
@@ -210,6 +217,35 @@ def test_pick_instance_type_builds_correct_search_cmd():
     assert "--min-ram" in cmd and "26" in cmd
     assert "--min-vram" in cmd and "16" in cmd
     assert "--min-disk" in cmd and "100" in cmd
+
+
+def test_pick_instance_type_threads_num_gpus_through():
+    """3.6: Function.num_gpus > 1 maps to `brev search --min-gpus N`."""
+    captured = {}
+
+    def fake_run(cmd, *a, **kw):
+        captured["cmd"] = cmd
+        return mock.Mock(returncode=0, stdout=json.dumps([{"type": "a100-x4"}]))
+
+    fn = _fn_with(gpu="A100", num_gpus=4)
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        _pick_instance_type(fn)
+    cmd = captured["cmd"]
+    assert "--min-gpus" in cmd and "4" in cmd
+
+
+def test_pick_instance_type_omits_min_gpus_when_only_one():
+    """num_gpus=1 is the default — don't noise up `brev search` with it."""
+    captured = {}
+
+    def fake_run(cmd, *a, **kw):
+        captured["cmd"] = cmd
+        return mock.Mock(returncode=0, stdout=json.dumps([{"type": "t4-x1"}]))
+
+    fn = _fn_with(gpu="T4", num_gpus=1)
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        _pick_instance_type(fn)
+    assert "--min-gpus" not in captured["cmd"]
 
 
 def test_pick_instance_type_cpu_when_no_gpu():
@@ -366,12 +402,43 @@ def test_remote_rejects_non_json_args():
 # ---- CLI entry ------------------------------------------------------------
 
 
-def test_cli_errors_without_instance_on_brev():
+def test_cli_allows_brev_without_instance_for_ephemeral_mode(tmp_path):
+    """Used to require --instance. 3.6 flipped this: omitting --instance
+    triggers ephemeral mode (runplz auto-creates a box and deletes it on
+    exit). The CLI must stop rejecting the missing flag."""
+    import textwrap
+
     from runplz import _cli
 
-    with mock.patch.object(sys, "argv", ["mhcflurry-run", "brev", "examples/simple_job.py"]):
-        with pytest.raises(SystemExit):
-            _cli.main(["brev", "examples/simple_job.py"])
+    script = tmp_path / "job.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            from runplz import App, Image
+
+            app = App("ephemeral-test")
+            image = Image.from_registry("ubuntu:22.04")
+
+            @app.function(image=image, gpu="T4")
+            def fn():
+                pass
+
+            @app.local_entrypoint()
+            def main():
+                fn.remote()
+            """
+        )
+    )
+
+    captured = {}
+    with mock.patch(
+        "runplz.backends.brev.run",
+        lambda app, function, args, kwargs, **kw: captured.update({"kw": kw}),
+    ):
+        _cli.main(["brev", str(script)])
+    # instance is threaded through as None; brev.run() expands it to an
+    # ephemeral name on its own.
+    assert captured["kw"]["instance"] is None
 
 
 # ---- App.bind() — pure-Python invocation ---------------------------------
@@ -401,18 +468,21 @@ def test_bind_local_with_no_build_flag():
     assert app._backend_kwargs["build"] is False
 
 
-def test_bind_brev_requires_instance():
+def test_bind_brev_accepts_none_instance_for_ephemeral_mode():
+    """3.6: instance=None on brev → ephemeral mode. App.bind() threads it
+    through as-is; brev.run() expands it into a generated name + forced
+    auto_create_instances=True + on_finish="delete"."""
     app = App("t")
 
     @app.function(image=_sample_image(), gpu="T4")
     def train():
         pass
 
-    with pytest.raises(ValueError, match="instance=... is required"):
-        app.bind("brev")
+    app.bind("brev")  # no instance= — ephemeral
+    assert app._backend == "brev"
+    assert app._backend_kwargs["instance"] is None
 
     app.bind("brev", instance="my-box")
-    assert app._backend == "brev"
     assert app._backend_kwargs["instance"] == "my-box"
 
 
@@ -524,6 +594,44 @@ def test_function_rejects_empty_gpu_string():
         @app.function(image=_sample_image(), gpu="")
         def train():
             pass
+
+
+def test_function_rejects_num_gpus_zero():
+    app = App("t")
+    with pytest.raises(ValueError, match="num_gpus must be a positive int"):
+
+        @app.function(image=_sample_image(), gpu="A100", num_gpus=0)
+        def train():
+            pass
+
+
+def test_function_rejects_num_gpus_greater_than_one_without_gpu():
+    app = App("t")
+    with pytest.raises(ValueError, match="num_gpus=4 requires gpu="):
+
+        @app.function(image=_sample_image(), num_gpus=4)
+        def train():
+            pass
+
+
+def test_function_num_gpus_defaults_to_one():
+    app = App("t")
+
+    @app.function(image=_sample_image(), gpu="T4")
+    def train():
+        pass
+
+    assert app.functions["train"].num_gpus == 1
+
+
+def test_function_accepts_multi_gpu_with_model():
+    app = App("t")
+
+    @app.function(image=_sample_image(), gpu="A100", num_gpus=4)
+    def train():
+        pass
+
+    assert app.functions["train"].num_gpus == 4
 
 
 # ---- Brev dispatch-time image vs mode validation -------------------------

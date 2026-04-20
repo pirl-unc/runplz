@@ -106,12 +106,15 @@ kwargs must be JSON-serializable.
 
 ### What the CLI flags do
 
-- `--instance <name>` — **required** for `brev`; the Brev box to attach
-  to. If it doesn't exist, runplz **fails** by default so a typoed name
-  can't silently provision a new billed box. Opt in with
-  `BrevConfig(auto_create_instances=True)` to have runplz `brev create`
-  missing boxes (cheapest match for your resource constraints, or an
-  explicit `BrevConfig(instance_type=...)` if you pinned one).
+- `--instance <name>` — **optional** for `brev`. Omit it for
+  **ephemeral mode**: runplz auto-names a box sized to your function
+  (cheapest match from the selector, or `BrevConfig(instance_type=...)`
+  if you pinned one), creates it, runs, and **deletes** it on exit.
+  With a named `--instance`, runplz attaches to an existing box
+  (auto-starting it if a previous run's `on_finish="stop"` paused it);
+  if the name doesn't exist, runplz **fails** by default so a typo
+  can't silently provision a new billed box — opt in to auto-create
+  with `BrevConfig(auto_create_instances=True)`.
 - `--host <name>` — **required** for `ssh`; any ssh endpoint reachable
   from your shell (bare hostname, `user@host`, or a `~/.ssh/config`
   alias). No provisioning — you own the box.
@@ -269,6 +272,20 @@ names tried: `estimated_start_seconds`, `eta_seconds`, `eta_s`,
 worth a job sitting 5 minutes in a queue. If no candidate has a hint,
 plain cheapest wins. Override the whole picker with
 `BrevConfig(instance_type="...")` when you need a specific shape.
+
+### Multi-GPU (`num_gpus=N`)
+
+`@app.function(gpu="A100-80GB", num_gpus=4)` requests 4 GPUs of that
+model. Defaults to `1`. Maps to:
+
+- **brev**: `brev search --min-gpus N` filters the instance-type catalog.
+- **Modal**: appended as `:N` to the gpu string (Modal's native syntax —
+  `A100-80GB:4`).
+- **ssh**: the spec-mismatch probe warns if `nvidia-smi` returns fewer
+  than `N` GPUs on the remote.
+- **local**: ignored, like other specs — your machine is your machine.
+
+Requires `gpu=...` (can't ask for multiple GPUs without a model).
 
 ### Multiple functions, multiple shapes?
 
