@@ -110,28 +110,37 @@ you need to override something.
 
 ### BrevConfig
 
-| field                    | default        | what it does                                                                                                                                      |
-| ------------------------ | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `auto_create_instances`  | `True`         | If `--instance` points at a non-existent box, `brev create` it. Set `False` to hard-fail instead of auto-provisioning.                            |
-| `instance_type`          | `None`         | Pin a specific Brev instance type string (e.g. `"n1-standard-4:nvidia-tesla-t4:1"`). Skips the constraint-based picker.                           |
-| `mode`                   | `"vm"`         | `"vm"` = full Brev VM + docker-in-VM. `"container"` = the box IS the base image; runplz applies Image DSL ops inline over ssh (lighter, no DinD). |
-| `use_docker`             | `True`         | VM-mode only. `False` skips docker and installs a native venv on the box. Legacy escape hatch for providers where container mode isn't available. |
-| `api_key_env`            | `"BREV_API_KEY"` | Placeholder for a REST fallback; unused today (auth goes through `brev login`).                                                                 |
-| `auth`                   | `"cli"`        | `"cli"` uses the logged-in `brev` CLI. `"rest"` is reserved / not implemented.                                                                    |
+All fields are validated at construction time — an invalid config raises
+`ValueError` immediately, not later during dispatch.
+
+| field                    | default | what it does                                                                                                                                      |
+| ------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `auto_create_instances`  | `True`  | If `--instance` points at a non-existent box, `brev create` it. Set `False` to hard-fail instead of auto-provisioning.                            |
+| `instance_type`          | `None`  | Pin a specific Brev instance type string (e.g. `"n1-standard-4:nvidia-tesla-t4:1"`). Skips the constraint-based picker.                           |
+| `mode`                   | `"vm"`  | `"vm"` = full Brev VM + docker-in-VM. `"container"` = the box IS the base image; runplz applies Image DSL ops inline over ssh (lighter, no DinD). |
+| `use_docker`             | `True`  | VM-mode only. `False` skips docker and installs a native venv on the box. Legacy escape hatch for providers where container mode isn't available. |
+
+Invalid combinations (rejected at construction):
+
+- `mode` not in `{"vm", "container"}`
+- `mode="container"` with `use_docker=False` (contradictory — the box *is* the image)
+- `instance_type=""` (must be a non-empty string or `None`)
 
 ### ModalConfig
 
-| field        | default | what it does                                                                                                 |
-| ------------ | ------- | ------------------------------------------------------------------------------------------------------------ |
-| `app_prefix` | `None`  | Placeholder; Modal reads `~/.modal.toml` and currently needs nothing else. Slot exists for future symmetry. |
+`ModalConfig()` is a no-op today. Modal reads auth from `~/.modal.toml`
+and schedules resources from `@app.function(gpu=..., cpu=..., memory=...)`;
+we don't expose Modal-specific knobs. The class exists as a slot in
+`App(modal=...)` so the signature doesn't break when fields are added.
 
 ### Why not one unified config?
 
-The fields don't really overlap: Brev's knobs are all about how the VM is
-provisioned (mode, instance type, docker-or-native), while Modal has
-essentially nothing to configure (it manages its own runtime). A single
-union would be ~90% Brev-only fields with a `# modal: ignored` next to
-each. Kept separate to make it obvious which knob applies where.
+Surveyed the fields — there is no genuine overlap today. Brev has real
+provisioning knobs (mode, instance type, docker-or-native); Modal has
+nothing we expose. A shared base class would be empty. If/when a
+genuinely cross-backend concept shows up (e.g. per-App secrets, a shared
+retry policy), we'll factor it into a `BaseConfig` then. Until then, the
+split is the honest API.
 
 ## Image DSL
 

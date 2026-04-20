@@ -59,7 +59,11 @@ def main(argv=None):
         if not args.instance:
             p.error("--instance is required for the brev backend")
         app._backend_kwargs["instance"] = args.instance
-    if args.backend == "local" and args.no_build:
+    elif args.instance:
+        p.error(f"--instance only applies to the brev backend (got {args.backend!r}).")
+    if args.no_build:
+        if args.backend != "local":
+            p.error(f"--no-build only applies to the local backend (got {args.backend!r}).")
         app._backend_kwargs["build"] = False
 
     if app._entrypoint is None:

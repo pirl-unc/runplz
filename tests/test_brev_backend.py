@@ -62,7 +62,7 @@ def _job_inside(tmp_path, name="jobs/train.py"):
     return p
 
 
-# -- _validate_config already covered in test_runplz.py; skipping here ----
+# -- BrevConfig validation lives in __post_init__; covered in test_runplz.py --
 
 
 # -- _brev_gpu_name covered in test_runplz.py; skipping ------------------
