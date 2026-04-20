@@ -39,7 +39,7 @@ class FakeSH:
 
 
 def _app(tmp_path, *, cfg=None):
-    app = App("panalle", brev=cfg or BrevConfig())
+    app = App("panalle", brev_config=cfg or BrevConfig())
     app._repo_root = tmp_path
     return app
 
@@ -335,7 +335,7 @@ def test_create_instance_with_resource_request_uses_picker(tmp_path):
 
     with mock.patch("runplz.backends.brev._pick_instance_type", return_value="picked-type"):
         with mock.patch("runplz.backends.brev._sh", fake_sh):
-            brev._create_instance("x", cfg=app.brev, image=fn.image, function=fn)
+            brev._create_instance("x", cfg=app.brev_config, image=fn.image, function=fn)
 
     cmd = recorded["create_cmd"]
     assert cmd[:2] == ["brev", "create"]

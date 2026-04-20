@@ -5,9 +5,9 @@ One Python decoration, three backends (local Docker, Brev, Modal).
 Write a job script:
 
     # jobs/train.py
-    from runplz import App, BrevConfig, Image
+    from runplz import App, Image
 
-    app = App("my-job", brev=BrevConfig())  # auto_create_instances=True by default
+    app = App("my-job")  # default BrevConfig auto-creates the box on first run
     image = (
         Image.from_registry("pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime")
         .pip_install("pandas", "scikit-learn")

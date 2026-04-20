@@ -88,11 +88,15 @@ class Function:
 
 class App:
     def __init__(
-        self, name: str, *, brev: Optional[BrevConfig] = None, modal: Optional[ModalConfig] = None
+        self,
+        name: str,
+        *,
+        brev_config: Optional[BrevConfig] = None,
+        modal_config: Optional[ModalConfig] = None,
     ):
         self.name = name
-        self.brev = brev or BrevConfig()
-        self.modal = modal or ModalConfig()
+        self.brev_config = brev_config or BrevConfig()
+        self.modal_config = modal_config or ModalConfig()
         self.functions: dict[str, Function] = {}
         self._entrypoint: Optional[Callable] = None
 

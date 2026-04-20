@@ -8,8 +8,8 @@ from runplz.app import _ensure_json_safe
 
 def test_app_defaults_build_own_configs():
     app = App("x")
-    assert isinstance(app.brev, BrevConfig)
-    assert isinstance(app.modal, ModalConfig)
+    assert isinstance(app.brev_config, BrevConfig)
+    assert isinstance(app.modal_config, ModalConfig)
 
 
 def test_app_dispatch_rejects_unknown_backend():

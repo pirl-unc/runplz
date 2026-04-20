@@ -62,7 +62,7 @@ def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out")
     _require_brev_cli()
     _skip_onboarding()
 
-    cfg = app.brev
+    cfg = app.brev_config
     if not _instance_exists(instance):
         if cfg.auto_create_instances:
             _create_instance(instance, cfg=cfg, image=function.image, function=function)
