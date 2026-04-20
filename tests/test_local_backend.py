@@ -120,9 +120,53 @@ def test_run_skips_build_when_build_false(tmp_path):
         with mock.patch("runplz.backends.local._nvidia_available", return_value=False):
             local.run(app, fn, [], {}, build=False)
 
-    # Only `docker run`, no `docker build`.
-    assert len(calls) == 1
-    assert calls[0][0][:3] == ["docker", "run", "--rm"]
+    # `docker image inspect` for the reused-tag warning, then `docker run`.
+    # No `docker build`.
+    assert [c[0][:3] for c in calls] == [
+        ["docker", "image", "inspect"],
+        ["docker", "run", "--rm"],
+    ]
+
+
+def test_build_false_logs_reused_image_tag(tmp_path, capsys):
+    """Issue #21: --no-build must tell the user which image it's reusing,
+    so a stale image can't silently rerun."""
+    app = _app(tmp_path)
+    image = Image.from_registry("ubuntu:22.04")
+    fn = _function(app, image, module_file=_job_inside_repo(tmp_path))
+
+    def fake_run(cmd, *a, **kw):
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            return mock.Mock(returncode=0, stdout="2026-04-20T12:34:56Z\n", stderr="")
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("runplz.backends.local.subprocess.run", fake_run):
+        with mock.patch("runplz.backends.local._nvidia_available", return_value=False):
+            local.run(app, fn, [], {}, build=False, image_tag="my-tag")
+
+    out = capsys.readouterr().out
+    assert "build=False" in out
+    assert "'my-tag'" in out
+    assert "2026-04-20T12:34:56Z" in out
+
+
+def test_build_false_warns_when_image_not_found(tmp_path, capsys):
+    app = _app(tmp_path)
+    image = Image.from_registry("ubuntu:22.04")
+    fn = _function(app, image, module_file=_job_inside_repo(tmp_path))
+
+    def fake_run(cmd, *a, **kw):
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            return mock.Mock(returncode=1, stdout="", stderr="No such image")
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("runplz.backends.local.subprocess.run", fake_run):
+        with mock.patch("runplz.backends.local._nvidia_available", return_value=False):
+            local.run(app, fn, [], {}, build=False, image_tag="ghost")
+
+    out = capsys.readouterr().out
+    assert "'ghost'" in out
+    assert "not found locally" in out
 
 
 def test_run_uses_user_dockerfile_when_from_dockerfile(tmp_path):

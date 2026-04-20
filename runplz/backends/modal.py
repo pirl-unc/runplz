@@ -33,6 +33,8 @@ import tarfile
 import tempfile
 from pathlib import Path
 
+from runplz._excludes import DEFAULT_TRANSFER_EXCLUDES
+
 _ENTRYPOINT_TEMPLATE = '''\
 """Generated Modal entrypoint for runplz. Do not edit."""
 
@@ -125,10 +127,16 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
     modal_gpu = _modal_gpu_string(function.gpu, function.min_gpu_memory)
 
     if function.min_disk is not None:
-        print(
-            f"[runplz] warning: min_disk={function.min_disk} ignored on Modal "
-            "(no disk-size kwarg; Modal manages container storage).",
-            flush=True,
+        # Issue #20: the previous `print()` let users believe their disk
+        # request was honored. Modal has no per-function disk knob — if
+        # you need durable or large storage, use a Modal Volume mount
+        # from inside your function. Fail loud rather than silently drop.
+        raise ValueError(
+            f"min_disk={function.min_disk!r} is not supported on the Modal backend. "
+            f"Modal manages container storage; there is no per-function disk-size kwarg. "
+            f"Options: (a) remove min_disk for this function on Modal, "
+            f"(b) mount a Modal Volume inside the function for large/durable storage, "
+            f"or (c) run this function on brev/local where min_disk maps to real capacity."
         )
 
     entrypoint_src = _ENTRYPOINT_TEMPLATE.format(
@@ -160,12 +168,50 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
         except OSError:
             pass
 
+    _check_output_blob_size(blob_path)
     _extract_tar(blob_path, host_out)
     try:
         os.unlink(blob_path)
     except OSError:
         pass
     print(f"Modal run complete. Outputs in {host_out}", flush=True)
+
+
+# Modal function return values are capped at ~256 MB. We return outputs as
+# a tar.gz blob, so large /out directories can silently overflow (issue #19).
+# These thresholds apply to the compressed tar, not the raw /out tree.
+_MODAL_OUTPUT_WARN_BYTES = 200 * 1024 * 1024
+_MODAL_OUTPUT_LIMIT_BYTES = 256 * 1024 * 1024
+
+
+def _check_output_blob_size(blob_path: str) -> None:
+    """Warn or raise when the returned output tar is near / over Modal's
+    ~256 MB return-value cap. At this point the blob has already been
+    written locally — if it landed truncated we want to surface that
+    instead of silently unpacking a broken archive (issue #19)."""
+    try:
+        size = os.path.getsize(blob_path)
+    except OSError:
+        return
+    if size >= _MODAL_OUTPUT_LIMIT_BYTES:
+        raise RuntimeError(
+            f"Modal output tar is {size / 1024 / 1024:.1f} MB, at or above "
+            f"Modal's ~{_MODAL_OUTPUT_LIMIT_BYTES // 1024 // 1024} MB "
+            f"return-value cap. The archive may be truncated and extracting "
+            f"it would silently lose data.\n"
+            f"Fix: write large outputs to a Modal Volume instead of /out, "
+            f"e.g. `modal.Volume.from_name('my-vol', create_if_missing=True)` "
+            f"mounted at /out, then download after the run with "
+            f"`volume.batch_iter(...)`. See Modal docs on Volumes."
+        )
+    if size >= _MODAL_OUTPUT_WARN_BYTES:
+        print(
+            f"+ warning: Modal output tar is {size / 1024 / 1024:.1f} MB, "
+            f"approaching Modal's ~{_MODAL_OUTPUT_LIMIT_BYTES // 1024 // 1024} "
+            f"MB return-value cap. Future runs with larger outputs will fail. "
+            f"Consider writing large artifacts to a Modal Volume instead.",
+            flush=True,
+        )
 
 
 _MODAL_GPU_SUFFIX_RE = re.compile(r"-\d+GB$", re.IGNORECASE)
@@ -213,9 +259,14 @@ def _render_modal_image(image, *, repo: Path) -> str:
             editable = kw.get("editable", "1") == "1"
             local_dir = (repo / path).resolve()
             flags = "-e " if editable else ""
+            # Plumb the shared secret-exclude list into Modal's add_local_dir
+            # so `.env` / ssh keys / credentials.json don't get baked into
+            # an image layer and uploaded to Modal. See runplz/_excludes.py.
+            ignore_list = list(DEFAULT_TRANSFER_EXCLUDES)
             lines.append(
                 f"image = image.add_local_dir({str(local_dir)!r}, "
-                f"remote_path='/workspace', copy=True).run_commands("
+                f"remote_path='/workspace', copy=True, "
+                f"ignore={ignore_list!r}).run_commands("
                 f"'pip install {flags}/workspace')"
             )
         elif op.kind == "run" and op.args:

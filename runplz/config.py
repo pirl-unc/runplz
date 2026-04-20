@@ -19,10 +19,12 @@ _VALID_BREV_ON_FINISH = ("stop", "delete", "leave")
 
 @dataclass(frozen=True)
 class BrevConfig:
-    # When True (default) and `--instance <name>` points at a box that does
-    # not exist, runplz provisions it via `brev create`. When False, a
-    # missing instance is a hard error.
-    auto_create_instances: bool = True
+    # When True and `--instance <name>` points at a box that does not exist,
+    # runplz provisions it via `brev create`. When False (default), a missing
+    # instance is a hard error so a typoed instance name can't silently create
+    # a brand-new billed box — opt in explicitly when you actually want
+    # programmatic creation.
+    auto_create_instances: bool = False
     # Optional explicit instance type (e.g. "n1-standard-4:nvidia-tesla-t4:1").
     # When set, takes precedence over the constraint-based picker. When None
     # (default), `brev search` is driven by the function's resource
@@ -57,6 +59,13 @@ class BrevConfig:
     # - "leave": never touch the box. Opt-in for interactive workflows where
     #   you're using the same box for dev + jobs. Current pre-3.2 behavior.
     on_finish: str = "stop"
+    # Wall-clock cap on the remote run. When None (default), the job runs
+    # until it finishes or the user Ctrl-Cs. When set, runplz kills the
+    # remote container/process after this many seconds and raises
+    # RuntimeError, so a wedged/infinite-loop job can't keep billing
+    # forever. Distinct from `Function(timeout=...)` which applies only
+    # to Modal — this is a Brev-specific kill-switch enforced by runplz.
+    max_runtime_seconds: Optional[int] = None
 
     def __post_init__(self):
         if self.mode not in _VALID_BREV_MODES:
@@ -75,6 +84,11 @@ class BrevConfig:
             raise ValueError(
                 f"BrevConfig.on_finish must be one of {_VALID_BREV_ON_FINISH}; "
                 f"got {self.on_finish!r}."
+            )
+        if self.max_runtime_seconds is not None and self.max_runtime_seconds <= 0:
+            raise ValueError(
+                f"BrevConfig.max_runtime_seconds must be a positive int (or None); "
+                f"got {self.max_runtime_seconds!r}."
             )
 
 

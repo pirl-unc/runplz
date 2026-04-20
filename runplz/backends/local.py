@@ -35,6 +35,12 @@ def run(
 
     if build:
         _build_image(function.image, repo, image_tag)
+    else:
+        # --no-build: we're reusing whatever image was last tagged as
+        # image_tag. Surface that explicitly so a stale image isn't silently
+        # rerun (issue #21). docker image inspect gives us the created-at
+        # timestamp so the user can sanity-check the age.
+        _print_reused_image(image_tag)
 
     script_in_container = _container_path_for(function.module_file, repo)
 
@@ -108,3 +114,25 @@ def _print_cmd(cmd):
     # users tailing a log file see status prints land before subprocess
     # output.
     print("+ " + " ".join(cmd), flush=True)
+
+
+def _print_reused_image(tag: str) -> None:
+    """Log which image the build=False path is about to run, with creation
+    timestamp when available so stale images can't hide. Best-effort: if
+    `docker image inspect` fails we still print the tag — `docker run`
+    will surface a missing-image error clearly on its own."""
+    r = subprocess.run(
+        ["docker", "image", "inspect", "--format", "{{.Created}}", tag],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        print(
+            f"+ build=False: reusing image {tag!r} (created {r.stdout.strip()})",
+            flush=True,
+        )
+    else:
+        print(
+            f"+ build=False: reusing image {tag!r} (not found locally — `docker run` will error).",
+            flush=True,
+        )

@@ -55,17 +55,34 @@ backend (plus the same flags: `instance=`, `outputs_dir=`, `build=`) so
 
 ## How it's structured
 
-**The CLI is the only entry point.** `runplz <backend> <script>` does three
-things:
+Two entry points, same dispatch underneath. `python script.py` won't
+work on its own — the `App` doesn't know which backend to target until
+something binds one.
+
+**CLI (preferred for CI / shared scripts).** `runplz <backend> <script>`:
 
 1. Imports your script (finds the `App` instance at module scope).
-2. Binds the chosen backend to that `App` (the reason `python script.py`
-   won't work — nothing has told the `App` where to dispatch).
+2. Binds the chosen backend to that `App`.
 3. Calls whatever you've decorated with `@app.local_entrypoint()`.
 
-Inside that entrypoint you call `train.remote()`, which serializes a
-minimal dispatch (env vars + a path to your script) and runs on the
-selected backend. Args and kwargs must be JSON-serializable.
+**`App.bind(...)` (for notebooks, one-off scripts, tests).** Bind the
+backend yourself, then call `.remote()` directly — no CLI, no
+`@local_entrypoint` required:
+
+```python
+app.bind("local")                         # or "modal"
+app.bind("brev", instance="my-gpu-box")   # an existing Brev instance
+train.remote()                            #   (same name `brev ls` shows)
+```
+
+The Brev `instance=` string is whatever you named the box in Brev — it
+must already exist in your Brev account, or `auto_create_instances=True`
+must be set on your `BrevConfig`. Brev's managed SSH config adds a
+`Host <name>` alias so `ssh <name>` works without further setup.
+
+Either way, `.remote()` serializes a minimal dispatch (env vars + a
+path to your script) and runs on the selected backend. Args and
+kwargs must be JSON-serializable.
 
 ### Decorators you'll use
 
@@ -90,10 +107,11 @@ selected backend. Args and kwargs must be JSON-serializable.
 ### What the CLI flags do
 
 - `--instance <name>` — **required** for `brev`; the Brev box to attach
-  to. If it doesn't exist and `BrevConfig(auto_create_instances=True)`
-  (the default), runplz provisions it for you (cheapest match for your
-  resource constraints, or an explicit `BrevConfig(instance_type=...)`
-  if you pinned one).
+  to. If it doesn't exist, runplz **fails** by default so a typoed name
+  can't silently provision a new billed box. Opt in with
+  `BrevConfig(auto_create_instances=True)` to have runplz `brev create`
+  missing boxes (cheapest match for your resource constraints, or an
+  explicit `BrevConfig(instance_type=...)` if you pinned one).
 - `--no-build` — **local only**; reuse the last tagged docker image
   instead of rebuilding.
 - `--outputs-dir <path>` — where to collect `/out` back to on the host
@@ -116,19 +134,30 @@ All fields are validated at construction time — an invalid config raises
 
 | field                    | default | what it does                                                                                                                                      |
 | ------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `auto_create_instances`  | `True`  | If `--instance` points at a non-existent box, `brev create` it. Set `False` to hard-fail instead of auto-provisioning.                            |
+| `auto_create_instances`  | `False` | When `--instance` points at a non-existent box, hard-fail rather than silently `brev create` it (typo-safe default). Set `True` to opt into auto-provisioning.                            |
 | `instance_type`          | `None`  | Pin a specific Brev instance type string (e.g. `"n1-standard-4:nvidia-tesla-t4:1"`). Skips the constraint-based picker.                           |
 | `mode`                   | `"container"` | `"container"` (default) = the Brev box IS the base image; runplz applies Image DSL ops inline over ssh. Lighter, no DinD, sidesteps a known GPU+docker SSH-wedging bug. Requires `Image.from_registry(...)`. `"vm"` = full Brev VM + docker-in-VM; use when you need a user Dockerfile or the legacy native path. |
 | `use_docker`             | `True`  | VM-mode only. `False` skips docker and installs a native venv on the box. Legacy escape hatch for providers where container mode isn't available. |
 | `on_finish`              | `"stop"` | What runplz does to the Brev box when the App exits (success **or** failure). `"stop"` → `brev stop` (disk cached, small ongoing charge). `"delete"` → `brev delete` (zero ongoing cost, cold rebuild). `"leave"` → never touch the box (opt-in for interactive dev workflows). |
+| `max_runtime_seconds`    | `None`  | Wall-clock kill-switch. When set, runplz kills the remote container/process and raises `RuntimeError` after this many seconds so a wedged job can't keep billing forever. `None` = unlimited.                                                                       |
 
 Invalid combinations (raised eagerly):
 
 - `mode` not in `{"vm", "container"}` — at config construction
 - `mode="container"` with `use_docker=False` — at config construction (contradictory; the box *is* the image)
 - `instance_type=""` — at config construction
+- `on_finish` not in `{"stop", "delete", "leave"}` — at config construction
+- `max_runtime_seconds <= 0` — at config construction (use `None` for unlimited)
 - `mode="container"` with `Image.from_dockerfile(...)` — at Brev dispatch (container mode has no Dockerfile step)
 - `mode="vm", use_docker=False` with `Image.from_dockerfile(...)` — at Brev dispatch (native path ignores the Dockerfile)
+
+### What runplz does NOT ship to the remote
+
+To keep local secrets local, runplz excludes these patterns by default from every host → remote transfer (both Brev's `rsync_up` and Modal's image build context):
+
+`.env`, `.env.local`, `.env.*.local`, `.env.production`, `.env.development`, `*.pem`, `*.key`, `id_rsa`, `id_rsa.*`, `id_ed25519`, `id_ed25519.*`, `credentials.json`, `.aws`, `.ssh`, `.netrc`, `.git-credentials`
+
+If you *need* a secret inside the remote environment, inject it via `@app.function(env={"X": ...})` or Modal Secrets rather than by relaxing this list.
 
 Image/mode checks fire at **Brev dispatch**, not at function decoration, so local/Modal users aren't constrained by the default Brev config on a shared `App`.
 

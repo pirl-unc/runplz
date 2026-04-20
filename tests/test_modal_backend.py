@@ -70,6 +70,19 @@ def test_render_modal_image_non_editable_install(tmp_path):
     assert "pip install -e /workspace" not in src
 
 
+def test_render_modal_image_passes_default_secret_ignores_to_add_local_dir(tmp_path):
+    """Issue #18: .env / ssh keys / credentials.json must not be baked
+    into the Modal image layer."""
+    from runplz._excludes import DEFAULT_TRANSFER_EXCLUDES
+
+    img = Image.from_registry("ubuntu:22.04").pip_install_local_dir(".", editable=False)
+    src = modal_backend._render_modal_image(img, repo=tmp_path)
+
+    assert "ignore=[" in src or "ignore=(" in src
+    for pat in DEFAULT_TRANSFER_EXCLUDES:
+        assert repr(pat) in src, f"missing {pat!r} from add_local_dir ignore list"
+
+
 def test_render_modal_image_pip_install_with_index_url(tmp_path):
     img = Image.from_registry("ubuntu:22.04").pip_install(
         "torch", index_url="https://download.pytorch.org/whl/cu121"
@@ -272,7 +285,44 @@ def test_run_min_gpu_memory_appends_suffix(tmp_path, capsys):
     assert "_GPU = 'A100-80GB'" in captured["src"]
 
 
-def test_run_min_disk_warns_and_is_ignored(tmp_path, capsys):
+def test_check_output_blob_size_warns_near_cap(tmp_path, capsys):
+    """Issue #19: a tar approaching Modal's 256MB return-value cap should
+    emit a loud warning so users switch to Volumes before they hit it."""
+    blob = tmp_path / "out.tar.gz"
+    blob.write_bytes(b"x" * (210 * 1024 * 1024))
+    modal_backend._check_output_blob_size(str(blob))
+
+    out = capsys.readouterr().out
+    assert "warning" in out.lower()
+    assert "Modal Volume" in out
+    assert "210.0 MB" in out
+
+
+def test_check_output_blob_size_raises_over_cap(tmp_path):
+    """At or above 256MB we raise instead of unpacking — the tar may already
+    be truncated and extracting it silently would lose data."""
+    blob = tmp_path / "out.tar.gz"
+    blob.write_bytes(b"x" * (260 * 1024 * 1024))
+    with pytest.raises(RuntimeError) as ei:
+        modal_backend._check_output_blob_size(str(blob))
+
+    msg = str(ei.value)
+    assert "260.0 MB" in msg
+    assert "may be truncated" in msg
+    assert "Modal Volume" in msg
+
+
+def test_check_output_blob_size_silent_under_warn_threshold(tmp_path, capsys):
+    blob = tmp_path / "out.tar.gz"
+    blob.write_bytes(b"x" * (10 * 1024 * 1024))
+    modal_backend._check_output_blob_size(str(blob))
+    assert capsys.readouterr().out == ""
+
+
+def test_run_min_disk_raises_on_modal(tmp_path):
+    """Issue #20: min_disk used to print a warning and silently drop.
+    Now it's a hard ValueError at dispatch so users can't believe their
+    disk request was honored."""
     app = App("x")
     app._repo_root = tmp_path
     (tmp_path / "jobs").mkdir()
@@ -285,20 +335,13 @@ def test_run_min_disk_warns_and_is_ignored(tmp_path, capsys):
     fn = app.functions["t"]
     fn.module_file = str(tmp_path / "jobs" / "j.py")
 
-    def fake_run(cmd, *a, **kw):
-        entry = cmd[-1].split("::")[0]
-        src = Path(entry).read_text()
-        for line in src.splitlines():
-            if line.startswith("_OUT_BLOB = "):
-                Path(line.split("=", 1)[1].strip().strip("'\"")).write_bytes(_fake_tarball_blob())
-        return mock.Mock(returncode=0)
-
-    with mock.patch("runplz.backends.modal.subprocess.run", fake_run):
+    with pytest.raises(ValueError) as ei:
         modal_backend.run(app, fn, [], {})
 
-    out = capsys.readouterr().out
-    assert "min_disk=200" in out
-    assert "ignored on Modal" in out
+    msg = str(ei.value)
+    assert "min_disk=200" in msg
+    assert "not supported on the Modal backend" in msg
+    assert "Modal Volume" in msg
 
 
 def test_run_no_memory_emits_none(tmp_path):

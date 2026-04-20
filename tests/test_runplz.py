@@ -116,8 +116,31 @@ def test_brev_rejects_empty_instance_type():
         BrevConfig(instance_type="   ")
 
 
+def test_brev_default_auto_create_is_false():
+    # 3.3: flipped from True. A typoed --instance name must not silently
+    # provision a new billed box — users opt in to auto-create explicitly.
+    assert BrevConfig().auto_create_instances is False
+
+
 def test_brev_default_on_finish_is_stop():
     assert BrevConfig().on_finish == "stop"
+
+
+def test_brev_default_max_runtime_seconds_is_none():
+    # Off by default. Users opt in when they want a billing kill-switch.
+    assert BrevConfig().max_runtime_seconds is None
+
+
+def test_brev_rejects_non_positive_max_runtime_seconds():
+    with pytest.raises(ValueError, match="max_runtime_seconds must be a positive int"):
+        BrevConfig(max_runtime_seconds=0)
+    with pytest.raises(ValueError, match="max_runtime_seconds must be a positive int"):
+        BrevConfig(max_runtime_seconds=-1)
+
+
+def test_brev_accepts_positive_max_runtime_seconds():
+    BrevConfig(max_runtime_seconds=1)
+    BrevConfig(max_runtime_seconds=3600)
 
 
 def test_brev_rejects_unknown_on_finish():
