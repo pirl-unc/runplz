@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 from runplz._excludes import DEFAULT_TRANSFER_EXCLUDES
+from runplz._selector import Candidate, pick_machine
 
 REMOTE_REPO_DIR = "runplz-repo"
 REMOTE_OUT_DIR = "runplz-out"
@@ -752,8 +753,16 @@ def _brev_gpu_name(modal_name: str) -> str:
 
 def _pick_instance_type(function) -> Optional[str]:
     """Run `brev search gpu` (or cpu) with filters from `function`'s
-    resource requests; return the cheapest matching TYPE string.
-    Returns None if no match."""
+    resource requests; return the best matching TYPE string.
+
+    Brev's own `--sort price` gives us cheapest-first; we post-process
+    through `pick_machine` so that when the top few candidates are
+    within 5% on price, we prefer whichever exposes the lowest
+    availability signal (ETA / supply). If no price or availability
+    fields are present we fall back to the original first-row behavior.
+
+    Returns None if no match.
+    """
     mode = "gpu" if function.gpu is not None else "cpu"
     cmd = ["brev", "search", mode, "--json", "--sort", "price"]
     if function.gpu:
@@ -774,11 +783,91 @@ def _pick_instance_type(function) -> Optional[str]:
         results = json.loads(r.stdout)
     except json.JSONDecodeError:
         return None
-    # `brev search --json` returns a list of matches sorted by $/hr.
     if not isinstance(results, list) or not results:
         return None
+
+    candidates = [_candidate_from_brev_row(row) for row in results]
+    priced = [c for c in candidates if c is not None and c.hourly_usd is not None]
+    if priced:
+        choice = pick_machine(priced)
+        if choice is not None:
+            print(f"+ selector picked {choice.name!r}: {choice.reason}", flush=True)
+            return choice.name
+
+    # Fallback: price/name fields not exposed in this `brev search` shape.
+    # Preserve the pre-3.4 behavior of taking the first (price-sorted) row.
     first = results[0]
-    return first.get("type") or first.get("Type") or first.get("name")
+    return _brev_row_type(first)
+
+
+# Candidate field names we tolerate across `brev search --json` schema
+# drift. Ordered most-specific → least.
+_BREV_PRICE_FIELDS = (
+    "hourly_price",
+    "price_per_hour",
+    "usd_per_hour",
+    "price",
+    "hourly_usd",
+    "estimated_hourly",
+)
+_BREV_AVAILABILITY_FIELDS = (
+    # Lower = faster to start. Brev has used variations of these.
+    "estimated_start_seconds",
+    "eta_seconds",
+    "eta_s",
+    "queue_wait_seconds",
+    "availability_rank",  # 0 = immediately available, higher = more latency
+)
+_BREV_REGION_FIELDS = ("region", "zone", "location", "provider_region")
+
+
+def _brev_row_type(row: dict) -> Optional[str]:
+    return row.get("type") or row.get("Type") or row.get("name")
+
+
+def _candidate_from_brev_row(row: dict) -> Optional[Candidate]:
+    """Map a single `brev search --json` row onto a selector Candidate.
+
+    Returns None when the row lacks a usable `type`/`name`. Prices and
+    availability hints are best-effort: missing data is fine (selector
+    handles `None`).
+    """
+    if not isinstance(row, dict):
+        return None
+    name = _brev_row_type(row)
+    if not name:
+        return None
+
+    price = None
+    for key in _BREV_PRICE_FIELDS:
+        v = row.get(key)
+        if v is None:
+            continue
+        try:
+            price = float(v)
+            break
+        except (TypeError, ValueError):
+            continue
+
+    hint = None
+    for key in _BREV_AVAILABILITY_FIELDS:
+        v = row.get(key)
+        if v is None:
+            continue
+        try:
+            hint = float(v)
+            break
+        except (TypeError, ValueError):
+            continue
+
+    region = None
+    for key in _BREV_REGION_FIELDS:
+        v = row.get(key)
+        if v:
+            region = str(v)
+            break
+
+    return Candidate(name=name, hourly_usd=price, availability_hint=hint, region=region, raw=row)
 
 
 def _refresh_ssh():

@@ -223,6 +223,75 @@ def test_pick_instance_type_cpu_when_no_gpu():
     assert result == "n2d-highmem-2"
 
 
+# ---- Selector tiebreaker integration with brev search -------------------
+
+
+def test_pick_instance_type_prefers_faster_start_within_5pct():
+    """Brev returns two candidates at $1.00 and $1.02 (both in the 5%
+    tolerance band) with different eta_seconds. Selector should pick
+    the faster-to-start one."""
+    brev_rows = [
+        # Brev sorts by price, so the "cheapest" row comes first. Our
+        # selector sees both and uses eta_seconds as tiebreaker.
+        {"type": "t4-slow-region", "hourly_price": 1.00, "eta_seconds": 300},
+        {"type": "t4-fast-region", "hourly_price": 1.02, "eta_seconds": 20},
+    ]
+
+    def fake_run(cmd, *a, **kw):
+        return mock.Mock(returncode=0, stdout=json.dumps(brev_rows))
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        result = _pick_instance_type(_fn_with(gpu="T4", min_memory=16))
+    assert result == "t4-fast-region"
+
+
+def test_pick_instance_type_cost_wins_outside_5pct():
+    """$1.00 vs $1.15 is 15%, well outside the band — cheapest wins
+    regardless of availability."""
+    brev_rows = [
+        {"type": "cheap-slow", "hourly_price": 1.00, "eta_seconds": 500},
+        {"type": "expensive-fast", "hourly_price": 1.15, "eta_seconds": 5},
+    ]
+
+    def fake_run(cmd, *a, **kw):
+        return mock.Mock(returncode=0, stdout=json.dumps(brev_rows))
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        result = _pick_instance_type(_fn_with(gpu="T4"))
+    assert result == "cheap-slow"
+
+
+def test_pick_instance_type_legacy_shape_no_price_field_falls_back_to_first():
+    """Older/minimal `brev search --json` output: just a `type` and nothing
+    else. Must still return the first row — never regress the pre-selector
+    behavior just because the schema is thin."""
+    brev_rows = [{"type": "minimal-row-1"}, {"type": "minimal-row-2"}]
+
+    def fake_run(cmd, *a, **kw):
+        return mock.Mock(returncode=0, stdout=json.dumps(brev_rows))
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        result = _pick_instance_type(_fn_with(gpu="T4"))
+    assert result == "minimal-row-1"
+
+
+def test_pick_instance_type_alternate_price_key_name():
+    """Brev schema drift: accept `price`, `usd_per_hour`, etc. as price
+    fields. Here we ship the rare `estimated_hourly` to confirm the fallback
+    chain works end-to-end."""
+    brev_rows = [
+        {"type": "slower", "estimated_hourly": 0.60, "eta_seconds": 200},
+        {"type": "faster", "estimated_hourly": 0.62, "eta_seconds": 10},
+    ]
+
+    def fake_run(cmd, *a, **kw):
+        return mock.Mock(returncode=0, stdout=json.dumps(brev_rows))
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        result = _pick_instance_type(_fn_with(gpu="T4"))
+    assert result == "faster"
+
+
 def test_pick_instance_type_returns_none_on_no_match():
     with mock.patch(
         "runplz.backends.brev.subprocess.run",
