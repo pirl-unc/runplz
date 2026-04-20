@@ -133,6 +133,23 @@ def test_instance_exists_false_on_invalid_json():
         assert brev._instance_exists("x") is False
 
 
+def test_instance_exists_false_when_json_null():
+    # brev ls --json can return `null` when the org has zero instances.
+    with mock.patch(
+        "runplz.backends.brev.subprocess.run",
+        return_value=mock.Mock(returncode=0, stdout="null"),
+    ):
+        assert brev._instance_exists("x") is False
+
+
+def test_instance_exists_handles_dict_with_null_instances():
+    with mock.patch(
+        "runplz.backends.brev.subprocess.run",
+        return_value=mock.Mock(returncode=0, stdout='{"instances": null}'),
+    ):
+        assert brev._instance_exists("x") is False
+
+
 # -- _require_brev_cli ----------------------------------------------------
 
 
