@@ -169,7 +169,9 @@ def test_instance_exists_handles_dict_with_null_instances():
 
 def test_wait_until_ssh_reachable_returns_on_first_success(monkeypatch):
     """First probe succeeds → helper returns immediately, no sleep."""
-    monkeypatch.setattr(brev, "_SSH_OPTS", [])
+    from runplz.backends import _ssh_common
+
+    monkeypatch.setattr(_ssh_common, "SSH_OPTS", [])
     calls = []
 
     def fake_run(cmd, *a, **kw):
@@ -178,7 +180,7 @@ def test_wait_until_ssh_reachable_returns_on_first_success(monkeypatch):
 
     sleeps = []
     monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_run):
         brev._wait_until_ssh_reachable("box", max_wait_s=60, probe_interval_s=1)
 
     assert len(calls) == 1
@@ -188,7 +190,9 @@ def test_wait_until_ssh_reachable_returns_on_first_success(monkeypatch):
 
 def test_wait_until_ssh_reachable_raises_after_deadline(monkeypatch):
     """SSH never reachable → raises with informative error."""
-    monkeypatch.setattr(brev, "_SSH_OPTS", [])
+    from runplz.backends import _ssh_common
+
+    monkeypatch.setattr(_ssh_common, "SSH_OPTS", [])
     clock = [0.0]
     monkeypatch.setattr("time.time", lambda: clock[0])
     monkeypatch.setattr(
@@ -199,37 +203,40 @@ def test_wait_until_ssh_reachable_raises_after_deadline(monkeypatch):
     def fake_run(cmd, *a, **kw):
         return mock.Mock(returncode=255, stdout="", stderr="Connection refused")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_run):
         with pytest.raises(RuntimeError, match="never became reachable"):
             brev._wait_until_ssh_reachable("box", max_wait_s=5, probe_interval_s=1)
 
 
-def test_wait_until_ssh_reachable_refreshes_periodically(monkeypatch):
-    """Every 4 failed probes, `brev refresh` is invoked to re-fetch the
-    SSH config (port may have changed when the instance fully came up)."""
-    monkeypatch.setattr(brev, "_SSH_OPTS", [])
+def test_wait_until_ssh_reachable_invokes_refresh_callback_periodically(monkeypatch):
+    """Every 4 failed probes the helper should fire the caller-provided
+    refresh_callback (Brev uses it to re-run `brev refresh` in case the
+    SSH port changed when the box finished provisioning)."""
+    from runplz.backends import _ssh_common
+
+    monkeypatch.setattr(_ssh_common, "SSH_OPTS", [])
     clock = [0.0]
     monkeypatch.setattr("time.time", lambda: clock[0])
     monkeypatch.setattr("time.sleep", lambda s: clock.__setitem__(0, clock[0] + s))
 
-    call_log = []
+    probes = []
+    refresh_calls = {"n": 0}
 
     def fake_run(cmd, *a, **kw):
-        call_log.append(cmd[0])
-        # SSH always fails; `brev refresh` succeeds.
-        if cmd[0] == "ssh":
-            return mock.Mock(returncode=255, stdout="", stderr="refused")
-        return mock.Mock(returncode=0, stdout="", stderr="")
+        probes.append(cmd[0])
+        return mock.Mock(returncode=255, stdout="", stderr="refused")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    def bump():
+        refresh_calls["n"] += 1
+
+    with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_run):
         with pytest.raises(RuntimeError):
-            brev._wait_until_ssh_reachable("box", max_wait_s=10, probe_interval_s=1)
+            brev._wait_until_ssh_reachable(
+                "box", max_wait_s=10, probe_interval_s=1, refresh_callback=bump
+            )
 
-    # Should have tried ssh at least 4 times; after every 4 we fire `brev refresh`.
-    ssh_probes = sum(1 for c in call_log if c == "ssh")
-    brev_refreshes = sum(1 for c in call_log if c == "brev")
-    assert ssh_probes >= 4
-    assert brev_refreshes >= 1
+    assert sum(1 for c in probes if c == "ssh") >= 4
+    assert refresh_calls["n"] >= 1
 
 
 # -- _require_brev_cli ----------------------------------------------------
@@ -436,7 +443,7 @@ def test_create_instance_container_mode_adds_image_flag(tmp_path):
 def test_ensure_docker_happy_path():
     # subprocess.run returns 0 → wait script exit 0 → no fallback.
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends._ssh_common.subprocess.run",
         return_value=mock.Mock(returncode=0),
     ):
         brev._ensure_docker("some-box")  # no raise
@@ -450,10 +457,10 @@ def test_ensure_docker_falls_back_to_get_docker_sh(capsys):
         fallback_called["cmd"] = cmd
 
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends._ssh_common.subprocess.run",
         return_value=mock.Mock(returncode=1),
     ):
-        with mock.patch("runplz.backends.brev._sh", fake_sh):
+        with mock.patch("runplz.backends._ssh_common._sh", fake_sh):
             brev._ensure_docker("some-box")
 
     assert "get.docker.com" in fallback_called["cmd"][-1]
@@ -465,7 +472,7 @@ def test_ensure_docker_falls_back_to_get_docker_sh(capsys):
 
 def test_remote_has_nvidia_true():
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends._ssh_common.subprocess.run",
         return_value=mock.Mock(returncode=0, stdout="y\n"),
     ):
         assert brev._remote_has_nvidia("box") is True
@@ -473,7 +480,7 @@ def test_remote_has_nvidia_true():
 
 def test_remote_has_nvidia_false():
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends._ssh_common.subprocess.run",
         return_value=mock.Mock(returncode=0, stdout="n\n"),
     ):
         assert brev._remote_has_nvidia("box") is False
@@ -484,7 +491,7 @@ def test_remote_has_nvidia_false():
 
 def test_rsync_up_excludes_and_no_delete(tmp_path):
     recorded = {}
-    with mock.patch("runplz.backends.brev._sh", lambda c: recorded.setdefault("c", c)):
+    with mock.patch("runplz.backends._ssh_common._sh", lambda c: recorded.setdefault("c", c)):
         brev._rsync_up(tmp_path, "my-box")
     cmd = recorded["c"]
     assert cmd[:2] == ["rsync", "-az"]
@@ -499,7 +506,7 @@ def test_rsync_up_excludes_default_secret_files(tmp_path):
     from runplz._excludes import DEFAULT_TRANSFER_EXCLUDES
 
     recorded = {}
-    with mock.patch("runplz.backends.brev._sh", lambda c: recorded.setdefault("c", c)):
+    with mock.patch("runplz.backends._ssh_common._sh", lambda c: recorded.setdefault("c", c)):
         brev._rsync_up(tmp_path, "my-box")
 
     cmd = recorded["c"]
@@ -509,7 +516,7 @@ def test_rsync_up_excludes_default_secret_files(tmp_path):
 
 def test_rsync_down_runs_correct_cmd(tmp_path):
     recorded = {}
-    with mock.patch("runplz.backends.brev._sh", lambda c: recorded.setdefault("c", c)):
+    with mock.patch("runplz.backends._ssh_common._sh", lambda c: recorded.setdefault("c", c)):
         brev._rsync_down("my-box", tmp_path)
     cmd = recorded["c"]
     assert cmd[:2] == ["rsync", "-az"]
@@ -519,7 +526,7 @@ def test_rsync_down_runs_correct_cmd(tmp_path):
 
 def test_ssh_packages_cmd_in_bash_lc():
     recorded = {}
-    with mock.patch("runplz.backends.brev._sh", lambda c: recorded.setdefault("c", c)):
+    with mock.patch("runplz.backends._ssh_common._sh", lambda c: recorded.setdefault("c", c)):
         brev._ssh("instance", "echo hi")
     assert recorded["c"][0] == "ssh"
     # Last arg is `bash -lc '<escaped cmd>'`.
@@ -529,7 +536,7 @@ def test_ssh_packages_cmd_in_bash_lc():
 
 def test_sh_prints_and_runs(capsys):
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends._ssh_common.subprocess.run",
         return_value=mock.Mock(returncode=0),
     ) as patched:
         brev._sh(["echo", "hello world"])
@@ -540,7 +547,7 @@ def test_sh_prints_and_runs(capsys):
 
 def test_ssh_capture_runs_with_capture():
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends._ssh_common.subprocess.run",
         return_value=mock.Mock(returncode=0, stdout="stdout-content"),
     ) as patched:
         out = brev._ssh_capture("box", "echo hi")
@@ -554,8 +561,8 @@ def test_ssh_capture_runs_with_capture():
 def test_ensure_remote_rsync_sends_expected_cmd():
     recorded = {}
     with mock.patch(
-        "runplz.backends.brev._ssh",
-        lambda instance, cmd: recorded.update({"i": instance, "c": cmd}),
+        "runplz.backends._ssh_common._ssh",
+        lambda target, cmd: recorded.update({"i": target, "c": cmd}),
     ):
         brev._ensure_remote_rsync("box")
     assert recorded["i"] == "box"
@@ -569,7 +576,7 @@ def test_ensure_remote_rsync_sends_expected_cmd():
 def test_build_image_dockerfile_uses_docker_build_f(tmp_path):
     img = Image.from_dockerfile("docker/Dockerfile")
     recorded = {}
-    with mock.patch("runplz.backends.brev._ssh", lambda i, c: recorded.setdefault("c", c)):
+    with mock.patch("runplz.backends._ssh_common._ssh", lambda i, c: recorded.setdefault("c", c)):
         brev._build_image("box", img)
     assert "docker build -f docker/Dockerfile" in recorded["c"]
     assert "__EOF__" not in recorded["c"]  # no synthesized Dockerfile heredoc
@@ -578,7 +585,7 @@ def test_build_image_dockerfile_uses_docker_build_f(tmp_path):
 def test_build_image_from_registry_pipes_synthesized_dockerfile():
     img = Image.from_registry("pytorch/pytorch:2.4.0").pip_install("numpy")
     recorded = {}
-    with mock.patch("runplz.backends.brev._ssh", lambda i, c: recorded.setdefault("c", c)):
+    with mock.patch("runplz.backends._ssh_common._ssh", lambda i, c: recorded.setdefault("c", c)):
         brev._build_image("box", img)
     c = recorded["c"]
     assert "cat <<'__EOF__' | sudo docker build -f - -t" in c
@@ -594,9 +601,9 @@ def test_run_container_detached_builds_full_docker_run(tmp_path):
     fn = _function(app, image, module_file=_job_inside(tmp_path), env={"USER_VAR": "1"})
 
     recorded = {}
-    with mock.patch("runplz.backends.brev._ssh", lambda i, c: recorded.setdefault("c", c)):
+    with mock.patch("runplz.backends._ssh_common._ssh", lambda i, c: recorded.setdefault("c", c)):
         brev._run_container_detached(
-            instance="box",
+            target="box",
             container_name="runplz-train-abc123",
             function=fn,
             rel_script="jobs/train.py",
@@ -629,7 +636,7 @@ def test_stream_and_wait_exits_when_container_done():
     def fake_run(cmd, *a, **kw):
         return next(seq)
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_run):
         rc = brev._stream_and_wait("box", "c")
     assert rc == 0
 
@@ -656,8 +663,8 @@ def test_stream_and_wait_reconnects_then_gives_up(capsys):
         return mock.Mock(returncode=0, stdout="")
 
     # Keep the retry ceiling small so the test finishes fast.
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
-        with mock.patch("runplz.backends.brev.time.sleep", lambda _s: None):
+    with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_run):
+        with mock.patch("runplz.backends._ssh_common.time.sleep", lambda _s: None):
             rc = brev._stream_and_wait("box", "c", max_reconnects=3)
     assert rc == 137
     # Should have emitted the give-up message once max_reconnects hit.
@@ -667,7 +674,7 @@ def test_stream_and_wait_reconnects_then_gives_up(capsys):
 def test_container_running_treats_ssh_failure_as_still_running():
     # subprocess.run raises TimeoutExpired → conservative return True.
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends._ssh_common.subprocess.run",
         side_effect=__import__("subprocess").TimeoutExpired(cmd="ssh", timeout=30),
     ):
         assert brev._container_running("box", "c") is True
@@ -675,7 +682,7 @@ def test_container_running_treats_ssh_failure_as_still_running():
 
 def test_container_running_returns_false_on_inspect_false():
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends._ssh_common.subprocess.run",
         return_value=mock.Mock(returncode=0, stdout="false\n"),
     ):
         assert brev._container_running("box", "c") is False
@@ -683,7 +690,7 @@ def test_container_running_returns_false_on_inspect_false():
 
 def test_container_running_true_on_running_output():
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends._ssh_common.subprocess.run",
         return_value=mock.Mock(returncode=0, stdout="true\n"),
     ):
         assert brev._container_running("box", "c") is True
@@ -768,8 +775,11 @@ def test_run_vm_docker_mode_nonzero_exit_raises(tmp_path):
         _rsync_down=mock.DEFAULT,
         _apply_on_finish=mock.DEFAULT,
     ):
-        with pytest.raises(RuntimeError) as ei:
-            brev.run(app, fn, [], {}, instance="box")
+        # _fetch_failure_tail lives in _ssh_common and calls _ssh_capture
+        # via its own module namespace — patch it there too.
+        with mock.patch("runplz.backends._ssh_common._ssh_capture", fake_ssh_capture):
+            with pytest.raises(RuntimeError) as ei:
+                brev.run(app, fn, [], {}, instance="box")
 
     msg = str(ei.value)
     assert "exited with status 137" in msg
@@ -809,12 +819,13 @@ def test_run_container_mode_nonzero_exit_includes_remote_log_tail(tmp_path):
         _ssh_capture=fake_ssh_capture,
         _rsync_down=mock.DEFAULT,
     ):
-        with mock.patch(
-            "runplz.backends.brev.subprocess.run",
-            return_value=mock.Mock(returncode=0, stdout="", stderr=""),
-        ):
-            with pytest.raises(RuntimeError) as ei:
-                brev.run(app, fn, [], {}, instance="box")
+        with mock.patch("runplz.backends._ssh_common._ssh_capture", fake_ssh_capture):
+            with mock.patch(
+                "runplz.backends.brev.subprocess.run",
+                return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+            ):
+                with pytest.raises(RuntimeError) as ei:
+                    brev.run(app, fn, [], {}, instance="box")
 
     msg = str(ei.value)
     assert "exited with status 1" in msg
@@ -828,8 +839,8 @@ def test_fetch_failure_tail_returns_empty_on_ssh_error():
     def boom(*a, **kw):
         raise RuntimeError("ssh went away")
 
-    with mock.patch("runplz.backends.brev._ssh_capture", boom):
-        out = brev._fetch_failure_tail(instance="box", container_name=None)
+    with mock.patch("runplz.backends._ssh_common._ssh_capture", boom):
+        out = brev._fetch_failure_tail(target="box", container_name=None)
     # Helper swallows the error and returns a diagnostic string.
     assert "could not fetch remote log tail" in out
     assert "ssh went away" in out
@@ -846,15 +857,13 @@ def test_raise_for_runtime_cap_kills_container_and_raises():
         calls.append(list(cmd))
         return mock.Mock(returncode=0, stdout="", stderr="")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+    with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_sub):
         with pytest.raises(RuntimeError) as ei:
             brev._raise_for_runtime_cap("box", 60, container_name="c-abc")
 
-    # Kill was attempted.
     kill_cmds = [c for c in calls if any("docker kill" in tok for tok in c)]
     assert kill_cmds, f"no docker kill issued; saw: {calls}"
     assert any("c-abc" in tok for tok in kill_cmds[0])
-    # Error is clear about the cap.
     assert "max_runtime_seconds=60" in str(ei.value)
 
 
@@ -866,7 +875,7 @@ def test_raise_for_runtime_cap_pkills_bootstrap_in_native_or_container_mode():
         calls.append(list(cmd))
         return mock.Mock(returncode=0, stdout="", stderr="")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+    with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_sub):
         with pytest.raises(RuntimeError):
             brev._raise_for_runtime_cap("box", 30, container_name=None)
 
@@ -880,9 +889,6 @@ def test_run_container_mode_timeout_triggers_cap():
     through _raise_for_runtime_cap → RuntimeError."""
 
     def fake_sub(cmd, *a, **kw):
-        # Only the bootstrap ssh call has timeout set; that's the one we
-        # want to simulate expiring. Other ssh calls (pkill cleanup) are
-        # fine.
         if kw.get("timeout") is not None:
             raise subprocess.TimeoutExpired(cmd=cmd, timeout=kw["timeout"])
         return mock.Mock(returncode=0, stdout="", stderr="")
@@ -892,11 +898,11 @@ def test_run_container_mode_timeout_triggers_cap():
         image=Image.from_registry("ubuntu:22.04"),
         env={},
     )
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
-        with mock.patch("runplz.backends.brev._render_ops_script", return_value=""):
+    with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_sub):
+        with mock.patch("runplz.backends._ssh_common._render_ops_script", return_value=""):
             with pytest.raises(RuntimeError, match="max_runtime_seconds=5"):
                 brev._run_container_mode(
-                    instance="box",
+                    target="box",
                     function=fn,
                     rel_script="jobs/j.py",
                     args=[],
@@ -910,13 +916,11 @@ def test_stream_and_wait_raises_when_cap_exceeded():
     streaming past the deadline."""
 
     def fake_sub(cmd, *a, **kw):
-        # Simulate a never-ending logs stream: the `docker logs -f` ssh
-        # call (has timeout=remaining_s) expires.
         if "docker logs -f" in " ".join(cmd):
             raise subprocess.TimeoutExpired(cmd=cmd, timeout=kw.get("timeout", 0))
         return mock.Mock(returncode=0, stdout="", stderr="")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+    with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_sub):
         with pytest.raises(RuntimeError, match="max_runtime_seconds=2"):
             brev._stream_and_wait("box", "container-xyz", max_runtime_seconds=2)
 
@@ -939,7 +943,7 @@ def test_stream_and_wait_no_cap_passes_none_timeout():
             return mock.Mock(returncode=0, stdout="0", stderr="")
         return mock.Mock(returncode=0, stdout="", stderr="")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+    with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_sub):
         exit_code = brev._stream_and_wait("box", "c-1", max_runtime_seconds=None)
 
     assert exit_code == 0
@@ -1258,10 +1262,10 @@ def test_run_native_builds_expected_remote_cmd(tmp_path):
         recorded["run_cmd"] = cmd
         return mock.Mock(returncode=0)
 
-    with mock.patch("runplz.backends.brev._ssh", fake_sh_ssh):
-        with mock.patch("runplz.backends.brev.subprocess.run", fake_sub_run):
+    with mock.patch("runplz.backends._ssh_common._ssh", fake_sh_ssh):
+        with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_sub_run):
             rc = brev._run_native(
-                instance="box",
+                target="box",
                 function=fn,
                 rel_script="jobs/train.py",
                 args=[],
@@ -1288,13 +1292,13 @@ def test_run_native_cpu_index_url(tmp_path):
     def fake_ssh(i, c):
         recorded.setdefault("setup", c)
 
-    with mock.patch("runplz.backends.brev._ssh", fake_ssh):
+    with mock.patch("runplz.backends._ssh_common._ssh", fake_ssh):
         with mock.patch(
-            "runplz.backends.brev.subprocess.run",
+            "runplz.backends._ssh_common.subprocess.run",
             return_value=mock.Mock(returncode=0),
         ):
             brev._run_native(
-                instance="box",
+                target="box",
                 function=fn,
                 rel_script="jobs/train.py",
                 args=[],
@@ -1323,10 +1327,10 @@ def test_run_container_mode_builds_expected_remote_cmd(tmp_path):
         recorded["run"] = cmd
         return mock.Mock(returncode=0)
 
-    with mock.patch("runplz.backends.brev._ssh", fake_ssh):
-        with mock.patch("runplz.backends.brev.subprocess.run", fake_sub_run):
+    with mock.patch("runplz.backends._ssh_common._ssh", fake_ssh):
+        with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_sub_run):
             rc = brev._run_container_mode(
-                instance="box",
+                target="box",
                 function=fn,
                 rel_script="jobs/train.py",
                 args=[],

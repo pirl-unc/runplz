@@ -3,6 +3,7 @@
 Usage:
     runplz local <script.py>
     runplz brev --instance my-gpu-box <script.py>
+    runplz ssh  --host gpu.example.com <script.py>
     runplz modal <script.py>
 
 Loads the user's script, finds its @app.local_entrypoint, sets the backend,
@@ -31,7 +32,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(
         prog="runplz", description="Run a Python @app.function on a chosen backend."
     )
-    p.add_argument("backend", choices=["local", "brev", "modal"])
+    p.add_argument("backend", choices=["local", "brev", "modal", "ssh"])
     p.add_argument("script", help="Path to a job script defining an App with @local_entrypoint.")
     p.add_argument(
         "--outputs-dir",
@@ -39,6 +40,10 @@ def main(argv=None):
         help="Host directory to collect outputs into (default: out/).",
     )
     p.add_argument("--instance", help="[brev] Brev instance name.")
+    p.add_argument(
+        "--host",
+        help="[ssh] SSH endpoint (hostname, user@host, or ~/.ssh/config alias).",
+    )
     p.add_argument(
         "--no-build", action="store_true", help="[local] Skip docker build (reuse tagged image)."
     )
@@ -61,6 +66,12 @@ def main(argv=None):
         app._backend_kwargs["instance"] = args.instance
     elif args.instance:
         p.error(f"--instance only applies to the brev backend (got {args.backend!r}).")
+    if args.backend == "ssh":
+        if not args.host:
+            p.error("--host is required for the ssh backend")
+        app._backend_kwargs["host"] = args.host
+    elif args.host:
+        p.error(f"--host only applies to the ssh backend (got {args.backend!r}).")
     if args.no_build:
         if args.backend != "local":
             p.error(f"--no-build only applies to the local backend (got {args.backend!r}).")

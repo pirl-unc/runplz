@@ -140,6 +140,73 @@ def test_cli_outputs_dir_flag_is_forwarded(tmp_path):
     assert captured["kw"]["outputs_dir"] == "artifacts"
 
 
+def test_cli_ssh_requires_host(tmp_path, capsys):
+    script = _write_job(
+        tmp_path,
+        """
+        from runplz import App, Image
+
+        app = App("t")
+        image = Image.from_registry("ubuntu:22.04")
+
+        @app.function(image=image)
+        def fn(): pass
+
+        @app.local_entrypoint()
+        def main(): fn.remote()
+        """,
+    )
+    with pytest.raises(SystemExit):
+        _cli.main(["ssh", str(script)])
+    assert "--host is required" in capsys.readouterr().err
+
+
+def test_cli_ssh_threads_host_into_backend_kwargs(tmp_path):
+    script = _write_job(
+        tmp_path,
+        """
+        from runplz import App, Image
+
+        app = App("t")
+        image = Image.from_registry("ubuntu:22.04")
+
+        @app.function(image=image)
+        def fn(): pass
+
+        @app.local_entrypoint()
+        def main(): fn.remote()
+        """,
+    )
+    captured = {}
+    with mock.patch(
+        "runplz.backends.ssh.run",
+        lambda app, function, args, kwargs, **kw: captured.update({"kw": kw}),
+    ):
+        _cli.main(["ssh", "--host", "gpu.example.com", str(script)])
+    assert captured["kw"]["host"] == "gpu.example.com"
+
+
+def test_cli_host_rejected_on_non_ssh_backend(tmp_path, capsys):
+    script = _write_job(
+        tmp_path,
+        """
+        from runplz import App, Image
+
+        app = App("t")
+        image = Image.from_registry("ubuntu:22.04")
+
+        @app.function(image=image)
+        def fn(): pass
+
+        @app.local_entrypoint()
+        def main(): fn.remote()
+        """,
+    )
+    with pytest.raises(SystemExit):
+        _cli.main(["local", "--host", "x", str(script)])
+    assert "--host only applies" in capsys.readouterr().err
+
+
 def test_cli_modal_dispatches_to_modal_backend(tmp_path):
     script = _write_job(
         tmp_path,

@@ -423,7 +423,7 @@ def test_bind_rejects_unknown_backend():
     def train():
         pass
 
-    with pytest.raises(ValueError, match="must be 'local', 'brev', or 'modal'"):
+    with pytest.raises(ValueError, match="must be 'local', 'brev', 'modal', or 'ssh'"):
         app.bind("k8s")
 
 

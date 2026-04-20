@@ -1,61 +1,55 @@
-"""Brev backend: provision (optional) → rsync repo → ssh docker build+run → rsync outputs.
+"""Brev backend: thin wrapper over the shared SSH plumbing.
+
+Provides Brev CLI lifecycle (create / stop / delete / ls / refresh) +
+the instance-type picker. Everything else — rsync, ssh, docker build,
+stream-and-wait, failure-tail, runtime-cap — lives in
+`runplz/backends/_ssh_common.py` and is shared with the SSH backend.
 
 Assumes `brev` CLI is installed and `brev login` has been run. Uses Brev's
 managed SSH config (`brev refresh` populates ~/.brev/ssh_config, which
 ~/.ssh/config Includes).
-
-Long training runs are resilient to SSH disconnects: the remote docker
-container is started detached (`docker run -d`), logs are streamed via
-`docker logs -f` in a reconnect loop, and we wait for the container to
-exit via `docker wait` (which tolerates transient tunnel drops).
 """
 
 import json
-import shlex
 import subprocess
-import time
-import uuid
 from pathlib import Path
 from typing import Optional
 
-from runplz._excludes import DEFAULT_TRANSFER_EXCLUDES
 from runplz._selector import Candidate, pick_machine
+from runplz.backends._ssh_common import (
+    FAILURE_TAIL_LINES,
+    _build_image,
+    _container_running,
+    _ensure_docker,
+    _ensure_remote_rsync,
+    _fetch_failure_tail,
+    _raise_for_runtime_cap,
+    _remote_has_nvidia,
+    _render_ops_script,
+    _rsync_down,
+    _rsync_up,
+    _run_container_detached,
+    _run_container_mode,
+    _run_native,
+    _sh,
+    _ssh,
+    _ssh_capture,
+    _stream_and_wait,
+    _wait_until_ssh_reachable,
+    make_container_name,
+)
 
-REMOTE_REPO_DIR = "runplz-repo"
-REMOTE_OUT_DIR = "runplz-out"
-REMOTE_IMAGE_TAG = "runplz-train:brev"
+# Re-exports so older test patches and external code that patched these
+# keep working without a hard rename.
+_ = (  # noqa: F841 — held for test-mocking compatibility
+    _container_running,
+    _raise_for_runtime_cap,
+    _render_ops_script,
+    _ssh,
+)
 
-# container-mode / native paths tee the bootstrap's combined stdout+stderr
-# into this file so we can `tail` it for failure context (issue #17). Lives
-# under $HOME so no sudo needed and survives across ssh reconnects.
-REMOTE_LAST_LOG = ".runplz-last.log"
+__all__ = ["run"]
 
-# How many lines of remote log to include in a failure RuntimeError.
-FAILURE_TAIL_LINES = 50
-
-# Brev's ~/.brev/ssh_config sets `ControlMaster auto` (connection
-# multiplexing). That's fast for short repeated calls but catastrophic
-# for our workload: a long-lived `docker logs -f` ssh session holds the
-# master, the underlying TCP goes stale (common on GCP N1/G2 GPU boxes),
-# and every subsequent ssh call — including our `docker inspect` health
-# probe — hangs for ~5 minutes waiting for the dead master to time out.
-# Force a fresh TCP connection per ssh call to sidestep that entirely.
-#
-# ServerAliveInterval=30 + large ServerAliveCountMax keeps each
-# individual session alive during idle stretches (docker image pulls,
-# data downloads, between-epoch pauses).
-_SSH_OPTS = [
-    "-o",
-    "ControlMaster=no",
-    "-o",
-    "ControlPath=none",
-    "-o",
-    "ServerAliveInterval=30",
-    "-o",
-    "ServerAliveCountMax=240",
-    "-o",
-    "TCPKeepAlive=yes",
-]
 
 # Brev's CLI hangs on an interactive walkthrough once an instance exists in the
 # org, blocking `brev ls`/`brev refresh`. Overwriting this file with the
@@ -97,7 +91,9 @@ def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out")
     # `brev create` has its own internal wait-for-ready loop, but on some
     # providers (8-GPU boxes, slow pull of large container images) that
     # loop times out before SSH is actually reachable. Poll explicitly.
-    _wait_until_ssh_reachable(instance)
+    # Pass refresh callback so ssh_common can re-run `brev refresh` mid-poll
+    # when the instance transitions from bootstrap-shim port to real port.
+    _wait_until_ssh_reachable(instance, refresh_callback=lambda: _refresh_ssh())
 
     repo = app._repo_root
     host_out = (repo / outputs_dir).resolve()
@@ -115,13 +111,8 @@ def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out")
     exit_code: Optional[int] = None
     try:
         if cfg.mode == "container":
-            # Brev `--mode container` box IS the user's container image. Apply
-            # our Image DSL ops inline (apt_install, pip_install,
-            # pip_install_local_dir, run_commands) via ssh, then invoke the
-            # bootstrap. No docker-in-docker, no nvidia-container-toolkit,
-            # no Brev VM sidecar stack.
             exit_code = _run_container_mode(
-                instance=instance,
+                target=instance,
                 function=function,
                 rel_script=str(rel_script),
                 args=args,
@@ -131,10 +122,10 @@ def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out")
         elif cfg.use_docker:
             _ensure_docker(instance)
             gpu_flag = "--gpus all" if _remote_has_nvidia(instance) else ""
-            container_name = f"runplz-{function.name}-{uuid.uuid4().hex[:8]}"
+            container_name = make_container_name(function.name)
             _build_image(instance, function.image)
             _run_container_detached(
-                instance=instance,
+                target=instance,
                 container_name=container_name,
                 function=function,
                 rel_script=str(rel_script),
@@ -147,10 +138,9 @@ def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out")
             )
         else:
             # Legacy native path. Skips docker; installs python + torch +
-            # user code into a venv on a plain VM-mode Brev box. Use this only
-            # if you can't use mode="container" (e.g. specific provider flow).
+            # user code into a venv on a plain VM-mode Brev box.
             exit_code = _run_native(
-                instance=instance,
+                target=instance,
                 function=function,
                 rel_script=str(rel_script),
                 args=args,
@@ -162,17 +152,10 @@ def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out")
     finally:
         # Fetch a log tail BEFORE container/box cleanup — afterwards the
         # logs are gone (docker rm wipes container state; brev stop/delete
-        # makes the box unreachable). Only do this on failure; no need to
-        # round-trip on the success path.
+        # makes the box unreachable). Only do this on failure.
         failure_tail = ""
         if exit_code is not None and exit_code != 0:
-            failure_tail = _fetch_failure_tail(
-                instance=instance,
-                container_name=container_name,
-            )
-        # Container cleanup first (while the box is definitely up), then
-        # the box itself per cfg.on_finish. Both are best-effort so a
-        # failure in cleanup doesn't mask the real error from the try block.
+            failure_tail = _fetch_failure_tail(target=instance, container_name=container_name)
         if container_name is not None:
             try:
                 _ssh_capture(
@@ -193,442 +176,7 @@ def run(app, function, args, kwargs, *, instance: str, outputs_dir: str = "out")
         raise RuntimeError(msg)
 
 
-def _fetch_failure_tail(*, instance: str, container_name: Optional[str]) -> str:
-    """Fetch the last N lines of remote output for a failed run.
-
-    Two sources:
-    - VM + docker path (`container_name` is set): `docker logs --tail N
-      <name>`. Docker persists logs until `docker rm`, so this works even
-      after a crash.
-    - container-mode + native paths: the bootstrap's combined stdout+stderr
-      was teed into `$HOME/{REMOTE_LAST_LOG}` during the run. `tail` that.
-
-    Best-effort: if ssh is wedged or the log file isn't there, return an
-    empty string rather than masking the original error with a tail-fetch
-    traceback.
-    """
-    try:
-        if container_name is not None:
-            cmd = f"sudo docker logs --tail {FAILURE_TAIL_LINES} {container_name} 2>&1"
-        else:
-            cmd = (
-                f'if [ -f "$HOME/{REMOTE_LAST_LOG}" ]; then '
-                f'tail -n {FAILURE_TAIL_LINES} "$HOME/{REMOTE_LAST_LOG}"; '
-                f"fi"
-            )
-        out = _ssh_capture(instance, cmd)
-        return (out or "").rstrip()
-    except Exception as exc:  # noqa: BLE001
-        return f"[runplz: could not fetch remote log tail — {type(exc).__name__}: {exc}]"
-
-
-def _apply_on_finish(*, instance: str, cfg) -> None:
-    """Stop / delete / leave the Brev box per `cfg.on_finish`.
-
-    Always best-effort: we never want box-cleanup to swallow a real error
-    from the try block. Failures here print a warning and move on.
-    """
-    if cfg.on_finish == "leave":
-        return
-    action = cfg.on_finish  # "stop" or "delete"
-    print(f"+ on_finish={action}: running `brev {action} {instance}`", flush=True)
-    try:
-        r = subprocess.run(
-            ["brev", action, instance],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(
-            f"+ warning: `brev {action} {instance}` raised {type(exc).__name__}: {exc}. "
-            f"The box may still be running — check `brev ls`.",
-            flush=True,
-        )
-        return
-    if r.returncode != 0:
-        # Don't raise — we're in a finally block and must not mask the real
-        # error. But DO shout: a silent non-zero here is a billing leak,
-        # which is exactly what on_finish exists to prevent.
-        print(
-            f"+ warning: `brev {action} {instance}` exited {r.returncode}. "
-            f"The box may still be running — check `brev ls`. "
-            f"stderr: {(r.stderr or '').strip()[:500]}",
-            flush=True,
-        )
-
-
-_NATIVE_VENV = "$HOME/runplz-venv"
-_NATIVE_OUT = f"$HOME/{REMOTE_OUT_DIR}"
-
-
-def _ensure_remote_rsync(instance: str):
-    """Install rsync on the remote if missing (pytorch/pytorch image and
-    similar are slim and don't ship with rsync)."""
-    cmd = (
-        "command -v rsync >/dev/null 2>&1 && exit 0; "
-        "export DEBIAN_FRONTEND=noninteractive; "
-        "sudo apt-get update -qq && "
-        "sudo apt-get install -y -qq --no-install-recommends rsync"
-    )
-    _ssh(instance, cmd)
-
-
-def _run_container_mode(*, instance, function, rel_script, args, kwargs, max_runtime_seconds=None):
-    """Brev `--mode container`: the SSH box IS the user's container image.
-
-    Runs the user's Image DSL ops (apt_install, pip_install, ...) inline
-    over ssh, then invokes the bootstrap. Because the box is already the
-    user-selected pytorch/cuda image, there's no docker-in-docker, no
-    `--gpus all` nvidia-container-toolkit path, no Brev VM-mode sidecars.
-    """
-    ops_script = _render_ops_script(function.image)
-    if ops_script:
-        _ssh(instance, ops_script)
-
-    # Values that contain $HOME must use double-quoted exports so the
-    # remote shell expands them. shlex.quote would wrap in single quotes,
-    # preventing expansion. Non-path values (JSON, name) go through
-    # shlex.quote since they may contain shell metacharacters.
-    user_env_exports = " ".join(
-        f"export {k}={shlex.quote(str(v))};" for k, v in function.env.items()
-    )
-    remote = (
-        "set -euo pipefail; "
-        "export PATH=/opt/conda/bin:$PATH; "
-        f'export RUNPLZ_OUT="$HOME/{REMOTE_OUT_DIR}"; '
-        f'export RUNPLZ_SCRIPT="$HOME/{REMOTE_REPO_DIR}/{rel_script}"; '
-        f"export RUNPLZ_FUNCTION={shlex.quote(function.name)}; "
-        f"export RUNPLZ_ARGS={shlex.quote(json.dumps(args))}; "
-        f"export RUNPLZ_KWARGS={shlex.quote(json.dumps(kwargs))}; "
-        f"{user_env_exports} "
-        'mkdir -p "$RUNPLZ_OUT"; '
-        # cd to the rsync'd repo so user-level `subprocess.run(["bash",
-        # "scripts/..."])` calls with relative paths find their scripts.
-        f'cd "$HOME/{REMOTE_REPO_DIR}"; '
-        # Tee combined stdout+stderr to a remote file so we can tail it for
-        # failure context (issue #17). `pipefail` + `set -e` above ensure the
-        # bootstrap's exit code (not tee's) is what escapes this block.
-        f'python -m runplz._bootstrap 2>&1 | tee "$HOME/{REMOTE_LAST_LOG}"'
-    )
-    try:
-        r = subprocess.run(
-            ["ssh", *_SSH_OPTS, instance, f"bash -lc {shlex.quote(remote)}"],
-            timeout=max_runtime_seconds,
-        )
-    except subprocess.TimeoutExpired:
-        _raise_for_runtime_cap(instance, max_runtime_seconds, container_name=None)
-    return r.returncode
-
-
-def _render_ops_script(image) -> str:
-    """Translate Image DSL ops into a bash script that runs them in
-    sequence on the remote container-mode box. Idempotent: apt/pip on
-    already-present packages is a cheap no-op.
-
-    The image is guaranteed to be `Image.from_registry(...)` — the
-    decoration-time validator in runplz.app rejects Dockerfile images
-    when `brev_config.mode == "container"`.
-    """
-    lines = ["set -euo pipefail"]
-    # Start on an apt-free note: wait for any apt from box bootstrap.
-    lines.append(
-        "for i in $(seq 1 60); do "
-        "  sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 "
-        "    && { echo waiting for apt; sleep 10; } "
-        "    || break; "
-        "done"
-    )
-    lines.append("export DEBIAN_FRONTEND=noninteractive")
-    lines.append("export PATH=/opt/conda/bin:$PATH")
-
-    apt_packages_seen: list[str] = []
-    pip_packages_seen: list[str] = []
-    for op in image.ops:
-        kw = op.kwargs_dict()
-        if op.kind == "apt_install" and op.args:
-            apt_packages_seen.extend(op.args)
-            pkgs = " ".join(shlex.quote(p) for p in op.args)
-            lines.append(
-                f"sudo apt-get update -qq && sudo apt-get install -y -qq "
-                f"--no-install-recommends {pkgs}"
-            )
-        elif op.kind == "pip_install" and op.args:
-            pip_packages_seen.extend(op.args)
-            pkgs = " ".join(shlex.quote(p) for p in op.args)
-            idx = ""
-            if "index_url" in kw:
-                idx = f" --index-url {shlex.quote(kw['index_url'])}"
-            lines.append(f"pip install --quiet{idx} {pkgs}")
-        elif op.kind == "pip_install_local_dir":
-            path = kw.get("path", ".")
-            editable = kw.get("editable", "1") == "1"
-            flags = "-e " if editable else ""
-            # Use the rsync'd repo (we rsync it before running). Keep $HOME
-            # unquoted so the remote shell expands it; only quote `path`.
-            rel = path.lstrip("./")
-            sub = f"/{rel}" if rel else ""
-            lines.append(f'pip install --quiet {flags}"$HOME/{REMOTE_REPO_DIR}{sub}"')
-        elif op.kind == "run" and op.args:
-            for cmd in op.args:
-                lines.append(cmd)
-    return "; ".join(lines)
-
-
-def _run_native(
-    *, instance, function, rel_script, args, kwargs, has_nvidia, max_runtime_seconds=None
-):
-    """Install user code natively and run the job over ssh.
-
-    Two ssh sessions: (1) idempotent setup — wait for Brev's own apt, then
-    apt-get + venv + pip install; (2) actually run the user's function
-    via the bootstrap, with env vars set for this specific invocation.
-    """
-    torch_index = (
-        "https://download.pytorch.org/whl/cu121"
-        if has_nvidia
-        else "https://download.pytorch.org/whl/cpu"
-    )
-    setup = (
-        "set -euo pipefail; "
-        # Wait out Brev's own apt activity (installs docker + nvidia
-        # runtime at first boot even when we don't want them).
-        "for i in $(seq 1 120); do "
-        "  sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 "
-        "    && { echo waiting for apt; sleep 10; } "
-        "    || break; "
-        "done; "
-        "sudo apt-get update -qq; "
-        "sudo apt-get install -y -qq --no-install-recommends "
-        "  python3 python3-venv python3-pip bzip2 wget rsync build-essential; "
-        f"python3 -m venv {_NATIVE_VENV}; "
-        f"source {_NATIVE_VENV}/bin/activate; "
-        "pip install --quiet --upgrade pip; "
-        f"pip install --quiet torch --index-url {torch_index}; "
-        f"pip install --quiet -e $HOME/{REMOTE_REPO_DIR}"
-    )
-    _ssh(instance, setup)
-
-    user_env_exports = " ".join(
-        f"export {k}={shlex.quote(str(v))};" for k, v in function.env.items()
-    )
-    remote = (
-        "set -euo pipefail; "
-        f'source "$HOME/runplz-venv/bin/activate"; '
-        f'export RUNPLZ_OUT="$HOME/{REMOTE_OUT_DIR}"; '
-        f'export RUNPLZ_SCRIPT="$HOME/{REMOTE_REPO_DIR}/{rel_script}"; '
-        f"export RUNPLZ_FUNCTION={shlex.quote(function.name)}; "
-        f"export RUNPLZ_ARGS={shlex.quote(json.dumps(args))}; "
-        f"export RUNPLZ_KWARGS={shlex.quote(json.dumps(kwargs))}; "
-        f"{user_env_exports} "
-        'mkdir -p "$RUNPLZ_OUT"; '
-        f'cd "$HOME/{REMOTE_REPO_DIR}"; '
-        # Tee output to a remote log file for failure-tail capture (#17).
-        f'python -m runplz._bootstrap 2>&1 | tee "$HOME/{REMOTE_LAST_LOG}"'
-    )
-    try:
-        r = subprocess.run(
-            ["ssh", *_SSH_OPTS, instance, f"bash -lc {shlex.quote(remote)}"],
-            timeout=max_runtime_seconds,
-        )
-    except subprocess.TimeoutExpired:
-        _raise_for_runtime_cap(instance, max_runtime_seconds, container_name=None)
-    return r.returncode
-
-
-def _raise_for_runtime_cap(instance: str, cap_s, container_name):
-    """Shared timeout-path cleanup + raise for issue #16.
-
-    container_name: set for VM+docker mode (kill the container with docker kill);
-    None for container-mode / native (pkill the bootstrap process tree).
-
-    Best-effort cleanup: if the kill ssh hangs or fails, still raise — the
-    on_finish action in run()'s finally block will nuke the box anyway.
-    """
-    if container_name is not None:
-        cleanup = f"sudo docker kill {container_name}"
-    else:
-        cleanup = "pkill -f 'runplz._bootstrap' || true"
-    try:
-        subprocess.run(
-            ["ssh", *_SSH_OPTS, instance, cleanup],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    raise RuntimeError(
-        f"Remote run exceeded max_runtime_seconds={cap_s}; "
-        f"issued remote cleanup ({cleanup!r}). "
-        f"Raise or remove BrevConfig.max_runtime_seconds if the job "
-        f"legitimately needs longer."
-    )
-
-
-def _build_image(instance: str, image):
-    """Build the image on the remote, either from a user Dockerfile or
-    from our Image DSL (by synthesizing a Dockerfile on the fly)."""
-    if image.dockerfile is not None:
-        build = (
-            f"set -euo pipefail; "
-            f"cd ~/{REMOTE_REPO_DIR} && "
-            f"sudo docker build -f {shlex.quote(image.dockerfile)} "
-            f"-t {REMOTE_IMAGE_TAG} ."
-        )
-    else:
-        df = image.render_dockerfile()
-        # Pipe the synthesized Dockerfile to docker build via stdin,
-        # using the repo as context so pip_install_local_dir can COPY it.
-        build = (
-            f"set -euo pipefail; "
-            f"cd ~/{REMOTE_REPO_DIR} && "
-            f"cat <<'__EOF__' | sudo docker build -f - -t {REMOTE_IMAGE_TAG} .\n"
-            f"{df}\n"
-            f"__EOF__"
-        )
-    _ssh(instance, build)
-
-
-def _run_container_detached(
-    *, instance, container_name, function, rel_script, args, kwargs, gpu_flag
-):
-    env_flags = " ".join(f"-e {shlex.quote(f'{k}={v}')}" for k, v in function.env.items())
-    runner_env = (
-        f"-e RUNPLZ_OUT=/out "
-        f"-e RUNPLZ_SCRIPT={shlex.quote('/workspace/' + rel_script)} "
-        f"-e RUNPLZ_FUNCTION={shlex.quote(function.name)} "
-        f"-e RUNPLZ_ARGS={shlex.quote(json.dumps(args))} "
-        f"-e RUNPLZ_KWARGS={shlex.quote(json.dumps(kwargs))}"
-    )
-    # --network=host bypasses docker's bridge + iptables NAT machinery for the
-    # container. We tried this specifically to see if conntrack saturation
-    # or nvidia-container-toolkit netfilter rules were behind Brev GPU's
-    # SSH-goes-dark-after-a-few-minutes bug; it wasn't (probing showed the
-    # port-22 SYN/ACK still completes but the banner bytes never arrive,
-    # even with host networking). Keeping the flag anyway: simpler
-    # networking, no NAT overhead, and it rules out a whole class of
-    # failure modes if we ever see this again.
-    start = (
-        f"set -euo pipefail; "
-        f"mkdir -p ~/{REMOTE_OUT_DIR} && "
-        f"sudo docker run -d --name {container_name} --network=host {gpu_flag} "
-        f"-v $HOME/{REMOTE_OUT_DIR}:/out "
-        f"{runner_env} {env_flags} "
-        f"{REMOTE_IMAGE_TAG} python -m runplz._bootstrap"
-    )
-    _ssh(instance, start)
-
-
-def _stream_and_wait(
-    instance: str,
-    container_name: str,
-    max_reconnects: int = 20,
-    max_runtime_seconds: Optional[int] = None,
-) -> int:
-    """Stream container logs and return its exit code.
-
-    `docker logs -f` exits when the container stops, so we loop across SSH
-    reconnects: if ssh drops mid-stream we re-attach with `--tail 0` to
-    pick up where we left off, then call `docker wait` for the exit code.
-    Gives up after `max_reconnects` consecutive reconnect attempts so we
-    don't loop forever if the box is permanently unreachable.
-
-    `max_runtime_seconds` is the user-set wall-clock cap (issue #16).
-    Tracked across reconnects so a job that keeps streaming can't dodge
-    it. On trip we `docker kill` the container and raise.
-    """
-    print(f"+ streaming logs from {container_name} (resilient to reconnects)", flush=True)
-    started = time.monotonic()
-
-    def _remaining_s() -> Optional[float]:
-        if max_runtime_seconds is None:
-            return None
-        left = max_runtime_seconds - (time.monotonic() - started)
-        return max(1.0, left)
-
-    tail = "all"
-    reconnects = 0
-    while True:
-        cmd = f"sudo docker logs -f --tail {tail} {container_name}"
-        try:
-            r = subprocess.run(
-                ["ssh", *_SSH_OPTS, instance, cmd],
-                timeout=_remaining_s(),
-            )
-        except subprocess.TimeoutExpired:
-            _raise_for_runtime_cap(instance, max_runtime_seconds, container_name=container_name)
-        # Container may have exited cleanly (rc=0) or ssh may have dropped.
-        # Either way, check whether the container is still running.
-        running = _container_running(instance, container_name)
-        if not running:
-            break
-        if max_runtime_seconds is not None and (time.monotonic() - started) >= max_runtime_seconds:
-            _raise_for_runtime_cap(instance, max_runtime_seconds, container_name=container_name)
-        reconnects += 1
-        if reconnects > max_reconnects:
-            print(
-                f"+ ssh reconnected {max_reconnects} times without finishing; "
-                f"giving up on log stream. Container {container_name} may "
-                f"still be running — check with `brev exec {instance} "
-                f"'sudo docker logs {container_name}'`.",
-                flush=True,
-            )
-            break
-        print(
-            f"+ ssh disconnected (rc={r.returncode}); container still "
-            f"running, reconnecting log stream "
-            f"({reconnects}/{max_reconnects})",
-            flush=True,
-        )
-        tail = "0"
-        time.sleep(2)
-    # Container stopped. Get its exit code (docker wait returns immediately
-    # for stopped containers and prints the exit code).
-    r = subprocess.run(
-        ["ssh", *_SSH_OPTS, instance, f"sudo docker wait {container_name}"],
-        capture_output=True,
-        text=True,
-    )
-    try:
-        return int(r.stdout.strip() or "1")
-    except ValueError:
-        return 1
-
-
-def _container_running(instance: str, container_name: str) -> bool:
-    # Treat ssh hangs / errors as "assume still running" so the caller keeps
-    # retrying the log stream instead of giving up. If the box really did die
-    # mid-training, docker wait at the end will return its final exit code.
-    try:
-        r = subprocess.run(
-            [
-                "ssh",
-                *_SSH_OPTS,
-                instance,
-                f"sudo docker inspect --format '{{{{.State.Running}}}}' {container_name}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        return True
-    if r.returncode != 0:
-        return True
-    return r.stdout.strip() == "true"
-
-
-def _ssh_capture(instance: str, remote_cmd: str) -> str:
-    r = subprocess.run(
-        ["ssh", *_SSH_OPTS, instance, remote_cmd],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    return r.stdout
+# --- Brev CLI lifecycle --------------------------------------------------
 
 
 def _require_brev_cli():
@@ -684,8 +232,6 @@ def _instance_exists(name: str) -> bool:
             f"(see _instance_exists docstring for why). stdout head: "
             f"{(r.stdout or '').strip()[:200]!r}"
         ) from exc
-    # `brev ls --json` shape varies: list of instances, dict with an
-    # "instances" key, or null when the org has no instances at all.
     if data is None:
         return False
     if isinstance(data, list):
@@ -693,7 +239,6 @@ def _instance_exists(name: str) -> bool:
     elif isinstance(data, dict):
         instances = data.get("instances", []) or []
     else:
-        # Unknown shape — treat as CLI failure rather than "empty."
         raise RuntimeError(
             f"`brev ls --json` returned an unexpected shape ({type(data).__name__}). "
             f"Refusing to continue (see _instance_exists docstring)."
@@ -707,12 +252,10 @@ def _create_instance(name: str, *, cfg=None, image=None, function=None):
     Picks the instance type in this order:
     1. `cfg.instance_type` — explicit user override (if set).
     2. Cheapest match from `brev search` driven by `function`'s resource
-       constraints. If no GPU is requested, this falls through to the
-       cheapest CPU box; if a GPU is requested, the cheapest matching
-       GPU box. With no constraints at all, we get the cheapest CPU box
-       Brev offers — a sensible default.
+       constraints, with the 5% cost-tolerance + availability tiebreaker
+       applied via `runplz._selector.pick_machine`.
 
-    Raises only if the picker finds no matches (e.g. constraints too tight).
+    Raises only if the picker finds no matches.
     """
     instance_type: Optional[str] = cfg.instance_type if cfg is not None else None
     if instance_type is None:
@@ -725,8 +268,6 @@ def _create_instance(name: str, *, cfg=None, image=None, function=None):
             )
 
     cmd = ["brev", "create", name, "--type", instance_type]
-    # Propagate --min-disk from function if set (also controls
-    # actual provisioned disk size on Brev, not just filter).
     if function is not None and function.min_disk is not None:
         cmd += ["--min-disk", str(function.min_disk)]
     if cfg is not None and cfg.mode == "container":
@@ -734,6 +275,49 @@ def _create_instance(name: str, *, cfg=None, image=None, function=None):
         # rejected at function-decoration time by runplz.app's validator.
         cmd += ["--mode", "container", "--container-image", image.base]
     _sh(cmd)
+
+
+def _refresh_ssh():
+    _sh(["brev", "refresh"])
+
+
+def _apply_on_finish(*, instance: str, cfg) -> None:
+    """Stop / delete / leave the Brev box per `cfg.on_finish`.
+
+    Always best-effort: we never want box-cleanup to swallow a real error
+    from the try block. Failures here print a warning and move on.
+    """
+    if cfg.on_finish == "leave":
+        return
+    action = cfg.on_finish  # "stop" or "delete"
+    print(f"+ on_finish={action}: running `brev {action} {instance}`", flush=True)
+    try:
+        r = subprocess.run(
+            ["brev", action, instance],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"+ warning: `brev {action} {instance}` raised {type(exc).__name__}: {exc}. "
+            f"The box may still be running — check `brev ls`.",
+            flush=True,
+        )
+        return
+    if r.returncode != 0:
+        # Don't raise — we're in a finally block and must not mask the real
+        # error. But DO shout: a silent non-zero here is a billing leak.
+        print(
+            f"+ warning: `brev {action} {instance}` exited {r.returncode}. "
+            f"The box may still be running — check `brev ls`. "
+            f"stderr: {(r.stderr or '').strip()[:500]}",
+            flush=True,
+        )
+
+
+# --- Brev instance-type picker -------------------------------------------
 
 
 def _brev_gpu_name(modal_name: str) -> str:
@@ -744,60 +328,10 @@ def _brev_gpu_name(modal_name: str) -> str:
     good enough for matching.
     """
     n = modal_name.upper()
-    # Strip any trailing "-40GB" / "-80GB" etc.
     for suffix in ("-40GB", "-80GB", "-16GB", "-24GB"):
         if n.endswith(suffix):
             return n[: -len(suffix)]
     return n
-
-
-def _pick_instance_type(function) -> Optional[str]:
-    """Run `brev search gpu` (or cpu) with filters from `function`'s
-    resource requests; return the best matching TYPE string.
-
-    Brev's own `--sort price` gives us cheapest-first; we post-process
-    through `pick_machine` so that when the top few candidates are
-    within 5% on price, we prefer whichever exposes the lowest
-    availability signal (ETA / supply). If no price or availability
-    fields are present we fall back to the original first-row behavior.
-
-    Returns None if no match.
-    """
-    mode = "gpu" if function.gpu is not None else "cpu"
-    cmd = ["brev", "search", mode, "--json", "--sort", "price"]
-    if function.gpu:
-        cmd += ["--gpu-name", _brev_gpu_name(function.gpu)]
-    if function.min_gpu_memory is not None:
-        cmd += ["--min-vram", str(function.min_gpu_memory)]
-    if function.min_cpu is not None:
-        cmd += ["--min-vcpu", str(int(function.min_cpu))]
-    if function.min_memory is not None:
-        cmd += ["--min-ram", str(function.min_memory)]
-    if function.min_disk is not None:
-        cmd += ["--min-disk", str(function.min_disk)]
-    print("+ " + " ".join(shlex.quote(c) for c in cmd), flush=True)
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    if r.returncode != 0:
-        return None
-    try:
-        results = json.loads(r.stdout)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(results, list) or not results:
-        return None
-
-    candidates = [_candidate_from_brev_row(row) for row in results]
-    priced = [c for c in candidates if c is not None and c.hourly_usd is not None]
-    if priced:
-        choice = pick_machine(priced)
-        if choice is not None:
-            print(f"+ selector picked {choice.name!r}: {choice.reason}", flush=True)
-            return choice.name
-
-    # Fallback: price/name fields not exposed in this `brev search` shape.
-    # Preserve the pre-3.4 behavior of taking the first (price-sorted) row.
-    first = results[0]
-    return _brev_row_type(first)
 
 
 # Candidate field names we tolerate across `brev search --json` schema
@@ -811,12 +345,11 @@ _BREV_PRICE_FIELDS = (
     "estimated_hourly",
 )
 _BREV_AVAILABILITY_FIELDS = (
-    # Lower = faster to start. Brev has used variations of these.
     "estimated_start_seconds",
     "eta_seconds",
     "eta_s",
     "queue_wait_seconds",
-    "availability_rank",  # 0 = immediately available, higher = more latency
+    "availability_rank",
 )
 _BREV_REGION_FIELDS = ("region", "zone", "location", "provider_region")
 
@@ -826,12 +359,7 @@ def _brev_row_type(row: dict) -> Optional[str]:
 
 
 def _candidate_from_brev_row(row: dict) -> Optional[Candidate]:
-    """Map a single `brev search --json` row onto a selector Candidate.
-
-    Returns None when the row lacks a usable `type`/`name`. Prices and
-    availability hints are best-effort: missing data is fine (selector
-    handles `None`).
-    """
+    """Map a single `brev search --json` row onto a selector Candidate."""
     if not isinstance(row, dict):
         return None
     name = _brev_row_type(row)
@@ -870,156 +398,50 @@ def _candidate_from_brev_row(row: dict) -> Optional[Candidate]:
     return Candidate(name=name, hourly_usd=price, availability_hint=hint, region=region, raw=row)
 
 
-def _refresh_ssh():
-    _sh(["brev", "refresh"])
+def _pick_instance_type(function) -> Optional[str]:
+    """Run `brev search gpu` (or cpu) with filters from `function`'s
+    resource requests; return the best matching TYPE string.
 
+    Brev's own `--sort price` gives us cheapest-first; we post-process
+    through `pick_machine` so that when the top few candidates are
+    within 5% on price, we prefer whichever exposes the lowest
+    availability signal (ETA / supply). If no price or availability
+    fields are present we fall back to the original first-row behavior.
 
-def _wait_until_ssh_reachable(
-    instance: str, *, max_wait_s: int = 1200, probe_interval_s: int = 15
-) -> None:
-    """Block until an SSH session to `instance` succeeds, or raise.
-
-    `brev create` has its own internal readiness check, but on slow-boot
-    providers (8-GPU boxes, large container image pulls) it frequently
-    times out before the SSH daemon inside the instance is listening.
-    This polls with short-timeout SSH probes and refreshes Brev's SSH
-    config mid-loop in case the port changes (which it does when Brev
-    promotes an instance from the bootstrap-shim port to the real one).
+    Returns None if no match.
     """
-    import time
+    import shlex as _shlex
 
-    print(
-        f"+ waiting for {instance} SSH to become reachable (up to {max_wait_s}s)...",
-        flush=True,
-    )
-    deadline = time.time() + max_wait_s
-    last_err = ""
-    attempt = 0
-    while time.time() < deadline:
-        attempt += 1
-        probe = subprocess.run(
-            [
-                "ssh",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                f"ConnectTimeout={probe_interval_s}",
-                *_SSH_OPTS,
-                instance,
-                "true",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if probe.returncode == 0:
-            print(f"+ {instance} SSH ready (attempt {attempt})", flush=True)
-            return
-        last_err = (probe.stderr or probe.stdout or "").strip().splitlines()[-1:] or [""]
-        last_err = last_err[0]
-        # Every ~minute, re-run `brev refresh` in case the SSH config
-        # needs updating (new port, new hostname).
-        if attempt % 4 == 0:
-            print(
-                f"+ {instance} still unreachable after {attempt} probes "
-                f"(last: {last_err}); refreshing brev config...",
-                flush=True,
-            )
-            try:
-                subprocess.run(["brev", "refresh"], check=False, capture_output=True, timeout=60)
-            except subprocess.TimeoutExpired:
-                pass
-        time.sleep(probe_interval_s)
-    raise RuntimeError(
-        f"SSH to {instance} never became reachable within {max_wait_s}s "
-        f"(last error: {last_err!r}). The instance may still be booting; "
-        f"try again, or check `brev ls` for its status."
-    )
-
-
-def _ensure_docker(instance: str, timeout_s: int = 420):
-    # Brev's own bootstrap installs docker shortly after the instance comes up.
-    # On GPU boxes the binary appears before dockerd is listening, so poll
-    # `docker info` (daemon reachable) rather than just presence of the binary.
-    print(f"+ waiting for docker daemon on {instance} (up to {timeout_s}s)", flush=True)
-    wait_script = (
-        "for i in $(seq 1 60); do "
-        "if command -v docker >/dev/null 2>&1 && "
-        "   sudo docker info >/dev/null 2>&1; then exit 0; fi; "
-        "sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 "
-        "  && echo 'apt busy, waiting' || echo 'waiting for docker daemon'; "
-        "sleep 7; "
-        "done; exit 1"
-    )
-    r = subprocess.run(
-        [
-            "ssh",
-            *_SSH_OPTS,
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            instance,
-            wait_script,
-        ],
-        timeout=timeout_s,
-    )
+    mode = "gpu" if function.gpu is not None else "cpu"
+    cmd = ["brev", "search", mode, "--json", "--sort", "price"]
+    if function.gpu:
+        cmd += ["--gpu-name", _brev_gpu_name(function.gpu)]
+    if function.min_gpu_memory is not None:
+        cmd += ["--min-vram", str(function.min_gpu_memory)]
+    if function.min_cpu is not None:
+        cmd += ["--min-vcpu", str(int(function.min_cpu))]
+    if function.min_memory is not None:
+        cmd += ["--min-ram", str(function.min_memory)]
+    if function.min_disk is not None:
+        cmd += ["--min-disk", str(function.min_disk)]
+    print("+ " + " ".join(_shlex.quote(c) for c in cmd), flush=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
-        print(
-            f"+ docker daemon not reachable on {instance} after {timeout_s}s "
-            f"(Brev's bootstrap may be stuck — check `brev ls` / "
-            f"`brev exec {instance} 'systemctl status docker'`); "
-            f"falling back to get-docker.sh",
-            flush=True,
-        )
-        _sh(["ssh", instance, "curl -fsSL https://get.docker.com | sudo sh"])
+        return None
+    try:
+        results = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(results, list) or not results:
+        return None
 
+    candidates = [_candidate_from_brev_row(row) for row in results]
+    priced = [c for c in candidates if c is not None and c.hourly_usd is not None]
+    if priced:
+        choice = pick_machine(priced)
+        if choice is not None:
+            print(f"+ selector picked {choice.name!r}: {choice.reason}", flush=True)
+            return choice.name
 
-def _remote_has_nvidia(instance: str) -> bool:
-    # nvidia-smi is often pre-installed on Brev boxes even without a GPU;
-    # the reliable signal is /proc/driver/nvidia, which only exists when the
-    # kernel module is loaded against real hardware.
-    r = subprocess.run(
-        ["ssh", *_SSH_OPTS, instance, "test -d /proc/driver/nvidia && echo y || echo n"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    return r.returncode == 0 and r.stdout.strip() == "y"
-
-
-def _rsync_up(repo: Path, instance: str):
-    # Intentionally no --delete: a user who sshes in and leaves files under
-    # ~/runplz-repo/ (logs, probe scripts, local edits) shouldn't have those
-    # wiped by the next run. Stale files on the remote are cheap; accidental
-    # user-data loss is not.
-    cmd = ["rsync", "-az"]
-    # Noise: cache + build directories that make the remote repo messy
-    # without being useful.
-    for pat in (".git", ".venv", "__pycache__", "*.egg-info", "build", "dist", "out"):
-        cmd.append(f"--exclude={pat}")
-    # Safety: never ship local secrets / dotenv / SSH keys to a remote box.
-    # See runplz/_excludes.py for the rationale.
-    for pat in DEFAULT_TRANSFER_EXCLUDES:
-        cmd.append(f"--exclude={pat}")
-    cmd.extend([f"{repo}/", f"{instance}:{REMOTE_REPO_DIR}/"])
-    _sh(cmd)
-
-
-def _rsync_down(instance: str, local_out: Path):
-    _sh(["rsync", "-az", f"{instance}:{REMOTE_OUT_DIR}/", f"{local_out}/"])
-
-
-def _ssh(instance: str, remote_cmd: str):
-    # Pass the whole pipeline as a SINGLE arg to ssh. If we pass
-    # ["ssh", host, "bash", "-lc", cmd] instead, ssh space-joins the trailing
-    # argv before sending to the remote shell, which then re-parses — turning
-    # `bash -lc 'set -euo pipefail; X'` into `bash -lc set -euo pipefail; X`
-    # (i.e. `set` runs with no args as the -c command, X runs in the outer
-    # shell without errexit). Quoting with shlex.quote around the whole
-    # command string avoids that.
-    _sh(["ssh", *_SSH_OPTS, instance, f"bash -lc {shlex.quote(remote_cmd)}"])
-
-
-def _sh(cmd):
-    print("+ " + " ".join(shlex.quote(c) for c in cmd), flush=True)
-    subprocess.run(cmd, check=True)
+    # Fallback: price/name fields not exposed in this `brev search` shape.
+    return _brev_row_type(results[0])

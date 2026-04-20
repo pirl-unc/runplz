@@ -7,7 +7,8 @@ Write a job script:
     # jobs/train.py
     from runplz import App, Image
 
-    app = App("my-job")  # default BrevConfig auto-creates the box on first run
+    # auto_create_instances=False by default — opt in to brev create
+    app = App("my-job")
     image = (
         Image.from_registry("pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime")
         .pip_install("pandas", "scikit-learn")
@@ -27,16 +28,17 @@ Then run it from the CLI:
 
     runplz local jobs/train.py
     runplz brev --instance my-box jobs/train.py
+    runplz ssh  --host gpu.example.com jobs/train.py
     runplz modal jobs/train.py
 
-The CLI is the only entry point — it imports the script, binds the backend,
-and invokes whatever you decorated with ``@app.local_entrypoint``. Inside
-that entrypoint call ``fn.remote(...)`` to dispatch on the chosen backend,
-or ``fn.local(...)`` to run the body in the current process (for tests).
+Two entry points: the CLI (above) and ``App.bind(backend, ...)`` from
+within any Python script / notebook. Both wire a backend to the App;
+inside the entrypoint call ``fn.remote(...)`` to dispatch on the chosen
+backend, or ``fn.local(...)`` to run the body in the current process.
 """
 
 from runplz.app import App, Function
-from runplz.config import BrevConfig, ModalConfig
+from runplz.config import BrevConfig, ModalConfig, SshConfig
 from runplz.image import Image, ImageOp
 from runplz.version import __version__
 
@@ -47,5 +49,6 @@ __all__ = [
     "ImageOp",
     "BrevConfig",
     "ModalConfig",
+    "SshConfig",
     "__version__",
 ]

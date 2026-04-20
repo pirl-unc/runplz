@@ -112,20 +112,24 @@ kwargs must be JSON-serializable.
   `BrevConfig(auto_create_instances=True)` to have runplz `brev create`
   missing boxes (cheapest match for your resource constraints, or an
   explicit `BrevConfig(instance_type=...)` if you pinned one).
+- `--host <name>` — **required** for `ssh`; any ssh endpoint reachable
+  from your shell (bare hostname, `user@host`, or a `~/.ssh/config`
+  alias). No provisioning — you own the box.
 - `--no-build` — **local only**; reuse the last tagged docker image
   instead of rebuilding.
 - `--outputs-dir <path>` — where to collect `/out` back to on the host
   (default `./out/`).
 
-All three have `app.bind(...)` equivalents (`instance=`, `build=False`,
-`outputs_dir=`) for the pure-Python invocation path.
+All four have `app.bind(...)` equivalents (`instance=`, `host=`,
+`build=False`, `outputs_dir=`) for the pure-Python invocation path.
 
 ## Backend config
 
-`App(..., brev_config=BrevConfig(...), modal_config=ModalConfig(...))`.
-Both default to instances of their respective config class, so you only
-pass one when you need to override something — the headline example
-above omits both and relies on defaults.
+`App(..., brev_config=BrevConfig(...), modal_config=ModalConfig(...),
+ssh_config=SshConfig(...))`. Each defaults to an instance of its
+respective config class, so you only pass one when you need to override
+something — the headline example above omits all three and relies on
+defaults.
 
 ### BrevConfig
 
@@ -150,6 +154,30 @@ Invalid combinations (raised eagerly):
 - `max_runtime_seconds <= 0` — at config construction (use `None` for unlimited)
 - `mode="container"` with `Image.from_dockerfile(...)` — at Brev dispatch (container mode has no Dockerfile step)
 - `mode="vm", use_docker=False` with `Image.from_dockerfile(...)` — at Brev dispatch (native path ignores the Dockerfile)
+
+### SshConfig
+
+`App(..., ssh_config=SshConfig(...))` plus `--host <target>` (CLI) or
+`app.bind("ssh", host=...)` (Python). runplz never provisions or tears
+down — you own the box. The backend rsyncs your repo up, optionally
+warns about spec mismatches, dispatches the bootstrap (docker or
+native), and rsyncs outputs back.
+
+| field                    | default | what it does                                                                                                                     |
+| ------------------------ | ------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `user`                   | `None`  | Ssh login user. `None` → whatever's in the host URL or your `~/.ssh/config`.                                                     |
+| `port`                   | `None`  | Ssh port. `None` → the default (22 or whatever your config says). **Known limitation**: not yet wired into rsync; use `~/.ssh/config` for non-22 ports. |
+| `use_docker`             | `True`  | Build + `docker run` the image on the remote. `False` = native venv install (mirrors `BrevConfig(mode="vm", use_docker=False)`). |
+| `on_finish`              | `"leave"` | Pinned to `"leave"`; runplz doesn't touch the lifecycle of a user-owned box. Setting `"stop"` / `"delete"` raises at config construction. |
+| `max_runtime_seconds`    | `None`  | Wall-clock kill-switch — same semantics as `BrevConfig.max_runtime_seconds`.                                                     |
+
+**Spec-mismatch warnings.** Because the SSH box is fixed (no selector
+chooses it for you), runplz probes the remote at dispatch and warns when
+your function's declared constraints aren't met — e.g. a function with
+`min_memory=32` against a 16GB remote, or `gpu="A100"` against a box
+where `nvidia-smi` reports a T4 (or no GPUs at all). Warnings only — the
+job still runs; the user may know something we don't (MIG slicing,
+overcommit, etc.).
 
 ### What runplz does NOT ship to the remote
 
