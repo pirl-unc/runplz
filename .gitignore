@@ -30,3 +30,4 @@ htmlcov/
 
 # Claude Code
 .claude/
+artifacts/
