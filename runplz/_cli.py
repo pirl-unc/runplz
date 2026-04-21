@@ -68,6 +68,20 @@ def main(argv=None):
     p.add_argument(
         "--no-build", action="store_true", help="[local] Skip docker build (reuse tagged image)."
     )
+    p.add_argument(
+        "--log-file",
+        help=(
+            "Tee stdout+stderr to this log file (overrides the default path). "
+            "Captures the full driver trail — rsync, ssh, docker build, "
+            "remote streamed logs, failure traces — so a closed terminal "
+            "can't strand you without a diagnostic record."
+        ),
+    )
+    p.add_argument(
+        "--no-log-file",
+        action="store_true",
+        help="Disable the default log-file capture. See --log-file.",
+    )
     args, entrypoint_argv = p.parse_known_args(argv)
 
     script_path = Path(args.script).resolve()
@@ -100,7 +114,25 @@ def main(argv=None):
     if app._entrypoint is None:
         p.error(f"{script_path} has no @app.local_entrypoint() function")
     entrypoint_kwargs = _parse_entrypoint_args(app._entrypoint, entrypoint_argv, p.error)
-    app._entrypoint(**entrypoint_kwargs)
+
+    # Resolve the log path relative to the same outputs-dir we'll hand to
+    # the backend. The log-capture has to wrap everything after this point,
+    # including the entrypoint and the backend dispatch.
+    from runplz._logcapture import resolve_log_path, tee_stdio_to
+
+    outputs_dir_abs = (Path.cwd() / args.outputs_dir).resolve()
+    log_path = resolve_log_path(
+        log_file_flag=args.log_file,
+        no_log_file_flag=args.no_log_file,
+        outputs_dir=outputs_dir_abs,
+        app_name=app.name,
+    )
+    if log_path is None:
+        app._entrypoint(**entrypoint_kwargs)
+        return
+    print(f"+ logging driver output to {log_path}", flush=True)
+    with tee_stdio_to(log_path):
+        app._entrypoint(**entrypoint_kwargs)
 
 
 _TRUTHY = {"true", "yes", "1", "on"}
