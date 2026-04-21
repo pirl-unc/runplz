@@ -42,7 +42,7 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
     cfg = app.ssh_config
     target, port = _build_ssh_target(host, user=cfg.user, port=cfg.port)
 
-    _wait_until_ssh_reachable(target, port=port)
+    _wait_until_ssh_reachable(target, port=port, max_wait_s=cfg.ssh_ready_wait_seconds)
     _warn_on_spec_mismatch(target, function, port=port)
 
     repo = app._repo_root

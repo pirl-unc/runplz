@@ -217,7 +217,11 @@ def run(
             # Poll explicitly with a refresh callback so ssh_common can
             # re-run `brev refresh` mid-poll when the instance transitions
             # from bootstrap-shim port to real port.
-            _wait_until_ssh_reachable(instance, refresh_callback=_refresh_ssh)
+            _wait_until_ssh_reachable(
+                instance,
+                refresh_callback=_refresh_ssh,
+                max_wait_s=cfg.ssh_ready_wait_seconds,
+            )
 
             repo = app._repo_root
             host_out = (repo / outputs_dir).resolve()

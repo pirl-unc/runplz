@@ -157,12 +157,19 @@ def _rsync_down(target: str, local_out: Path, *, port: Optional[int] = None):
 def _wait_until_ssh_reachable(
     target: str,
     *,
-    max_wait_s: int = 1200,
+    max_wait_s: int = 1800,
     probe_interval_s: int = 15,
     refresh_callback: Optional[Callable[[], None]] = None,
     port: Optional[int] = None,
 ) -> None:
     """Block until an SSH session to `target` succeeds, or raise.
+
+    Default budget: 1800s (30 min). Bumped from 1200s in 3.7.2 because
+    8×A100/H100 shapes on Denvr / OCI consistently take 15-18 min to
+    boot — the old 20-min cap tripped on healthy provisioning and left
+    the freshly-created billed box running (see issues #29 / #34).
+    Callers can still override via the backend config
+    (BrevConfig.ssh_ready_wait_seconds, SshConfig.ssh_ready_wait_seconds).
 
     Polls with short-timeout SSH probes. Every ~minute invokes
     `refresh_callback` (if provided) to let the caller repair any config

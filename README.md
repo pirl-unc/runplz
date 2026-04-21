@@ -168,6 +168,7 @@ All fields are validated at construction time — an invalid config raises
 | `use_docker`             | `True`  | VM-mode only. `False` skips docker and installs a native venv on the box. Legacy escape hatch for providers where container mode isn't available. |
 | `on_finish`              | `"stop"` | What runplz does to the Brev box when the App exits (success **or** failure). `"stop"` → `brev stop` (disk cached, small ongoing charge). `"delete"` → `brev delete` (zero ongoing cost, cold rebuild). `"leave"` → never touch the box (opt-in for interactive dev workflows). |
 | `max_runtime_seconds`    | `None`  | Wall-clock kill-switch. When set, runplz kills the remote container/process and raises `RuntimeError` after this many seconds so a wedged job can't keep billing forever. `None` = unlimited.                                                                       |
+| `ssh_ready_wait_seconds` | `1800` (30 min) | How long to wait for the freshly-provisioned Brev box to become SSH-reachable. Default covers 8×A100/H100 cold boots on Denvr / OCI (15-18 min in practice). Bump for slower provider / shape combos. |
 
 Invalid combinations (raised eagerly):
 
@@ -198,6 +199,7 @@ native), and rsyncs outputs back.
 | `use_docker`             | `True`  | Build + `docker run` the image on the remote. `False` = native venv install (mirrors `BrevConfig(mode="vm", use_docker=False)`). |
 | `on_finish`              | `"leave"` | Pinned to `"leave"`; runplz doesn't touch the lifecycle of a user-owned box. Setting `"stop"` / `"delete"` raises at config construction. |
 | `max_runtime_seconds`    | `None`  | Wall-clock kill-switch — same semantics as `BrevConfig.max_runtime_seconds`.                                                     |
+| `ssh_ready_wait_seconds` | `1800` (30 min) | How long to wait for the SSH box to become reachable before giving up. Mostly useful when the user is booting the box just before the runplz invocation. |
 
 **Spec-mismatch warnings.** Because the SSH box is fixed (no selector
 chooses it for you), runplz probes the remote at dispatch and warns when

@@ -70,6 +70,11 @@ class BrevConfig:
     # forever. Distinct from `Function(timeout=...)` which applies only
     # to Modal — this is a Brev-specific kill-switch enforced by runplz.
     max_runtime_seconds: Optional[int] = None
+    # How long to wait for the freshly-provisioned Brev box to become
+    # SSH-reachable before giving up. Default 1800s (30 min) covers
+    # 8×A100/H100 cold boots on Denvr / OCI (observed 15-18 min). Bump
+    # to 2400+ for exotic shapes that take longer (issue #34).
+    ssh_ready_wait_seconds: int = 1800
 
     def __post_init__(self):
         if self.mode not in _VALID_BREV_MODES:
@@ -93,6 +98,11 @@ class BrevConfig:
             raise ValueError(
                 f"BrevConfig.max_runtime_seconds must be a positive int (or None); "
                 f"got {self.max_runtime_seconds!r}."
+            )
+        if not isinstance(self.ssh_ready_wait_seconds, int) or self.ssh_ready_wait_seconds <= 0:
+            raise ValueError(
+                f"BrevConfig.ssh_ready_wait_seconds must be a positive int; "
+                f"got {self.ssh_ready_wait_seconds!r}."
             )
 
 
@@ -125,6 +135,11 @@ class SshConfig:
     # Wall-clock kill-switch on the remote run. Same semantics as
     # BrevConfig.max_runtime_seconds.
     max_runtime_seconds: Optional[int] = None
+    # How long to wait for the SSH box to become reachable before giving
+    # up. Default 1800s (30 min). Mostly matters when the user is
+    # booting the box themselves just before the runplz invocation;
+    # for always-on dev boxes the ssh probe succeeds on the first try.
+    ssh_ready_wait_seconds: int = 1800
 
     def __post_init__(self):
         if self.port is not None and not (0 < self.port < 65536):
@@ -143,6 +158,11 @@ class SshConfig:
             raise ValueError(
                 f"SshConfig.max_runtime_seconds must be a positive int (or None); "
                 f"got {self.max_runtime_seconds!r}."
+            )
+        if not isinstance(self.ssh_ready_wait_seconds, int) or self.ssh_ready_wait_seconds <= 0:
+            raise ValueError(
+                f"SshConfig.ssh_ready_wait_seconds must be a positive int; "
+                f"got {self.ssh_ready_wait_seconds!r}."
             )
 
 

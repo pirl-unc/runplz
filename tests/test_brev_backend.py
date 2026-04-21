@@ -751,6 +751,40 @@ def test_run_vm_docker_mode_end_to_end(tmp_path):
         brev.run(app, fn, [], {}, instance="box")
 
 
+def test_run_threads_ssh_ready_wait_seconds_into_helper(tmp_path):
+    """3.7.2: BrevConfig.ssh_ready_wait_seconds must reach
+    _wait_until_ssh_reachable (otherwise the knob is decorative)."""
+    cfg = BrevConfig(mode="vm", use_docker=True, ssh_ready_wait_seconds=2400)
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+
+    seen = {}
+
+    def capture_wait(target, **kw):
+        seen["max_wait_s"] = kw.get("max_wait_s")
+
+    with mock.patch.multiple(
+        "runplz.backends.brev",
+        _require_brev_cli=mock.DEFAULT,
+        _skip_onboarding=mock.DEFAULT,
+        _instance_exists=mock.Mock(return_value=True),
+        _refresh_ssh=mock.DEFAULT,
+        _wait_until_ssh_reachable=capture_wait,
+        _ensure_docker=mock.DEFAULT,
+        _rsync_up=mock.DEFAULT,
+        _remote_has_nvidia=mock.Mock(return_value=False),
+        _build_image=mock.DEFAULT,
+        _run_container_detached=mock.DEFAULT,
+        _stream_and_wait=mock.Mock(return_value=0),
+        _ssh_capture=mock.DEFAULT,
+        _rsync_down=mock.DEFAULT,
+        _apply_on_finish=mock.DEFAULT,
+    ):
+        brev.run(app, fn, [], {}, instance="box")
+
+    assert seen["max_wait_s"] == 2400
+
+
 def test_run_vm_docker_mode_nonzero_exit_raises(tmp_path):
     """Issue #17: non-zero exit must surface the remote log tail in the
     RuntimeError so users don't have to ssh in to see what actually broke."""
