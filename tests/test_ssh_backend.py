@@ -88,29 +88,164 @@ def test_ssh_config_rejects_non_positive_max_runtime_seconds():
 
 
 def test_build_ssh_target_bare_host():
-    assert ssh._build_ssh_target("my-box", user=None, port=None) == "my-box"
+    assert ssh._build_ssh_target("my-box", user=None, port=None) == ("my-box", None)
 
 
 def test_build_ssh_target_user_from_config_wins():
     # Host has no user — user comes from cfg.
-    assert ssh._build_ssh_target("my-box", user="alex", port=None) == "alex@my-box"
+    assert ssh._build_ssh_target("my-box", user="alex", port=None) == ("alex@my-box", None)
 
 
 def test_build_ssh_target_user_preserved_when_in_host():
     # Host carries a user; cfg.user=None → keep what the user gave us.
-    assert ssh._build_ssh_target("root@my-box", user=None, port=None) == "root@my-box"
+    assert ssh._build_ssh_target("root@my-box", user=None, port=None) == ("root@my-box", None)
 
 
-def test_build_ssh_target_cfg_user_overrides_url_user(capsys):
+def test_build_ssh_target_cfg_user_overrides_url_user():
     # Conflict: URL says root, cfg says alex. cfg wins — explicit over implicit.
-    assert ssh._build_ssh_target("root@my-box", user="alex", port=None) == "alex@my-box"
+    assert ssh._build_ssh_target("root@my-box", user="alex", port=None) == ("alex@my-box", None)
 
 
-def test_build_ssh_target_port_warning(capsys):
-    ssh._build_ssh_target("my-box", user=None, port=2222)
-    out = capsys.readouterr().out
-    assert "port=2222" in out
-    assert "warning" in out.lower()
+def test_build_ssh_target_config_port_threads_through():
+    """3.7.1: SshConfig.port is actually wired into ssh/rsync now."""
+    assert ssh._build_ssh_target("my-box", user=None, port=2222) == ("my-box", 2222)
+
+
+def test_build_ssh_target_port_parsed_from_url():
+    assert ssh._build_ssh_target("my-box:2222", user=None, port=None) == ("my-box", 2222)
+
+
+def test_build_ssh_target_config_port_overrides_url_port():
+    # Explicit SshConfig.port beats whatever the URL happened to inline.
+    assert ssh._build_ssh_target("my-box:9999", user=None, port=2222) == ("my-box", 2222)
+
+
+def test_build_ssh_target_non_numeric_colon_suffix_kept_as_host():
+    # Not a port — ssh should see "hostname:alias" verbatim.
+    assert ssh._build_ssh_target("my-box:alias", user=None, port=None) == (
+        "my-box:alias",
+        None,
+    )
+
+
+# --- port plumbing into ssh/rsync invocations (3.7.1) ----------------
+
+
+def test_ssh_cmd_opts_includes_dash_p_when_port_set():
+    from runplz.backends import _ssh_common
+
+    opts = _ssh_common._ssh_cmd_opts(port=2222)
+    assert opts[-2:] == ["-p", "2222"]
+    # Base opts are preserved.
+    assert "ControlMaster=no" in opts
+
+
+def test_ssh_cmd_opts_omits_dash_p_when_port_none():
+    from runplz.backends import _ssh_common
+
+    assert "-p" not in _ssh_common._ssh_cmd_opts(port=None)
+
+
+def test_rsync_ssh_transport_includes_port():
+    from runplz.backends import _ssh_common
+
+    transport = _ssh_common._rsync_ssh_transport(port=2222)
+    # -e string must survive shell parsing as ["ssh", ..., "-p", "2222"].
+    import shlex as _shlex
+
+    parts = _shlex.split(transport)
+    assert parts[0] == "ssh"
+    assert "-p" in parts
+    assert "2222" in parts
+
+
+def test_rsync_up_threads_port_into_transport(tmp_path):
+    from runplz.backends import _ssh_common
+
+    recorded = {}
+    with mock.patch("runplz.backends._ssh_common._sh", lambda c: recorded.setdefault("c", c)):
+        _ssh_common._rsync_up(tmp_path, "my-box", port=2222)
+
+    cmd = recorded["c"]
+    assert cmd[:2] == ["rsync", "-az"]
+    # rsync -e "ssh -p 2222 ..." must appear.
+    e_idx = cmd.index("-e")
+    assert "ssh" in cmd[e_idx + 1]
+    assert "-p" in cmd[e_idx + 1]
+    assert "2222" in cmd[e_idx + 1]
+
+
+def test_rsync_up_omits_transport_flag_when_no_port(tmp_path):
+    from runplz.backends import _ssh_common
+
+    recorded = {}
+    with mock.patch("runplz.backends._ssh_common._sh", lambda c: recorded.setdefault("c", c)):
+        _ssh_common._rsync_up(tmp_path, "my-box", port=None)
+
+    # Without a port we don't set -e — rsync uses the system's default ssh.
+    assert "-e" not in recorded["c"]
+
+
+def test_ssh_helper_threads_port(tmp_path):
+    from runplz.backends import _ssh_common
+
+    recorded = {}
+    with mock.patch("runplz.backends._ssh_common._sh", lambda c: recorded.setdefault("c", c)):
+        _ssh_common._ssh("my-box", "echo hi", port=2222)
+
+    cmd = recorded["c"]
+    assert cmd[0] == "ssh"
+    assert "-p" in cmd
+    assert "2222" in cmd
+    # target and the bash -lc payload are still present.
+    assert "my-box" in cmd
+    assert any(arg.startswith("bash -lc ") for arg in cmd)
+
+
+def test_ssh_run_end_to_end_passes_port_through_to_helpers(tmp_path):
+    """When a port is set on SshConfig, every downstream helper call must
+    receive it."""
+    cfg = SshConfig(port=2222, use_docker=True)
+    app = _app(tmp_path, cfg)
+    fn = _function(
+        app,
+        Image.from_registry("ubuntu:22.04"),
+        module_file=_job_inside(tmp_path),
+    )
+
+    seen_ports = {"reachable": None, "rsync_up": None, "build": None, "stream": None}
+
+    def fake_wait(target, *, port=None, **kw):
+        seen_ports["reachable"] = port
+
+    def fake_rsync_up(repo, target, *, port=None):
+        seen_ports["rsync_up"] = port
+
+    def fake_build(target, image, *, port=None):
+        seen_ports["build"] = port
+
+    def fake_stream(target, container_name, *, port=None, **kw):
+        seen_ports["stream"] = port
+        return 0
+
+    with mock.patch.multiple(
+        "runplz.backends.ssh",
+        _wait_until_ssh_reachable=fake_wait,
+        _warn_on_spec_mismatch=mock.DEFAULT,
+        _ensure_remote_rsync=mock.DEFAULT,
+        _rsync_up=fake_rsync_up,
+        _ensure_docker=mock.DEFAULT,
+        _remote_has_nvidia=mock.Mock(return_value=False),
+        _build_image=fake_build,
+        _run_container_detached=mock.DEFAULT,
+        _stream_and_wait=fake_stream,
+        _ssh_capture=mock.DEFAULT,
+        _rsync_down=mock.DEFAULT,
+        _fetch_failure_tail=mock.DEFAULT,
+    ):
+        ssh.run(app, fn, [], {}, host="gpu.example.com")
+
+    assert all(v == 2222 for v in seen_ports.values()), seen_ports
 
 
 # --- App.bind wiring -----------------------------------------------------

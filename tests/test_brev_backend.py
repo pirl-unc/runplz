@@ -562,7 +562,7 @@ def test_ensure_remote_rsync_sends_expected_cmd():
     recorded = {}
     with mock.patch(
         "runplz.backends._ssh_common._ssh",
-        lambda target, cmd: recorded.update({"i": target, "c": cmd}),
+        lambda target, cmd, **kw: recorded.update({"i": target, "c": cmd}),
     ):
         brev._ensure_remote_rsync("box")
     assert recorded["i"] == "box"
@@ -576,7 +576,10 @@ def test_ensure_remote_rsync_sends_expected_cmd():
 def test_build_image_dockerfile_uses_docker_build_f(tmp_path):
     img = Image.from_dockerfile("docker/Dockerfile")
     recorded = {}
-    with mock.patch("runplz.backends._ssh_common._ssh", lambda i, c: recorded.setdefault("c", c)):
+    with mock.patch(
+        "runplz.backends._ssh_common._ssh",
+        lambda i, c, **kw: recorded.setdefault("c", c),
+    ):
         brev._build_image("box", img)
     assert "docker build -f docker/Dockerfile" in recorded["c"]
     assert "__EOF__" not in recorded["c"]  # no synthesized Dockerfile heredoc
@@ -585,7 +588,10 @@ def test_build_image_dockerfile_uses_docker_build_f(tmp_path):
 def test_build_image_from_registry_pipes_synthesized_dockerfile():
     img = Image.from_registry("pytorch/pytorch:2.4.0").pip_install("numpy")
     recorded = {}
-    with mock.patch("runplz.backends._ssh_common._ssh", lambda i, c: recorded.setdefault("c", c)):
+    with mock.patch(
+        "runplz.backends._ssh_common._ssh",
+        lambda i, c, **kw: recorded.setdefault("c", c),
+    ):
         brev._build_image("box", img)
     c = recorded["c"]
     assert "cat <<'__EOF__' | sudo docker build -f - -t" in c
@@ -601,7 +607,10 @@ def test_run_container_detached_builds_full_docker_run(tmp_path):
     fn = _function(app, image, module_file=_job_inside(tmp_path), env={"USER_VAR": "1"})
 
     recorded = {}
-    with mock.patch("runplz.backends._ssh_common._ssh", lambda i, c: recorded.setdefault("c", c)):
+    with mock.patch(
+        "runplz.backends._ssh_common._ssh",
+        lambda i, c, **kw: recorded.setdefault("c", c),
+    ):
         brev._run_container_detached(
             target="box",
             container_name="runplz-train-abc123",
@@ -751,7 +760,7 @@ def test_run_vm_docker_mode_nonzero_exit_raises(tmp_path):
 
     tail_output = "Traceback (most recent call last):\n  File 'x.py'\nRuntimeError: oops"
 
-    def fake_ssh_capture(instance, cmd):
+    def fake_ssh_capture(instance, cmd, **kw):
         # The _fetch_failure_tail helper issues `docker logs --tail N ...`
         # for VM+docker mode. Return our canned tail to that call.
         if "docker logs --tail" in cmd:
@@ -800,7 +809,7 @@ def test_run_container_mode_nonzero_exit_includes_remote_log_tail(tmp_path):
 
     tail_output = "ValueError: bad tensor shape"
 
-    def fake_ssh_capture(instance, cmd):
+    def fake_ssh_capture(instance, cmd, **kw):
         # Container-mode dispatch issues `tail -n N "$HOME/.runplz-last.log"`.
         if ".runplz-last.log" in cmd:
             return tail_output
@@ -1556,7 +1565,7 @@ def test_container_rm_force_called_in_finally_on_failure(tmp_path):
 
     ssh_calls = {"cmds": []}
 
-    def fake_ssh_capture(instance, cmd):
+    def fake_ssh_capture(instance, cmd, **kw):
         ssh_calls["cmds"].append(cmd)
         return ""
 
@@ -1662,7 +1671,7 @@ def test_run_native_builds_expected_remote_cmd(tmp_path):
 
     recorded = {}
 
-    def fake_sh_ssh(instance, cmd):
+    def fake_sh_ssh(instance, cmd, **kw):
         # First call is setup, second call (subprocess.run) is the actual run.
         recorded.setdefault("setup", cmd)
 
@@ -1697,7 +1706,7 @@ def test_run_native_cpu_index_url(tmp_path):
 
     recorded = {}
 
-    def fake_ssh(i, c):
+    def fake_ssh(i, c, **kw):
         recorded.setdefault("setup", c)
 
     with mock.patch("runplz.backends._ssh_common._ssh", fake_ssh):
@@ -1727,7 +1736,7 @@ def test_run_container_mode_builds_expected_remote_cmd(tmp_path):
 
     recorded = {}
 
-    def fake_ssh(i, c):
+    def fake_ssh(i, c, **kw):
         # First call = ops_script install; ignore.
         recorded["ops"] = c
 

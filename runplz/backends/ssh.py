@@ -40,18 +40,18 @@ __all__ = ["run"]
 
 def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
     cfg = app.ssh_config
-    target = _build_ssh_target(host, user=cfg.user, port=cfg.port)
+    target, port = _build_ssh_target(host, user=cfg.user, port=cfg.port)
 
-    _wait_until_ssh_reachable(target)
-    _warn_on_spec_mismatch(target, function)
+    _wait_until_ssh_reachable(target, port=port)
+    _warn_on_spec_mismatch(target, function, port=port)
 
     repo = app._repo_root
     host_out = (repo / outputs_dir).resolve()
     host_out.mkdir(parents=True, exist_ok=True)
 
     # Make sure rsync is present before we try to upload.
-    _ensure_remote_rsync(target)
-    _rsync_up(repo, target)
+    _ensure_remote_rsync(target, port=port)
+    _rsync_up(repo, target, port=port)
 
     rel_script = Path(function.module_file).resolve().relative_to(repo)
 
@@ -59,10 +59,10 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
     exit_code: Optional[int] = None
     try:
         if cfg.use_docker:
-            _ensure_docker(target)
-            gpu_flag = "--gpus all" if _remote_has_nvidia(target) else ""
+            _ensure_docker(target, port=port)
+            gpu_flag = "--gpus all" if _remote_has_nvidia(target, port=port) else ""
             container_name = make_container_name(function.name)
-            _build_image(target, function.image)
+            _build_image(target, function.image, port=port)
             _run_container_detached(
                 target=target,
                 container_name=container_name,
@@ -71,9 +71,13 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
                 args=args,
                 kwargs=kwargs,
                 gpu_flag=gpu_flag,
+                port=port,
             )
             exit_code = _stream_and_wait(
-                target, container_name, max_runtime_seconds=cfg.max_runtime_seconds
+                target,
+                container_name,
+                max_runtime_seconds=cfg.max_runtime_seconds,
+                port=port,
             )
         else:
             # Native: can't use Image.from_registry's container env — fall back
@@ -85,19 +89,23 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
                 rel_script=str(rel_script),
                 args=args,
                 kwargs=kwargs,
-                has_nvidia=_remote_has_nvidia(target),
+                has_nvidia=_remote_has_nvidia(target, port=port),
                 max_runtime_seconds=cfg.max_runtime_seconds,
+                port=port,
             )
-        _rsync_down(target, host_out)
+        _rsync_down(target, host_out, port=port)
     finally:
         failure_tail = ""
         if exit_code is not None and exit_code != 0:
-            failure_tail = _fetch_failure_tail(target=target, container_name=container_name)
+            failure_tail = _fetch_failure_tail(
+                target=target, container_name=container_name, port=port
+            )
         if container_name is not None:
             try:
                 _ssh_capture(
                     target,
                     f"sudo docker rm -f {container_name} >/dev/null 2>&1 || true",
+                    port=port,
                 )
             except Exception as exc:  # noqa: BLE001
                 print(f"+ warning: failed to remove container {container_name}: {exc}", flush=True)
@@ -114,12 +122,19 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
         raise RuntimeError(msg)
 
 
-def _build_ssh_target(host: str, *, user: Optional[str], port: Optional[int]) -> str:
-    """Build the ssh/rsync endpoint string from host + optional user/port.
+def _build_ssh_target(
+    host: str, *, user: Optional[str], port: Optional[int]
+) -> tuple[str, Optional[int]]:
+    """Split a user-supplied host string into an ssh target + port.
 
-    If the host string already includes a user ("alex@...") or port (":22"),
-    SshConfig.user / .port still win — we rewrite rather than concatenate,
-    so conflicting values fail loudly instead of silently.
+    Accepts ``hostname``, ``user@hostname``, ``hostname:port``, and
+    ``user@hostname:port``. IPv6 bracketed literals (``[::1]:22``) are
+    passed to ssh as-is.
+
+    Precedence: explicit ``SshConfig.user`` / ``SshConfig.port`` always
+    win over values inlined into the host URL — explicit config should
+    be obvious at the call site, not quietly overridden by user@host
+    parsing.
     """
     bare = host
     if "@" in bare:
@@ -127,27 +142,17 @@ def _build_ssh_target(host: str, *, user: Optional[str], port: Optional[int]) ->
         if user is None:
             user = existing_user
     if ":" in bare and "]" not in bare:
-        # IPv6 bracketed URLs have colons; bail out on those, let ssh parse.
-        bare, existing_port = bare.rsplit(":", 1)
-        if port is None:
-            try:
-                port = int(existing_port)
-            except ValueError:
-                bare = f"{bare}:{existing_port}"  # wasn't a port after all
+        bare_candidate, existing_port = bare.rsplit(":", 1)
+        try:
+            parsed_port = int(existing_port)
+        except ValueError:
+            parsed_port = None
+        if parsed_port is not None:
+            bare = bare_candidate
+            if port is None:
+                port = parsed_port
     target = f"{user}@{bare}" if user else bare
-    if port:
-        # rsync needs `-e "ssh -p <port>"` but _ssh_common helpers don't
-        # thread that kwarg through. Instead, advise ~/.ssh/config or put
-        # the port in the alias. As a fallback, emit a warning: pinning
-        # ports inline is not yet supported.
-        # TODO: plumb port through SSH_OPTS everywhere.
-        print(
-            f"+ warning: SshConfig.port={port!r} not yet wired into rsync/ssh "
-            f"invocations. Set the port in your ~/.ssh/config instead, or "
-            f"bake it into the host alias. Proceeding without -p.",
-            flush=True,
-        )
-    return target
+    return target, port
 
 
 # --- Spec-mismatch warnings ----------------------------------------------
@@ -157,7 +162,7 @@ _MEMINFO_LINE = re.compile(r"^MemTotal:\s+(\d+)\s+kB", re.MULTILINE)
 _NVIDIA_LINE = re.compile(r"^([^,]+),\s*(\d+)\s*MiB$", re.MULTILINE)
 
 
-def _warn_on_spec_mismatch(target: str, function) -> None:
+def _warn_on_spec_mismatch(target: str, function, *, port: Optional[int] = None) -> None:
     """Probe the remote box and warn when its specs don't meet the function's
     constraints. Best-effort — never raises. The user may know something we
     don't (overcommitting a dev box, MIG-partitioned GPUs, etc.).
@@ -173,6 +178,7 @@ def _warn_on_spec_mismatch(target: str, function) -> None:
             "echo '---NVIDIA---'; "
             "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null; "
             "echo '---END---'",
+            port=port,
         )
     except Exception as exc:  # noqa: BLE001
         print(

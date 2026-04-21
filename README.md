@@ -194,7 +194,7 @@ native), and rsyncs outputs back.
 | field                    | default | what it does                                                                                                                     |
 | ------------------------ | ------- | -------------------------------------------------------------------------------------------------------------------------------- |
 | `user`                   | `None`  | Ssh login user. `None` → whatever's in the host URL or your `~/.ssh/config`.                                                     |
-| `port`                   | `None`  | Ssh port. `None` → the default (22 or whatever your config says). **Known limitation**: not yet wired into rsync; use `~/.ssh/config` for non-22 ports. |
+| `port`                   | `None`  | Ssh port. `None` → the default (22 or whatever your `~/.ssh/config` says). When set, threaded into both the `ssh` command (`-p N`) and the `rsync` transport (`-e "ssh -p N ..."`). Also accepted inline on `host="user@example.com:2222"`. |
 | `use_docker`             | `True`  | Build + `docker run` the image on the remote. `False` = native venv install (mirrors `BrevConfig(mode="vm", use_docker=False)`). |
 | `on_finish`              | `"leave"` | Pinned to `"leave"`; runplz doesn't touch the lifecycle of a user-owned box. Setting `"stop"` / `"delete"` raises at config construction. |
 | `max_runtime_seconds`    | `None`  | Wall-clock kill-switch — same semantics as `BrevConfig.max_runtime_seconds`.                                                     |
