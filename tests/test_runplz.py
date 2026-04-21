@@ -142,6 +142,23 @@ def test_brev_accepts_positive_max_runtime_seconds():
     BrevConfig(max_runtime_seconds=3600)
 
 
+def test_brev_default_ssh_ready_wait_seconds_is_30_minutes():
+    """3.7.2: bumped from 1200s (20min) → 1800s (30min) to cover
+    8×A100 Denvr/OCI cold boots."""
+    assert BrevConfig().ssh_ready_wait_seconds == 1800
+
+
+def test_brev_rejects_non_positive_ssh_ready_wait_seconds():
+    with pytest.raises(ValueError, match="ssh_ready_wait_seconds must be a positive int"):
+        BrevConfig(ssh_ready_wait_seconds=0)
+    with pytest.raises(ValueError, match="ssh_ready_wait_seconds must be a positive int"):
+        BrevConfig(ssh_ready_wait_seconds=-1)
+
+
+def test_brev_accepts_custom_ssh_ready_wait_seconds():
+    BrevConfig(ssh_ready_wait_seconds=2400)  # 40 min for exotic shapes
+
+
 def test_brev_rejects_unknown_on_finish():
     with pytest.raises(ValueError, match="on_finish must be one of"):
         BrevConfig(on_finish="terminate")

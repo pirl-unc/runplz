@@ -84,6 +84,15 @@ def test_ssh_config_rejects_non_positive_max_runtime_seconds():
         SshConfig(max_runtime_seconds=-1)
 
 
+def test_ssh_config_default_ssh_ready_wait_is_30_minutes():
+    assert SshConfig().ssh_ready_wait_seconds == 1800
+
+
+def test_ssh_config_rejects_non_positive_ssh_ready_wait_seconds():
+    with pytest.raises(ValueError, match="ssh_ready_wait_seconds must be a positive int"):
+        SshConfig(ssh_ready_wait_seconds=0)
+
+
 # --- target string construction -----------------------------------------
 
 
