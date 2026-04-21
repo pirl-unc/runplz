@@ -1050,6 +1050,196 @@ def test_run_named_instance_triggers_auto_start_when_stopped(tmp_path):
     assert start_calls == ["my-box"], "existing-instance path must call _start_instance_if_stopped"
 
 
+# -- #29: try/finally widens to cover post-create setup ----------------
+
+
+def test_setup_failure_after_create_still_runs_on_finish(tmp_path):
+    """Regression for #29: if _refresh_ssh / _wait_until_ssh_reachable /
+    _rsync_up raises *after* _create_instance succeeds, the Brev box is
+    already billed — runplz must still fire _apply_on_finish so the box
+    doesn't leak."""
+    cfg = BrevConfig(auto_create_instances=True, mode="vm", use_docker=True, on_finish="delete")
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+
+    finish_calls = []
+
+    def capture_finish(*, instance, cfg):
+        finish_calls.append((instance, cfg.on_finish))
+
+    create_calls = []
+
+    def fake_create(name, *, cfg=None, image=None, function=None):
+        create_calls.append(name)
+
+    with mock.patch.multiple(
+        "runplz.backends.brev",
+        _require_brev_cli=mock.DEFAULT,
+        _skip_onboarding=mock.DEFAULT,
+        _instance_exists=mock.Mock(return_value=False),
+        _create_instance=fake_create,
+        # _refresh_ssh raises — simulates the Brev API transient hitting
+        # a post-create setup step. Before #29 this would leak the box.
+        _refresh_ssh=mock.Mock(side_effect=RuntimeError("rpc error: context deadline exceeded")),
+        _wait_until_ssh_reachable=mock.DEFAULT,
+        _ensure_docker=mock.DEFAULT,
+        _rsync_up=mock.DEFAULT,
+        _remote_has_nvidia=mock.Mock(return_value=False),
+        _build_image=mock.DEFAULT,
+        _run_container_detached=mock.DEFAULT,
+        _stream_and_wait=mock.Mock(return_value=0),
+        _ssh_capture=mock.DEFAULT,
+        _rsync_down=mock.DEFAULT,
+        _apply_on_finish=capture_finish,
+    ):
+        with pytest.raises(RuntimeError, match="context deadline"):
+            brev.run(app, fn, [], {}, instance="new-box")
+
+    assert create_calls == ["new-box"]
+    # Crucially: _apply_on_finish DID fire despite the post-create failure.
+    assert finish_calls == [("new-box", "delete")]
+
+
+def test_typo_with_auto_create_false_raises_without_calling_on_finish(tmp_path):
+    """Negative: a typoed --instance name with auto_create_instances=False
+    must raise BEFORE the try/finally — there's no box to clean up, and
+    running `brev stop` on a nonexistent name would be noise."""
+    cfg = BrevConfig(auto_create_instances=False)
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+
+    finish_calls = []
+
+    def capture_finish(*, instance, cfg):  # pragma: no cover — should not fire
+        finish_calls.append(instance)
+
+    with mock.patch.multiple(
+        "runplz.backends.brev",
+        _require_brev_cli=mock.DEFAULT,
+        _skip_onboarding=mock.DEFAULT,
+        _instance_exists=mock.Mock(return_value=False),
+        _apply_on_finish=capture_finish,
+    ):
+        with pytest.raises(RuntimeError, match="not found"):
+            brev.run(app, fn, [], {}, instance="typoed")
+
+    assert finish_calls == [], "on_finish must NOT run when typo-guard raises"
+
+
+# -- #38: SIGTERM → on_finish still fires ------------------------------
+
+
+def test_sigterm_during_dispatch_triggers_on_finish(tmp_path):
+    """Regression for #38: kill -TERM on the orchestrator must run
+    _apply_on_finish instead of silently exiting the process."""
+    cfg = BrevConfig(auto_create_instances=True, mode="vm", use_docker=True, on_finish="delete")
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+
+    finish_calls = []
+
+    def capture_finish(*, instance, cfg):
+        finish_calls.append(instance)
+
+    def fake_stream(instance, container_name, max_runtime_seconds=None):
+        # Simulate the orchestrator receiving SIGTERM while the remote
+        # training is streaming. Raise the context manager's translated
+        # exception — which is what signal.signal's handler would do.
+        raise brev._OrchestratorKilled("runplz orchestrator killed by SIGTERM")
+
+    with mock.patch.multiple(
+        "runplz.backends.brev",
+        _require_brev_cli=mock.DEFAULT,
+        _skip_onboarding=mock.DEFAULT,
+        _instance_exists=mock.Mock(return_value=False),
+        _create_instance=mock.DEFAULT,
+        _refresh_ssh=mock.DEFAULT,
+        _wait_until_ssh_reachable=mock.DEFAULT,
+        _ensure_docker=mock.DEFAULT,
+        _rsync_up=mock.DEFAULT,
+        _remote_has_nvidia=mock.Mock(return_value=False),
+        _build_image=mock.DEFAULT,
+        _run_container_detached=mock.DEFAULT,
+        _stream_and_wait=fake_stream,
+        _ssh_capture=mock.DEFAULT,
+        _rsync_down=mock.DEFAULT,
+        _apply_on_finish=capture_finish,
+    ):
+        with pytest.raises(brev._OrchestratorKilled):
+            brev.run(app, fn, [], {}, instance=None)
+
+    assert len(finish_calls) == 1
+    assert finish_calls[0].startswith("runplz-panalle-train-")
+
+
+def test_orchestrator_signal_cleanup_installs_and_restores_handlers():
+    """The context manager must install a handler while active and
+    restore the original on exit. Verifies we don't leak a handler
+    into the caller's process."""
+    import signal
+
+    original = signal.getsignal(signal.SIGTERM)
+    with brev._orchestrator_signal_cleanup("x"):
+        installed = signal.getsignal(signal.SIGTERM)
+        assert installed is not original  # our handler is active
+    # Restored.
+    assert signal.getsignal(signal.SIGTERM) is original
+
+
+# -- #28: _refresh_ssh retries on transient Brev errors ---------------
+
+
+def test_refresh_ssh_retries_on_rpc_context_deadline_exceeded():
+    """First call returns `rpc error: context deadline exceeded`; second
+    succeeds. _refresh_ssh must ride through the transient."""
+    attempts = []
+
+    def fake_run(cmd, *a, **kw):
+        attempts.append(list(cmd))
+        if len(attempts) == 1:
+            return mock.Mock(
+                returncode=1,
+                stdout="",
+                stderr="rpc error: code = Internal desc = context deadline exceeded",
+            )
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        with mock.patch("time.sleep", lambda _s: None):
+            brev._refresh_ssh()  # must not raise
+    assert len(attempts) == 2
+
+
+def test_refresh_ssh_gives_up_after_all_attempts_fail():
+    """If every retry hits a transient error, raise with context."""
+
+    def fake_run(cmd, *a, **kw):
+        return mock.Mock(returncode=1, stdout="", stderr="rpc error: eof")
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        with mock.patch("time.sleep", lambda _s: None):
+            with pytest.raises(RuntimeError, match="failed after"):
+                brev._refresh_ssh()
+
+
+def test_refresh_ssh_does_not_retry_non_transient_errors():
+    """`brev refresh` failing with an auth error isn't transient — retry
+    would waste time. Raise on the first attempt."""
+    attempts = []
+
+    def fake_run(cmd, *a, **kw):
+        attempts.append(list(cmd))
+        return mock.Mock(
+            returncode=1, stdout="", stderr="you are not authenticated — run `brev login`"
+        )
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        with mock.patch("time.sleep", lambda _s: None):
+            with pytest.raises(RuntimeError, match="failed after"):
+                brev._refresh_ssh()
+    assert len(attempts) == 1, "non-transient errors should not retry"
+
+
 def test_fetch_failure_tail_returns_empty_on_ssh_error():
     """_fetch_failure_tail must never raise — the caller is already about
     to raise the real error and we don't want to mask it."""
