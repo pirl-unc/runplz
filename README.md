@@ -8,28 +8,24 @@ Tiny Modal-shaped job harness — one Python decoration, multiple backends.
 # jobs/train.py
 from runplz import App, Image
 
-app = App("my-job")  # default BrevConfig: safe — no auto-create on typo
+app = App("my-job")
 
 image = (
     Image.from_registry("pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime")
-    .apt_install("rsync", "build-essential")
     .pip_install("pandas>=2.0", "scikit-learn")
     .pip_install_local_dir(".", editable=True)
 )
 
-@app.function(
-    image=image,
-    gpu="T4",
-    min_cpu=4, min_memory=26, min_gpu_memory=16, min_disk=100,
-    timeout=60 * 60,
-)
+@app.function(image=image, gpu="T4", min_cpu=4, min_memory=16)
 def train():
-    import subprocess
-    subprocess.run(["bash", "scripts/train.sh"], check=True)
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # ... your training code ...
+    return device
 
 @app.local_entrypoint()
 def main():
-    train.remote()
+    print("ran on:", train.remote())
 ```
 
 Invoke via the CLI:

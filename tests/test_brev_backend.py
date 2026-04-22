@@ -351,11 +351,12 @@ def test_create_instance_with_resource_request_uses_picker(tmp_path):
 
     recorded = {}
 
-    def fake_sh(cmd):
-        recorded["create_cmd"] = cmd
+    def fake_capture(cmd, **kw):
+        recorded["create_cmd"] = list(cmd)
+        return mock.Mock(returncode=0, stdout="", stderr="")
 
     with mock.patch("runplz.backends.brev._pick_instance_type", return_value="picked-type"):
-        with mock.patch("runplz.backends.brev._sh", fake_sh):
+        with mock.patch("runplz.backends.brev._brev_capture", fake_capture):
             brev._create_instance("x", cfg=app.brev_config, image=fn.image, function=fn)
 
     cmd = recorded["create_cmd"]
@@ -376,7 +377,13 @@ def test_create_instance_no_constraints_falls_through_to_picker(tmp_path):
 
     recorded = {}
     with mock.patch("runplz.backends.brev._pick_instance_type", return_value="cheap-cpu-type"):
-        with mock.patch("runplz.backends.brev._sh", lambda c: recorded.setdefault("c", c)):
+        with mock.patch(
+            "runplz.backends.brev._brev_capture",
+            lambda cmd, **kw: (
+                recorded.setdefault("c", cmd),
+                mock.Mock(returncode=0, stdout="", stderr=""),
+            )[1],
+        ):
             brev._create_instance("x", cfg=cfg, image=fn.image, function=fn)
 
     assert "cheap-cpu-type" in recorded["c"]
@@ -407,7 +414,13 @@ def test_create_instance_explicit_instance_type_bypasses_picker(tmp_path):
         return "SHOULD-NOT-BE-USED"
 
     with mock.patch("runplz.backends.brev._pick_instance_type", fake_picker):
-        with mock.patch("runplz.backends.brev._sh", lambda c: recorded.setdefault("c", c)):
+        with mock.patch(
+            "runplz.backends.brev._brev_capture",
+            lambda cmd, **kw: (
+                recorded.setdefault("c", cmd),
+                mock.Mock(returncode=0, stdout="", stderr=""),
+            )[1],
+        ):
             brev._create_instance("x", cfg=cfg, image=fn.image, function=fn)
 
     assert picker_called["n"] == 0
@@ -422,7 +435,13 @@ def test_create_instance_container_mode_adds_image_flag(tmp_path):
 
     recorded = {}
     with mock.patch("runplz.backends.brev._pick_instance_type", return_value="picked-type"):
-        with mock.patch("runplz.backends.brev._sh", lambda c: recorded.setdefault("c", c)):
+        with mock.patch(
+            "runplz.backends.brev._brev_capture",
+            lambda cmd, **kw: (
+                recorded.setdefault("c", cmd),
+                mock.Mock(returncode=0, stdout="", stderr=""),
+            )[1],
+        ):
             brev._create_instance("x", cfg=cfg, image=image, function=fn)
 
     cmd = recorded["c"]
@@ -1283,6 +1302,297 @@ def test_refresh_ssh_does_not_retry_non_transient_errors():
     assert len(attempts) == 1, "non-transient errors should not retry"
 
 
+# -- 3.8.0: every brev CLI call goes through the retry wrapper --------
+
+
+def test_brev_capture_retries_on_http_500():
+    """HTTP 500 from Brev's control plane is transient — retry."""
+    attempts = []
+
+    def fake_run(cmd, *a, **kw):
+        attempts.append(list(cmd))
+        if len(attempts) == 1:
+            return mock.Mock(returncode=1, stdout="", stderr="HTTP 500 Internal Server Error")
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        with mock.patch("time.sleep", lambda _s: None):
+            r = brev._brev_capture(["brev", "ls", "--json"], label="brev ls")
+    assert r.returncode == 0
+    assert len(attempts) == 2
+
+
+def test_brev_capture_retries_on_unexpected_eof():
+    attempts = []
+
+    def fake_run(cmd, *a, **kw):
+        attempts.append(list(cmd))
+        if len(attempts) < 3:
+            return mock.Mock(returncode=1, stdout="", stderr="unexpected EOF")
+        return mock.Mock(returncode=0, stdout="ok", stderr="")
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        with mock.patch("time.sleep", lambda _s: None):
+            r = brev._brev_capture(["brev", "ls"], label="t")
+    assert r.returncode == 0
+    assert len(attempts) == 3
+
+
+def test_brev_capture_retries_on_timeout():
+    """subprocess.TimeoutExpired is always transient (slow API)."""
+    attempts = []
+
+    def fake_run(cmd, *a, **kw):
+        attempts.append(list(cmd))
+        if len(attempts) < 2:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=1)
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        with mock.patch("time.sleep", lambda _s: None):
+            r = brev._brev_capture(["brev", "refresh"], label="brev refresh")
+    assert r.returncode == 0
+    assert len(attempts) == 2
+
+
+def test_brev_capture_returns_final_failure_on_non_transient():
+    """Non-transient errors short-circuit — the caller gets the
+    CompletedProcess to inspect rather than an exception."""
+    attempts = []
+
+    def fake_run(cmd, *a, **kw):
+        attempts.append(list(cmd))
+        return mock.Mock(returncode=1, stdout="", stderr="CREATE_FAILED: shadeform not_found")
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        with mock.patch("time.sleep", lambda _s: None):
+            r = brev._brev_capture(["brev", "create", "x"], label="brev create")
+    assert r.returncode == 1
+    assert len(attempts) == 1  # broker said no — don't waste retries
+
+
+def test_instance_exists_retries_context_deadline_exceeded():
+    """Attempt 7 from the real report: `brev ls --json context deadline
+    exceeded`. With 3.8.0 this must retry rather than raise."""
+    attempts = []
+
+    def fake_run(cmd, *a, **kw):
+        attempts.append(list(cmd))
+        if len(attempts) < 2:
+            return mock.Mock(
+                returncode=1,
+                stdout="",
+                stderr="context deadline exceeded",
+            )
+        return mock.Mock(returncode=0, stdout='[{"name": "my-box"}]', stderr="")
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        with mock.patch("time.sleep", lambda _s: None):
+            assert brev._instance_exists("my-box") is True
+    assert len(attempts) == 2
+
+
+def test_create_instance_retries_http_500():
+    """Attempt 6 from the real report: HTTP 500 from brevapi. With 3.8.0
+    the retry loop rides through it."""
+    attempts = []
+
+    def fake_run(cmd, *a, **kw):
+        attempts.append(list(cmd))
+        if attempts[-1][:2] == ["brev", "create"]:
+            if len(attempts) == 1:
+                return mock.Mock(
+                    returncode=1,
+                    stdout="",
+                    stderr="HTTP 500 Internal Server Error from brevapi",
+                )
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    cfg = BrevConfig(auto_create_instances=True, mode="vm", instance_type="some-type")
+    fn = types.SimpleNamespace(
+        name="t",
+        gpu=None,
+        min_cpu=None,
+        min_memory=None,
+        min_gpu_memory=None,
+        min_disk=None,
+        num_gpus=1,
+    )
+    img = Image.from_registry("ubuntu:22.04")
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        with mock.patch("time.sleep", lambda _s: None):
+            brev._create_instance("my-new-box", cfg=cfg, image=img, function=fn)
+
+    create_calls = [c for c in attempts if c[:2] == ["brev", "create"]]
+    assert len(create_calls) == 2  # retried and succeeded
+
+
+def test_create_instance_already_exists_treated_as_success():
+    """The HTTP-500-after-create scenario: Brev actually *did* create the
+    box but the response came back as 500. Our retry then gets 'already
+    exists', and we verify via `brev ls` that it's really there."""
+    attempts = []
+
+    def fake_run(cmd, *a, **kw):
+        attempts.append(list(cmd))
+        if cmd[:2] == ["brev", "create"]:
+            return mock.Mock(
+                returncode=1,
+                stdout="",
+                stderr="workspace with this name already exists",
+            )
+        if cmd[:2] == ["brev", "ls"]:
+            return mock.Mock(
+                returncode=0,
+                stdout='[{"name": "idempotent-box"}]',
+                stderr="",
+            )
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    cfg = BrevConfig(auto_create_instances=True, mode="vm", instance_type="t")
+    fn = types.SimpleNamespace(
+        name="t",
+        gpu=None,
+        min_cpu=None,
+        min_memory=None,
+        min_gpu_memory=None,
+        min_disk=None,
+        num_gpus=1,
+    )
+    img = Image.from_registry("ubuntu:22.04")
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        with mock.patch("time.sleep", lambda _s: None):
+            # Must not raise — "already exists" + confirmed-by-ls == success.
+            brev._create_instance("idempotent-box", cfg=cfg, image=img, function=fn)
+
+
+def test_create_instance_already_exists_but_not_listed_raises():
+    """If `brev create` says 'already exists' but `brev ls` doesn't
+    confirm, that's a confusing state — don't silently pretend it worked."""
+
+    def fake_run(cmd, *a, **kw):
+        if cmd[:2] == ["brev", "create"]:
+            return mock.Mock(returncode=1, stdout="", stderr="already exists")
+        if cmd[:2] == ["brev", "ls"]:
+            return mock.Mock(returncode=0, stdout="[]", stderr="")
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    cfg = BrevConfig(auto_create_instances=True, mode="vm", instance_type="t")
+    fn = types.SimpleNamespace(
+        name="t",
+        gpu=None,
+        min_cpu=None,
+        min_memory=None,
+        min_gpu_memory=None,
+        min_disk=None,
+        num_gpus=1,
+    )
+    img = Image.from_registry("ubuntu:22.04")
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        with mock.patch("time.sleep", lambda _s: None):
+            with pytest.raises(RuntimeError, match="brev create"):
+                brev._create_instance("ghost", cfg=cfg, image=img, function=fn)
+
+
+def test_check_terminal_state_raises_for_failure_status():
+    """3.8.0: if `brev ls` shows the instance in FAILURE (Nebius / shadeform
+    provisioning died at the provider layer), we must bail early from
+    the SSH-reachable poll instead of burning the full 30-min budget."""
+    with mock.patch(
+        "runplz.backends.brev.subprocess.run",
+        return_value=mock.Mock(
+            returncode=0,
+            stdout=json.dumps([{"name": "doomed", "status": "FAILURE"}]),
+            stderr="",
+        ),
+    ):
+        with pytest.raises(brev.BrevInstanceFailed, match="FAILURE"):
+            brev._check_terminal_state("doomed")
+
+
+def test_check_terminal_state_noop_on_running_status():
+    with mock.patch(
+        "runplz.backends.brev.subprocess.run",
+        return_value=mock.Mock(
+            returncode=0,
+            stdout=json.dumps([{"name": "doomed", "status": "STARTING"}]),
+            stderr="",
+        ),
+    ):
+        brev._check_terminal_state("doomed")  # must not raise
+
+
+def test_check_terminal_state_raises_for_deploying_failed():
+    with mock.patch(
+        "runplz.backends.brev.subprocess.run",
+        return_value=mock.Mock(
+            returncode=0,
+            stdout=json.dumps([{"name": "h100", "status": "DEPLOYING_FAILED"}]),
+            stderr="",
+        ),
+    ):
+        with pytest.raises(brev.BrevInstanceFailed, match="DEPLOYING_FAILED"):
+            brev._check_terminal_state("h100")
+
+
+def test_wait_until_ssh_reachable_bails_on_brev_instance_failed(monkeypatch):
+    """When the refresh callback raises BrevInstanceFailed, the SSH-
+    reachable loop must stop probing and propagate — not swallow it as
+    a best-effort callback hiccup."""
+    from runplz.backends import _ssh_common
+
+    monkeypatch.setattr(_ssh_common, "SSH_OPTS", [])
+    clock = [0.0]
+    monkeypatch.setattr("time.time", lambda: clock[0])
+    monkeypatch.setattr("time.sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+
+    def always_refused(cmd, *a, **kw):
+        return mock.Mock(returncode=255, stderr="refused", stdout="")
+
+    call_count = {"n": 0}
+
+    def failing_callback():
+        call_count["n"] += 1
+        raise brev.BrevInstanceFailed("status=FAILURE")
+
+    with mock.patch("runplz.backends._ssh_common.subprocess.run", always_refused):
+        with pytest.raises(brev.BrevInstanceFailed, match="FAILURE"):
+            brev._wait_until_ssh_reachable(
+                "doomed",
+                max_wait_s=120,
+                probe_interval_s=1,
+                refresh_callback=failing_callback,
+            )
+
+    # Should have bailed after the first refresh_callback invocation
+    # (fires every 4 probes) — not the full 120s of probing.
+    assert call_count["n"] == 1
+
+
+def test_apply_on_finish_retries_transient_then_succeeds(capsys):
+    """`brev stop` hitting a transient should retry, not loud-warn on
+    the first blip. (Billing-leak relevance: the finally block must not
+    give up on the first hiccup.)"""
+    cfg = BrevConfig(mode="vm", use_docker=True)  # on_finish default = "stop"
+    attempts = []
+
+    def fake_run(cmd, *a, **kw):
+        attempts.append(list(cmd))
+        if len(attempts) < 2:
+            return mock.Mock(returncode=1, stdout="", stderr="context deadline exceeded")
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        with mock.patch("time.sleep", lambda _s: None):
+            brev._apply_on_finish(instance="box", cfg=cfg)
+
+    # Retried and succeeded. No "box may still be running" warning.
+    out = capsys.readouterr().out
+    assert "may still be running" not in out
+    assert len(attempts) == 2
+
+
 def test_fetch_failure_tail_returns_empty_on_ssh_error():
     """_fetch_failure_tail must never raise — the caller is already about
     to raise the real error and we don't want to mask it."""
@@ -1679,15 +1989,19 @@ def test_apply_on_finish_silent_on_success(capsys):
 
 
 def test_apply_on_finish_warns_on_subprocess_exception(capsys):
+    """If _brev_capture exhausts retries and raises on timeout, the
+    caller's try/except still prints a warning (best-effort cleanup
+    in a finally block must not propagate)."""
     cfg = BrevConfig(mode="vm", use_docker=True)
-    with mock.patch(
-        "runplz.backends.brev.subprocess.run",
-        side_effect=subprocess.TimeoutExpired(cmd="brev stop", timeout=120),
-    ):
+
+    def always_timeout(*a, **kw):
+        raise RuntimeError("`brev stop box` timed out after 120s on all 4 attempts.")
+
+    with mock.patch("runplz.backends.brev._brev_capture", side_effect=always_timeout):
         brev._apply_on_finish(instance="box", cfg=cfg)
 
     out = capsys.readouterr().out
-    assert "TimeoutExpired" in out
+    assert "RuntimeError" in out
     assert "check `brev ls`" in out
 
 
