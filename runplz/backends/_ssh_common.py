@@ -213,7 +213,17 @@ def _wait_until_ssh_reachable(
             )
             try:
                 refresh_callback()
-            except Exception as exc:  # noqa: BLE001
+            except BaseException as exc:
+                # If the callback raised on purpose (e.g. the instance
+                # entered a terminal FAILURE state and we should bail
+                # early instead of probing a dead box), let it through.
+                # Only swallow plain exceptions from general-purpose
+                # refresh logic (auth blip, etc.) — those are best-
+                # effort. Signal exceptions (_OrchestratorKilled,
+                # KeyboardInterrupt) propagate regardless.
+                name = type(exc).__name__
+                if name in ("_OrchestratorKilled", "BrevInstanceFailed"):
+                    raise
                 print(f"+ refresh callback raised: {exc}", flush=True)
         time.sleep(probe_interval_s)
     raise RuntimeError(

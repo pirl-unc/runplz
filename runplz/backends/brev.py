@@ -45,11 +45,14 @@ from runplz.backends._ssh_common import (
 )
 
 # Re-exports so older test patches and external code that patched these
-# keep working without a hard rename.
+# keep working without a hard rename. 3.8's _brev_capture / _brev_sh
+# replaced `_sh` for brev CLI calls, but tests still patch `brev._sh`
+# in a few places — the re-export keeps the test surface stable.
 _ = (  # noqa: F841 — held for test-mocking compatibility
     _container_running,
     _raise_for_runtime_cap,
     _render_ops_script,
+    _sh,
     _ssh,
 )
 
@@ -211,15 +214,27 @@ def run(
                 # run's `on_finish="stop"`. Resume it before SSH.
                 _start_instance_if_stopped(instance)
             _refresh_ssh()
+
             # `brev create` has its own internal wait-for-ready loop, but
             # on some providers (8-GPU boxes, slow pull of large container
             # images) that loop times out before SSH is actually reachable.
             # Poll explicitly with a refresh callback so ssh_common can
             # re-run `brev refresh` mid-poll when the instance transitions
             # from bootstrap-shim port to real port.
+            # Refresh callback does two things per invocation:
+            # 1. Runs `brev refresh` so ~/.brev/ssh_config picks up any
+            #    port changes when the instance transitions from the
+            #    bootstrap-shim port to the real one.
+            # 2. Checks `brev ls` for terminal failure states and raises
+            #    BrevInstanceFailed early, so a box stuck in FAILURE /
+            #    DEAD / DEPLOYING_FAILED doesn't burn the full budget.
+            def _poll_refresh_and_check():
+                _refresh_ssh()
+                _check_terminal_state(instance)
+
             _wait_until_ssh_reachable(
                 instance,
-                refresh_callback=_refresh_ssh,
+                refresh_callback=_poll_refresh_and_check,
                 max_wait_s=cfg.ssh_ready_wait_seconds,
             )
 
@@ -338,19 +353,20 @@ def _instance_exists(name: str) -> bool:
     Brev API outage, malformed JSON) — we refuse to silently treat a degraded
     listing as "instance doesn't exist," because the caller's fallback is to
     auto-create a *new billed box*, which may duplicate one the user already
-    has.
+    has. Transient errors are retried before escalating.
 
     Returns False only when `brev ls` succeeded but the target name is
     definitively not in the list (including the documented `null` / empty
     shapes Brev returns for empty orgs).
     """
-    r = subprocess.run(["brev", "ls", "--json"], capture_output=True, text=True, timeout=60)
+    r = _brev_capture(["brev", "ls", "--json"], label="brev ls --json")
     if r.returncode != 0:
         raise RuntimeError(
-            f"`brev ls --json` failed with exit code {r.returncode}. "
-            f"Refusing to continue — if we assumed the instance was missing we'd "
-            f"auto-create a duplicate billed box. Run `brev login` / check the "
-            f"`brev` CLI and retry. stderr: {(r.stderr or '').strip()[:500]}"
+            f"`brev ls --json` failed with exit code {r.returncode} after "
+            f"{len(_BREV_DEFAULT_RETRIES)} attempts. Refusing to continue — if "
+            f"we assumed the instance was missing we'd auto-create a duplicate "
+            f"billed box. Run `brev login` / check the `brev` CLI and retry. "
+            f"stderr: {(r.stderr or '').strip()[:500]}"
         )
     try:
         data = json.loads(r.stdout)
@@ -382,14 +398,30 @@ _BREV_STATUS_FIELDS = ("status", "state", "power_state", "lifecycle_status")
 # case-insensitive matching.
 _BREV_STOPPED_STATES = {"stopped", "paused", "hibernated", "suspended"}
 
+# Terminal failure states — the instance isn't coming back. Probing SSH
+# against these is wasted budget (observed in the wild: H100 Nebius
+# workspaces that enter FAILURE after provisioning and never leave).
+# Lower-cased for case-insensitive matching.
+_BREV_TERMINAL_FAILED_STATES = {
+    "failed",
+    "failure",
+    "deploying_failed",
+    "create_failed",
+    "terminated",
+    "dead",
+    "error",
+}
+
 
 def _instance_status(name: str) -> Optional[str]:
     """Return the raw status string for `name` from `brev ls --json`, or
     None if the instance isn't listed or no recognized status field is
     present. Best-effort — used only to decide whether we need to call
-    `brev start` before SSH."""
+    `brev start` before SSH. Transient errors are retried; any final
+    failure quietly returns None (the SSH reachability loop will surface
+    a real problem if there is one)."""
     try:
-        r = subprocess.run(["brev", "ls", "--json"], capture_output=True, text=True, timeout=60)
+        r = _brev_capture(["brev", "ls", "--json"], label="brev ls --json (status)")
     except Exception:  # noqa: BLE001
         return None
     if r.returncode != 0:
@@ -419,6 +451,35 @@ def _instance_status(name: str) -> Optional[str]:
     return None
 
 
+class BrevInstanceFailed(RuntimeError):
+    """Brev reports the instance in a terminal failure state (FAILURE /
+    DEAD / DEPLOYING_FAILED). Raised during the SSH-ready poll so we
+    bail early instead of waiting out the full 30-minute budget.
+    Distinct exception type so `brev.run()`'s finally block can tell
+    "provisioning failed" apart from "dispatch failed" when shaping the
+    user-facing error."""
+
+
+def _check_terminal_state(name: str) -> None:
+    """Raise BrevInstanceFailed if `brev ls` reports a terminal failure
+    state for this instance. Called periodically during
+    _wait_until_ssh_reachable so we stop probing dead boxes early.
+
+    Silent no-op if status isn't recognizable — the reachability loop
+    handles ambiguous cases by timing out normally.
+    """
+    status = _instance_status(name)
+    if status is None:
+        return
+    if status.strip().lower() in _BREV_TERMINAL_FAILED_STATES:
+        raise BrevInstanceFailed(
+            f"Brev instance {name!r} is in terminal state {status!r}. "
+            f"Provisioning at the cloud-provider layer failed (check "
+            f"`brev ls` / provider console for details). Runplz will "
+            f"not waste the SSH-reachability budget probing a dead box."
+        )
+
+
 def _start_instance_if_stopped(name: str) -> None:
     """If the Brev box for `name` is in a stopped / paused state, run
     `brev start` before the dispatch tries to SSH.
@@ -436,12 +497,10 @@ def _start_instance_if_stopped(name: str) -> None:
         return
     print(f"+ instance {name!r} is {status!r}; running `brev start {name}`", flush=True)
     try:
-        r = subprocess.run(
+        r = _brev_capture(
             ["brev", "start", name],
-            check=False,
-            capture_output=True,
-            text=True,
             timeout=600,
+            label=f"brev start {name}",
         )
     except Exception as exc:  # noqa: BLE001
         print(
@@ -487,68 +546,88 @@ def _create_instance(name: str, *, cfg=None, image=None, function=None):
         # `image.base` is guaranteed to be set here — Dockerfile images are
         # rejected at function-decoration time by runplz.app's validator.
         cmd += ["--mode", "container", "--container-image", image.base]
-    _sh(cmd)
+
+    # `brev create` can take a while; 10 minutes per attempt gives the API
+    # enough room on slow providers. Retry transient errors (HTTP 500, EOF,
+    # context deadline) — see the 3.8 report for real-world signatures.
+    print("+ " + " ".join(str(c) for c in cmd), flush=True)
+    r = _brev_capture(cmd, timeout=600, label=f"brev create {name}")
+    if r.returncode == 0:
+        return
+
+    err_str = ((r.stderr or "") + (r.stdout or "")).strip()
+    # Idempotency guard: if we retried and Brev says "already exists", the
+    # first attempt succeeded under the hood (HTTP 500 *after* create was
+    # registered, which happens). Verify the instance is really there and
+    # proceed instead of failing.
+    if _looks_already_exists(err_str):
+        print(
+            f"+ `brev create {name}` reports already exists; verifying via "
+            f"`brev ls` (idempotent-retry path)",
+            flush=True,
+        )
+        try:
+            if _instance_exists(name):
+                print(f"+ {name!r} confirmed created — treating as success", flush=True)
+                return
+        except RuntimeError:
+            pass  # fall through to the hard error below
+
+    raise RuntimeError(
+        f"`brev create {name}` failed after {len(_BREV_DEFAULT_RETRIES)} attempt(s) "
+        f"with exit {r.returncode}. stderr: {err_str[:500]}"
+    )
 
 
 _BREV_TRANSIENT_PATTERNS = (
+    # API / gRPC layer (brevapi.us-west-2-prod.control-plane.brev.dev).
     "context deadline exceeded",
     "rpc error",
     "connection reset",
     "connection refused",
     "i/o timeout",
     "temporary failure in name resolution",
+    # HTTP status codes — 500/502/503/504 are all transient; Brev sometimes
+    # surfaces 500 Internal Server Error on otherwise-valid `brev create`.
+    "internal server error",
     "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "500",
+    "502",
     "503",
     "504",
+    # Transport-level hiccups.
     "eof",
+    "unexpected eof",
+    "http2: server sent goaway",
+    "read: connection closed",
+    "broken pipe",
+    # Shadeform broker — the "not_found" case from attempt 5 is NOT
+    # transient (broker said no), but an empty "list failed" often is.
+    "external nodes: skipping (list failed):",
 )
 
-# Attempts, seconds to wait before each retry. First attempt has no wait;
-# each subsequent wait grows. A total of ~21s spent on retries is enough to
-# ride out the Brev API hiccups seen in the wild without blocking for too
-# long if the error is genuine.
-_REFRESH_RETRY_WAITS = (0, 3, 6, 12)
+# Error signatures meaning "Brev already created this instance but we lost
+# the response" — the retry attempt then races into `name already exists`.
+# Caller treats this as success after verifying the instance actually exists.
+_BREV_ALREADY_EXISTS_PATTERNS = (
+    "already exists",
+    "name is taken",
+    "workspace with this name",
+    "instance with name",
+    "conflict",
+)
 
+# Attempts: (0, 3, 6, 12) = 4 tries, ~21s total retry budget per CLI call.
+# Enough to ride out typical Brev API blips without delaying hard-failures
+# by too much. Every brev call uses this unless explicitly overridden.
+_BREV_DEFAULT_RETRIES = (0, 3, 6, 12)
 
-def _refresh_ssh():
-    """Run `brev refresh`, retrying on transient Brev API errors.
-
-    Issue #28: `brev refresh` periodically returns `rpc error: context
-    deadline exceeded` when the Brev backend API is slow (common during
-    8×A100 Denvr/OCI provisioning). That used to be fatal, leaving a
-    freshly-provisioned billed box running. Retry up to 4 attempts total
-    across ~21 seconds; only raise if every attempt fails with what looks
-    like a transient error, or if we hit a non-transient failure.
-    """
-    import time
-
-    last_stderr = ""
-    for attempt, wait_s in enumerate(_REFRESH_RETRY_WAITS, start=1):
-        if wait_s:
-            time.sleep(wait_s)
-        r = subprocess.run(
-            ["brev", "refresh"],
-            capture_output=True,
-            text=True,
-        )
-        if r.returncode == 0:
-            if attempt > 1:
-                print(f"+ brev refresh succeeded on attempt {attempt}", flush=True)
-            return
-        err = ((r.stderr or "") + (r.stdout or "")).lower()
-        last_stderr = (r.stderr or r.stdout or "").strip()
-        if _looks_transient(err) and attempt < len(_REFRESH_RETRY_WAITS):
-            print(
-                f"+ brev refresh attempt {attempt}/{len(_REFRESH_RETRY_WAITS)} "
-                f"hit transient error; retrying. stderr: {last_stderr[:200]}",
-                flush=True,
-            )
-            continue
-        break
-    raise RuntimeError(
-        f"`brev refresh` failed after {len(_REFRESH_RETRY_WAITS)} attempts. "
-        f"Last stderr: {last_stderr[:500]}"
-    )
+# Per-attempt timeout for brev CLI calls. 90s gives slow control-plane calls
+# (brev ls with many instances, brev create kicking off provisioning) room
+# without waiting forever on a genuinely hung subprocess.
+_BREV_DEFAULT_TIMEOUT_S = 90
 
 
 def _looks_transient(err: str) -> bool:
@@ -556,23 +635,121 @@ def _looks_transient(err: str) -> bool:
     return any(pat in low for pat in _BREV_TRANSIENT_PATTERNS)
 
 
+def _looks_already_exists(err: str) -> bool:
+    low = err.lower()
+    return any(pat in low for pat in _BREV_ALREADY_EXISTS_PATTERNS)
+
+
+def _brev_capture(
+    cmd: list,
+    *,
+    timeout: int = _BREV_DEFAULT_TIMEOUT_S,
+    retry_waits: tuple = _BREV_DEFAULT_RETRIES,
+    label: Optional[str] = None,
+) -> subprocess.CompletedProcess:
+    """Run a `brev` subcommand with transient-error retries.
+
+    Transient error patterns are checked against combined stdout+stderr
+    (see _BREV_TRANSIENT_PATTERNS). Non-transient failures terminate
+    immediately with the CompletedProcess returned for caller inspection.
+    A transient failure on the final attempt returns the last
+    CompletedProcess too — the caller can decide whether that's fatal.
+
+    `subprocess.TimeoutExpired` is always treated as transient.
+    """
+    import time
+
+    label = label or " ".join(str(c) for c in cmd[:3])
+    last: Optional[subprocess.CompletedProcess] = None
+    for attempt, wait_s in enumerate(retry_waits, start=1):
+        if wait_s:
+            time.sleep(wait_s)
+        try:
+            last = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if attempt < len(retry_waits):
+                print(
+                    f"+ {label} attempt {attempt}/{len(retry_waits)} timed out "
+                    f"after {timeout}s; retrying",
+                    flush=True,
+                )
+                continue
+            raise RuntimeError(
+                f"`{label}` timed out after {timeout}s on all {len(retry_waits)} attempts."
+            ) from None
+        if last.returncode == 0:
+            if attempt > 1:
+                print(f"+ {label} succeeded on attempt {attempt}", flush=True)
+            return last
+        # Coerce to str in case stderr/stdout are Mocks (test harness) or
+        # None (some subprocess configurations) — we only want the text.
+        err = str(last.stderr or "") + str(last.stdout or "")
+        if _looks_transient(err) and attempt < len(retry_waits):
+            snippet = str(last.stderr or last.stdout or "").strip()[:200]
+            print(
+                f"+ {label} attempt {attempt}/{len(retry_waits)} hit transient "
+                f"error; retrying. stderr: {snippet}",
+                flush=True,
+            )
+            continue
+        # Non-transient, or final attempt of a transient: return for caller.
+        return last
+    # Unreachable — the loop either returns or raises.
+    assert last is not None  # for type checkers
+    return last
+
+
+def _brev_sh(
+    cmd: list,
+    *,
+    timeout: int = _BREV_DEFAULT_TIMEOUT_S,
+    retry_waits: tuple = _BREV_DEFAULT_RETRIES,
+    label: Optional[str] = None,
+):
+    """Analogue of `_sh` for brev CLI calls: runs with retries, prints the
+    command, and raises on final non-zero exit."""
+    import shlex as _shlex
+
+    label = label or " ".join(str(c) for c in cmd[:3])
+    print("+ " + " ".join(_shlex.quote(str(c)) for c in cmd), flush=True)
+    r = _brev_capture(cmd, timeout=timeout, retry_waits=retry_waits, label=label)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()[:500]
+        raise RuntimeError(
+            f"`{label}` failed after {len(retry_waits)} attempt(s) "
+            f"with exit {r.returncode}. stderr: {err}"
+        )
+
+
+def _refresh_ssh():
+    """Run `brev refresh`, retrying on transient Brev API errors.
+
+    Issue #28: `brev refresh` periodically returns `rpc error: context
+    deadline exceeded` when the Brev backend API is slow (common during
+    8×A100 Denvr/OCI provisioning). Without retry, that used to be fatal
+    and leaked a billed box. 3.8.0 unified this with every other brev
+    CLI call through _brev_sh.
+    """
+    _brev_sh(["brev", "refresh"], label="brev refresh")
+
+
 def _apply_on_finish(*, instance: str, cfg) -> None:
     """Stop / delete / leave the Brev box per `cfg.on_finish`.
 
     Always best-effort: we never want box-cleanup to swallow a real error
-    from the try block. Failures here print a warning and move on.
+    from the try block. Transient Brev API errors get retries (via
+    _brev_capture) so a single flaky call doesn't leak a billed box;
+    any final failure prints a loud warning and moves on.
     """
     if cfg.on_finish == "leave":
         return
     action = cfg.on_finish  # "stop" or "delete"
     print(f"+ on_finish={action}: running `brev {action} {instance}`", flush=True)
     try:
-        r = subprocess.run(
+        r = _brev_capture(
             ["brev", action, instance],
-            check=False,
-            capture_output=True,
-            text=True,
             timeout=120,
+            label=f"brev {action} {instance}",
         )
     except Exception as exc:  # noqa: BLE001
         print(
@@ -703,7 +880,7 @@ def _pick_instance_type(function) -> Optional[str]:
     if function.min_disk is not None:
         cmd += ["--min-disk", str(function.min_disk)]
     print("+ " + " ".join(_shlex.quote(c) for c in cmd), flush=True)
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    r = _brev_capture(cmd, label=f"brev search {mode}")
     if r.returncode != 0:
         return None
     try:
