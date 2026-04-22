@@ -18,15 +18,23 @@ image = (
 
 @app.function(image=image, gpu="T4", min_cpu=4, min_memory=16)
 def train():
-    import torch
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    import os, torch
+    print("cuda available:", torch.cuda.is_available())
     # ... your training code ...
-    return device
+    # Anything under $RUNPLZ_OUT comes back to ./out/ on your machine.
+    os.makedirs(os.environ["RUNPLZ_OUT"], exist_ok=True)
+    with open(f"{os.environ['RUNPLZ_OUT']}/result.txt", "w") as f:
+        f.write("done\n")
 
 @app.local_entrypoint()
 def main():
-    print("ran on:", train.remote())
+    train.remote()
 ```
+
+`.remote()` doesn't bring the function's return value back — the
+remote body runs in a separate process, possibly on a separate
+machine. Communicate via files (see ["Data in and out"](#data-in-and-out) below) or stdout
+(captured to the driver log).
 
 Invoke via the CLI:
 
@@ -347,20 +355,92 @@ The core dependency set is empty. Backends shell out to system CLIs:
 - `ssh`   → `ssh`, `rsync` (docker on the remote if `use_docker=True`)
 - `modal` → `modal>=1.1,<2` Python package
 
-## Outputs
+## Data in and out
 
-Write to `$RUNPLZ_OUT` inside your function. runplz collects that directory
-back to `./out/` on the host:
+runplz doesn't serialize args/returns — you move data via files. The
+remote function sees your repo under `/workspace/` and writes results
+to `$RUNPLZ_OUT`, which comes back to `./out/` on your machine.
 
-- **local** — bind-mount (no size cap).
-- **brev / ssh** — `rsync` from the remote (no size cap beyond disk).
+### Inputs — your repo goes up
+
+The entire repo (minus `.env` / secrets / `.git` / caches — see
+["What runplz does NOT ship"](#what-runplz-does-not-ship-to-the-remote)) is rsynced to
+the remote before dispatch. Read input files by relative path the same
+way you would locally:
+
+```python
+@app.function(image=image)
+def train():
+    import pandas as pd
+    df = pd.read_csv("data/train.csv")   # from /workspace/data/train.csv
+    ...
+```
+
+Large datasets that you don't want to rsync every run: host them on
+S3 / GCS / Modal Volume and have the remote function pull them at
+start-up. runplz's `.env` exclusion means you can ship `boto3`
+credentials via `@app.function(env=...)` without leaking them into the
+image layer.
+
+### Outputs — write to `$RUNPLZ_OUT`
+
+`RUNPLZ_OUT` is set to the remote's output directory (`/out` inside
+docker, or `$HOME/runplz-out` on ssh/native paths). Anything you drop
+there is collected back to `./out/` on the host:
+
+```python
+@app.function(image=image, gpu="T4")
+def train():
+    import os, torch
+    model = ...
+    torch.save(model.state_dict(), f"{os.environ['RUNPLZ_OUT']}/weights.pt")
+```
+
+Transport per backend:
+
+- **local** — bind-mount. No size cap.
+- **brev / ssh** — `rsync` from the remote after dispatch. No size cap
+  beyond remote disk.
 - **modal** — the remote returns `/out` as a tar.gz blob, subject to
   Modal's ~256 MB return-value cap. runplz measures the blob before
   extracting: **warns at 200 MB**, **raises `RuntimeError` at 256 MB**
   (the archive may already be truncated, and silently unpacking a
-  truncated tar would lose data). For anything bigger, write to
-  `modal.Volume.from_name("...", create_if_missing=True)` mounted at
-  `/out` and download via `volume.batch_iter(...)` after the run.
+  truncated tar would lose data).
+
+### Large / persistent outputs on Modal — use a Volume
+
+When your results are bigger than 256 MB — or when you want them to
+persist across runs without being re-rsynced — mount a Modal Volume
+at `/out`:
+
+```python
+import modal
+
+volume = modal.Volume.from_name("training-outputs", create_if_missing=True)
+
+@app.function(image=image, gpu="T4", volumes={"/out": volume})
+def train():
+    import os, torch
+    model = ...
+    torch.save(model.state_dict(), "/out/weights.pt")
+    # volume.commit() not needed — Modal auto-commits on function exit
+```
+
+Then download locally after the run:
+
+```python
+# jobs/download.py — a separate script, or a follow-up local_entrypoint
+import modal
+vol = modal.Volume.from_name("training-outputs")
+for entry in vol.iterdir("/"):
+    with open(f"./out/{entry.path.lstrip('/')}", "wb") as f:
+        for chunk in vol.read_file(entry.path):
+            f.write(chunk)
+```
+
+Brev / ssh don't have a direct volume equivalent — for durable output
+on those backends, write to a mounted network drive the box already
+has, or push to S3 at the end of the function.
 
 ## Caveats
 

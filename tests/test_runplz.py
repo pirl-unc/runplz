@@ -159,6 +159,18 @@ def test_brev_accepts_custom_ssh_ready_wait_seconds():
     BrevConfig(ssh_ready_wait_seconds=2400)  # 40 min for exotic shapes
 
 
+def test_brev_default_instance_type_fallback_count():
+    """3.9.0: brev create passes 3 --type candidates by default."""
+    assert BrevConfig().instance_type_fallback_count == 3
+
+
+def test_brev_rejects_zero_or_negative_fallback_count():
+    with pytest.raises(ValueError, match="instance_type_fallback_count"):
+        BrevConfig(instance_type_fallback_count=0)
+    with pytest.raises(ValueError, match="instance_type_fallback_count"):
+        BrevConfig(instance_type_fallback_count=-1)
+
+
 def test_brev_rejects_unknown_on_finish():
     with pytest.raises(ValueError, match="on_finish must be one of"):
         BrevConfig(on_finish="terminate")
@@ -277,6 +289,57 @@ def test_pick_instance_type_cpu_when_no_gpu():
 
 
 # ---- Selector tiebreaker integration with brev search -------------------
+
+
+def test_pick_instance_types_returns_up_to_n_ranked_candidates():
+    """3.9.0: the plural picker returns multiple types for `brev create`
+    multi-provider fallback."""
+    from runplz.backends.brev import _pick_instance_types
+
+    brev_rows = [
+        {"type": "a-cheap", "hourly_price": 1.00, "eta_seconds": 300},
+        {"type": "b-in-band", "hourly_price": 1.03, "eta_seconds": 50},
+        {"type": "c-outside", "hourly_price": 1.40},
+        {"type": "d-outside", "hourly_price": 2.00},
+    ]
+
+    def fake_run(cmd, *a, **kw):
+        return mock.Mock(returncode=0, stdout=json.dumps(brev_rows), stderr="")
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        result = _pick_instance_types(_fn_with(gpu="T4", min_memory=16), n=3)
+
+    # Band (a, b); hinted prefers b first (lower eta). Fallback #3: c.
+    assert result == ["b-in-band", "a-cheap", "c-outside"]
+
+
+def test_pick_instance_types_n1_falls_back_to_single_picker():
+    """n=1 must match the single-type picker exactly (back-compat)."""
+    from runplz.backends.brev import _pick_instance_type, _pick_instance_types
+
+    rows = [
+        {"type": "cheap", "hourly_price": 1.00, "eta_seconds": 200},
+        {"type": "fast", "hourly_price": 1.03, "eta_seconds": 20},
+    ]
+
+    def fake_run(cmd, *a, **kw):
+        return mock.Mock(returncode=0, stdout=json.dumps(rows), stderr="")
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        single = _pick_instance_type(_fn_with(gpu="T4"))
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        multi = _pick_instance_types(_fn_with(gpu="T4"), n=1)
+    assert multi == [single]
+
+
+def test_pick_instance_types_empty_on_no_matches():
+    from runplz.backends.brev import _pick_instance_types
+
+    def fake_run(cmd, *a, **kw):
+        return mock.Mock(returncode=0, stdout="[]", stderr="")
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        assert _pick_instance_types(_fn_with(gpu="T4"), n=3) == []
 
 
 def test_pick_instance_type_prefers_faster_start_within_5pct():

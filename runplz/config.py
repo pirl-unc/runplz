@@ -75,6 +75,14 @@ class BrevConfig:
     # 8×A100/H100 cold boots on Denvr / OCI (observed 15-18 min). Bump
     # to 2400+ for exotic shapes that take longer (issue #34).
     ssh_ready_wait_seconds: int = 1800
+    # How many fallback instance types to pass to `brev create`. When
+    # > 1, runplz feeds the selector's top-N ranked candidates via
+    # repeated `--type` flags and Brev's own retry loop tries them in
+    # order — if Nebius fails on type A, Brev transparently falls back
+    # to type B on e.g. OCI. Only applies to auto-picked types; when
+    # `instance_type` is pinned explicitly, that one type is still the
+    # only one passed. Set to 1 for the pre-3.9 behavior (single type).
+    instance_type_fallback_count: int = 3
 
     def __post_init__(self):
         if self.mode not in _VALID_BREV_MODES:
@@ -103,6 +111,14 @@ class BrevConfig:
             raise ValueError(
                 f"BrevConfig.ssh_ready_wait_seconds must be a positive int; "
                 f"got {self.ssh_ready_wait_seconds!r}."
+            )
+        if (
+            not isinstance(self.instance_type_fallback_count, int)
+            or self.instance_type_fallback_count < 1
+        ):
+            raise ValueError(
+                f"BrevConfig.instance_type_fallback_count must be a positive int "
+                f"(1 = no fallback); got {self.instance_type_fallback_count!r}."
             )
 
 
