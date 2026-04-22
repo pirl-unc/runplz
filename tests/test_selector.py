@@ -4,7 +4,9 @@ See runplz/_selector.py for the algorithm. Exercises the 5% cost
 tolerance + availability-hint tiebreaker plus the fallback paths.
 """
 
-from runplz._selector import Candidate, pick_machine
+import pytest
+
+from runplz._selector import Candidate, pick_machine, pick_machines
 
 
 def _c(name, price, hint=None, region=None):
@@ -107,3 +109,82 @@ def test_reason_mentions_tolerance_in_band_with_no_hints():
     assert choice.name == "a"
     assert "2 other" in choice.reason
     assert "availability hint" in choice.reason
+
+
+# --- pick_machines: multi-type fallback (#44) ------------------------
+
+
+def test_pick_machines_empty_returns_empty_list():
+    assert pick_machines([], n=3) == []
+
+
+def test_pick_machines_zero_n_raises():
+    with pytest.raises(ValueError, match="positive int"):
+        pick_machines([_c("x", 1.0)], n=0)
+
+
+def test_pick_machines_returns_up_to_n():
+    cands = [_c("a", 1.00), _c("b", 1.20), _c("c", 1.50), _c("d", 2.00)]
+    got = [c.name for c in pick_machines(cands, n=2)]
+    assert got == ["a", "b"]
+
+
+def test_pick_machines_returns_fewer_than_n_when_pool_is_small():
+    got = pick_machines([_c("only", 0.5)], n=5)
+    assert [c.name for c in got] == ["only"]
+
+
+def test_pick_machines_within_band_orders_by_hint_then_cost():
+    """Within the 5% band, availability-hinted candidates beat unhinted
+    ones; ties broken by cost. Outside the band, cheapest-first."""
+    cands = [
+        _c("cheap-slow", 1.00, hint=500),
+        _c("mid-fast", 1.04, hint=10),
+        _c("nohint", 1.02),
+        _c("expensive", 1.50, hint=1),  # outside 5% band → ranks AFTER band
+    ]
+    names = [c.name for c in pick_machines(cands, n=4)]
+    # In-band: fast (hint=10) > slow (hint=500) > nohint (inf).
+    # Out-of-band: expensive comes last even though its hint is best.
+    assert names == ["mid-fast", "cheap-slow", "nohint", "expensive"]
+
+
+def test_pick_machines_fallback_goes_outside_band_cheapest_first():
+    """The whole point for #44: top pick is within-band; fallbacks 2..N
+    come from OUTSIDE the band, cheapest-first, because we want
+    resilience (try a 10%-pricier option if the cheap one fails) over
+    strict cost-optimality."""
+    cands = [
+        _c("A-cheap-in-band", 1.00),
+        _c("B-also-in-band", 1.03),
+        _c("C-10pct-over", 1.10),
+        _c("D-20pct-over", 1.20),
+    ]
+    got = [c.name for c in pick_machines(cands, n=3)]
+    # Band: A, B. Outside: C, D. Top 3: A, B, C.
+    assert got == ["A-cheap-in-band", "B-also-in-band", "C-10pct-over"]
+
+
+def test_pick_machines_skips_candidates_without_price():
+    cands = [_c("no-price", None), _c("cheap", 0.5), _c("zero", 0)]
+    assert [c.name for c in pick_machines(cands, n=3)] == ["cheap"]
+
+
+def test_pick_machines_top_pick_reason_matches_pick_machine():
+    """Behavioral regression guard: the #1 result from pick_machines
+    should reflect the same logic as pick_machine (so logs stay
+    consistent across the single- vs multi-pick code paths)."""
+    cands = [_c("a", 1.0, hint=100), _c("b", 1.03, hint=5)]
+    single = pick_machine(cands)
+    top = pick_machines(cands, n=2)[0]
+    assert top.name == single.name
+    assert "lower availability hint" in top.reason or "lowest availability" in top.reason
+
+
+def test_pick_machines_fallback_entries_have_a_reason_each():
+    cands = [_c("a", 1.0), _c("b", 1.2), _c("c", 1.5)]
+    got = pick_machines(cands, n=3)
+    assert len(got) == 3
+    assert got[0].reason  # top-pick reason
+    assert "fallback" in got[1].reason
+    assert "fallback" in got[2].reason

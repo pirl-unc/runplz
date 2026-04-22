@@ -112,3 +112,97 @@ def pick_machine(
         region=winner.region,
         reason=reason,
     )
+
+
+def pick_machines(
+    candidates: Iterable[Candidate],
+    *,
+    n: int,
+    cost_tolerance: float = DEFAULT_COST_TOLERANCE,
+) -> list:
+    """Return up to `n` ranked MachineChoices for fallback dispatch.
+
+    Same preference order as `pick_machine` applied sequentially:
+      1. Entries in the tolerance band (cheapest * (1 + cost_tolerance))
+         come first. Within the band, availability-hinted entries beat
+         unhinted (lower hint first); ties broken by cost.
+      2. Entries outside the band come next, cheapest-first. This is
+         the "if A fails try B" fallback lane — the tolerance band is
+         about optimal first-pick, fallback is about resilience so
+         we're okay reaching up the price ladder.
+
+    Empty / all-no-price candidate sets return an empty list. `n` must
+    be a positive int.
+    """
+    if n < 1:
+        raise ValueError(f"pick_machines(n={n!r}): n must be a positive int.")
+
+    pool = [c for c in candidates if c.hourly_usd is not None and c.hourly_usd > 0]
+    if not pool:
+        return []
+    pool.sort(key=lambda c: c.hourly_usd)
+
+    cheapest = pool[0].hourly_usd
+    band_ceiling = cheapest * (1.0 + cost_tolerance)
+    band = [c for c in pool if c.hourly_usd <= band_ceiling]
+    outside = [c for c in pool if c.hourly_usd > band_ceiling]
+
+    # Within-band ordering: if ANY band member has a hint, sort the
+    # whole band by (hint presence, hint value, cost). Unhinted entries
+    # come after hinted ones so a known-fast box always beats an
+    # unknown-fast box at the same price tier.
+    hinted_present = any(c.availability_hint is not None for c in band)
+    if hinted_present:
+
+        def _band_key(c: Candidate):
+            # (hint_available, hint_value, cost) — tuples sort
+            # left-to-right. Using `float('inf')` for missing hints puts
+            # unhinted entries last within the band.
+            hint = c.availability_hint if c.availability_hint is not None else float("inf")
+            return (hint, c.hourly_usd)
+
+        band.sort(key=_band_key)
+
+    ordered = band + outside  # band wins over outside; outside stays cost-ascending
+
+    choices = []
+    for i, c in enumerate(ordered[:n]):
+        if i == 0:
+            reason = _describe_pick(c, band, cheapest, cost_tolerance, hinted_present)
+        else:
+            reason = f"fallback #{i} (ordered by tolerance-band first, then cheapest-outside-band)"
+        choices.append(
+            MachineChoice(name=c.name, hourly_usd=c.hourly_usd, region=c.region, reason=reason)
+        )
+    return choices
+
+
+def _describe_pick(
+    winner: Candidate,
+    band: list,
+    cheapest_price: float,
+    cost_tolerance: float,
+    hinted_present: bool,
+) -> str:
+    """Human-readable reason string for the top pick from pick_machines.
+    Mirrors pick_machine's prose so logs stay consistent."""
+    if hinted_present and winner is not band[0]:
+        # This shouldn't happen — we put the hinted-best at band[0] above.
+        # Defensive fallback so we never crash on a reason string.
+        return f"within {int(cost_tolerance * 100)}% of cheapest ${cheapest_price:.3f}/hr"
+    if hinted_present:
+        if len(band) == 1:
+            return "cheapest (only candidate in tolerance band)"
+        if winner.availability_hint is None:
+            return "cheapest; tolerance band had availability hints but we picked cost"
+        return (
+            f"lowest availability hint in the {int(cost_tolerance * 100)}% "
+            f"tolerance band (hint={winner.availability_hint}, "
+            f"cost=${winner.hourly_usd:.3f}/hr)"
+        )
+    if len(band) == 1:
+        return "cheapest"
+    return (
+        f"cheapest; {len(band) - 1} other candidate(s) within "
+        f"{int(cost_tolerance * 100)}% but none had an availability hint"
+    )

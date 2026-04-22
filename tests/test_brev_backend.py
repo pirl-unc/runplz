@@ -355,7 +355,7 @@ def test_create_instance_with_resource_request_uses_picker(tmp_path):
         recorded["create_cmd"] = list(cmd)
         return mock.Mock(returncode=0, stdout="", stderr="")
 
-    with mock.patch("runplz.backends.brev._pick_instance_type", return_value="picked-type"):
+    with mock.patch("runplz.backends.brev._pick_instance_types", return_value=["picked-type"]):
         with mock.patch("runplz.backends.brev._brev_capture", fake_capture):
             brev._create_instance("x", cfg=app.brev_config, image=fn.image, function=fn)
 
@@ -376,7 +376,7 @@ def test_create_instance_no_constraints_falls_through_to_picker(tmp_path):
     fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
 
     recorded = {}
-    with mock.patch("runplz.backends.brev._pick_instance_type", return_value="cheap-cpu-type"):
+    with mock.patch("runplz.backends.brev._pick_instance_types", return_value=["cheap-cpu-type"]):
         with mock.patch(
             "runplz.backends.brev._brev_capture",
             lambda cmd, **kw: (
@@ -389,13 +389,105 @@ def test_create_instance_no_constraints_falls_through_to_picker(tmp_path):
     assert "cheap-cpu-type" in recorded["c"]
 
 
+def test_create_instance_passes_multiple_type_flags_for_fallback(tmp_path):
+    """3.9.0: auto-picked types fan out into repeated --type flags so
+    Brev's native multi-provider retry kicks in."""
+    cfg = BrevConfig(auto_create_instances=True, mode="vm", instance_type_fallback_count=3)
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(
+        app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path), gpu="T4"
+    )
+
+    recorded = {}
+
+    def fake_capture(cmd, **kw):
+        recorded["cmd"] = list(cmd)
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch(
+        "runplz.backends.brev._pick_instance_types",
+        return_value=["type-a", "type-b", "type-c"],
+    ):
+        with mock.patch("runplz.backends.brev._brev_capture", fake_capture):
+            brev._create_instance("multi", cfg=cfg, image=fn.image, function=fn)
+
+    cmd = recorded["cmd"]
+    # Three --type flags in the same order the picker returned.
+    type_positions = [i for i, tok in enumerate(cmd) if tok == "--type"]
+    assert len(type_positions) == 3
+    types_passed = [cmd[i + 1] for i in type_positions]
+    assert types_passed == ["type-a", "type-b", "type-c"]
+
+
+def test_create_instance_pinned_instance_type_skips_fallback(tmp_path):
+    """If the user explicitly pinned an instance_type, we pass only
+    that one — no fallback list, no picker call."""
+    cfg = BrevConfig(
+        auto_create_instances=True,
+        mode="vm",
+        instance_type="my-pinned-type",
+        instance_type_fallback_count=5,  # should be ignored for pinned types
+    )
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+
+    recorded = {}
+    picker_called = {"n": 0}
+
+    def fake_capture(cmd, **kw):
+        recorded["cmd"] = list(cmd)
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    def fake_picker(fn, *, n):
+        picker_called["n"] += 1
+        return ["SHOULD-NEVER-BE-USED"]
+
+    with mock.patch("runplz.backends.brev._pick_instance_types", fake_picker):
+        with mock.patch("runplz.backends.brev._brev_capture", fake_capture):
+            brev._create_instance("pinned", cfg=cfg, image=fn.image, function=fn)
+
+    assert picker_called["n"] == 0, "picker must not run when instance_type is pinned"
+    type_positions = [i for i, tok in enumerate(recorded["cmd"]) if tok == "--type"]
+    assert len(type_positions) == 1
+    assert recorded["cmd"][type_positions[0] + 1] == "my-pinned-type"
+
+
+def test_create_instance_fallback_count_one_passes_single_type(tmp_path):
+    """Setting instance_type_fallback_count=1 matches pre-3.9 behavior."""
+    cfg = BrevConfig(auto_create_instances=True, mode="vm", instance_type_fallback_count=1)
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(
+        app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path), gpu="T4"
+    )
+
+    recorded = {}
+
+    def fake_capture(cmd, **kw):
+        recorded["cmd"] = list(cmd)
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    seen_n = {}
+
+    def fake_picker(fn, *, n):
+        seen_n["n"] = n
+        return ["only-type"]
+
+    with mock.patch("runplz.backends.brev._pick_instance_types", fake_picker):
+        with mock.patch("runplz.backends.brev._brev_capture", fake_capture):
+            brev._create_instance("solo", cfg=cfg, image=fn.image, function=fn)
+
+    assert seen_n["n"] == 1  # picker was asked for exactly 1 type
+    type_positions = [i for i, tok in enumerate(recorded["cmd"]) if tok == "--type"]
+    assert len(type_positions) == 1
+
+
 def test_create_instance_raises_when_picker_returns_none(tmp_path):
     cfg = BrevConfig(auto_create_instances=True)
     app = _app(tmp_path, cfg=cfg)
     fn = _function(
         app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path), gpu="T4"
     )
-    with mock.patch("runplz.backends.brev._pick_instance_type", return_value=None):
+    with mock.patch("runplz.backends.brev._pick_instance_types", return_value=[]):
         with pytest.raises(RuntimeError, match="no matching instances"):
             brev._create_instance("x", cfg=cfg, image=fn.image, function=fn)
 
@@ -434,7 +526,7 @@ def test_create_instance_container_mode_adds_image_flag(tmp_path):
     fn = _function(app, image, module_file=_job_inside(tmp_path), gpu="T4")
 
     recorded = {}
-    with mock.patch("runplz.backends.brev._pick_instance_type", return_value="picked-type"):
+    with mock.patch("runplz.backends.brev._pick_instance_types", return_value=["picked-type"]):
         with mock.patch(
             "runplz.backends.brev._brev_capture",
             lambda cmd, **kw: (

@@ -20,7 +20,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from runplz._selector import Candidate, pick_machine
+from runplz._selector import Candidate
 from runplz.backends._ssh_common import (
     FAILURE_TAIL_LINES,
     _build_image,
@@ -529,17 +529,26 @@ def _create_instance(name: str, *, cfg=None, image=None, function=None):
 
     Raises only if the picker finds no matches.
     """
-    instance_type: Optional[str] = cfg.instance_type if cfg is not None else None
-    if instance_type is None:
-        instance_type = _pick_instance_type(function)
-        if instance_type is None:
+    # Build the list of candidate types to pass to `brev create`. Brev's
+    # CLI natively supports repeated `--type` flags for multi-provider
+    # fallback (if A fails on Nebius, it tries B on OCI, etc.). We feed
+    # the selector's top-N ranked candidates when auto-picking; a
+    # user-pinned `instance_type` is always the one-and-only.
+    if cfg is not None and cfg.instance_type is not None:
+        instance_types = [cfg.instance_type]
+    else:
+        n = cfg.instance_type_fallback_count if cfg is not None else 1
+        instance_types = _pick_instance_types(function, n=n)
+        if not instance_types:
             raise RuntimeError(
                 "`brev search` returned no matching instances. Loosen the "
                 "function's resource constraints, pass an explicit "
                 "`instance_type=...` on BrevConfig, or pre-create the instance."
             )
 
-    cmd = ["brev", "create", name, "--type", instance_type]
+    cmd = ["brev", "create", name]
+    for t in instance_types:
+        cmd += ["--type", t]
     if function is not None and function.min_disk is not None:
         cmd += ["--min-disk", str(function.min_disk)]
     if cfg is not None and cfg.mode == "container":
@@ -850,19 +859,21 @@ def _candidate_from_brev_row(row: dict) -> Optional[Candidate]:
     return Candidate(name=name, hourly_usd=price, availability_hint=hint, region=region, raw=row)
 
 
-def _pick_instance_type(function) -> Optional[str]:
-    """Run `brev search gpu` (or cpu) with filters from `function`'s
-    resource requests; return the best matching TYPE string.
+def _pick_instance_types(function, *, n: int = 1) -> list:
+    """Run `brev search` with filters from `function`'s resource requests
+    and return up to `n` ranked TYPE strings for multi-type fallback
+    dispatch (issue #44).
 
-    Brev's own `--sort price` gives us cheapest-first; we post-process
-    through `pick_machine` so that when the top few candidates are
-    within 5% on price, we prefer whichever exposes the lowest
-    availability signal (ETA / supply). If no price or availability
-    fields are present we fall back to the original first-row behavior.
+    Brev's own `--sort price` gives us cheapest-first. We post-process
+    through `pick_machines` so the top pick applies the 5% cost-
+    tolerance + availability tiebreaker, and the tail provides fallback
+    candidates cheapest-first. If no price/availability fields are
+    exposed, falls back to the top N rows in `brev search` order.
 
-    Returns None if no match.
+    Returns `[]` on no match. When n == 1, returns a single-element list
+    (or []).
     """
-    import shlex as _shlex
+    from runplz._selector import pick_machines
 
     mode = "gpu" if function.gpu is not None else "cpu"
     cmd = ["brev", "search", mode, "--json", "--sort", "price"]
@@ -879,24 +890,43 @@ def _pick_instance_type(function) -> Optional[str]:
         cmd += ["--min-ram", str(function.min_memory)]
     if function.min_disk is not None:
         cmd += ["--min-disk", str(function.min_disk)]
-    print("+ " + " ".join(_shlex.quote(c) for c in cmd), flush=True)
+    print("+ " + " ".join(str(c) for c in cmd), flush=True)
     r = _brev_capture(cmd, label=f"brev search {mode}")
     if r.returncode != 0:
-        return None
+        return []
     try:
         results = json.loads(r.stdout)
     except json.JSONDecodeError:
-        return None
+        return []
     if not isinstance(results, list) or not results:
-        return None
+        return []
 
     candidates = [_candidate_from_brev_row(row) for row in results]
     priced = [c for c in candidates if c is not None and c.hourly_usd is not None]
     if priced:
-        choice = pick_machine(priced)
-        if choice is not None:
-            print(f"+ selector picked {choice.name!r}: {choice.reason}", flush=True)
-            return choice.name
+        choices = pick_machines(priced, n=n)
+        if choices:
+            names = [c.name for c in choices]
+            print(
+                f"+ selector picked {names!r}: top={choices[0].reason}",
+                flush=True,
+            )
+            return names
 
     # Fallback: price/name fields not exposed in this `brev search` shape.
-    return _brev_row_type(results[0])
+    # Take the first N rows in Brev's own order (it already sorted by
+    # price server-side).
+    fallback = []
+    for row in results[:n]:
+        t = _brev_row_type(row)
+        if t:
+            fallback.append(t)
+    return fallback
+
+
+def _pick_instance_type(function) -> Optional[str]:
+    """Single-type picker. Back-compat wrapper around
+    `_pick_instance_types(function, n=1)` — kept so older code /
+    tests that expect a single TYPE string still work."""
+    types = _pick_instance_types(function, n=1)
+    return types[0] if types else None
