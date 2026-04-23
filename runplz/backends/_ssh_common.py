@@ -844,10 +844,15 @@ def _run_container_detached(
     args,
     kwargs,
     gpu_flag,
+    app_name: Optional[str] = None,
     remote_run: Optional[RemoteRunContext] = None,
     port=None,
 ):
     env_flags = " ".join(f"-e {shlex.quote(f'{k}={v}')}" for k, v in function.env.items())
+    label_flags = "--label runplz=1 "
+    if app_name is not None:
+        label_flags += f"--label {shlex.quote(f'runplz-app={app_name}')} "
+    label_flags += f"--label {shlex.quote(f'runplz-function={function.name}')}"
     runner_env = (
         f"-e RUNPLZ_OUT=/out "
         f"-e RUNPLZ_SCRIPT={shlex.quote('/workspace/' + rel_script)} "
@@ -882,7 +887,8 @@ def _run_container_detached(
     start = (
         f"set -euo pipefail; "
         f'mkdir -p "{out_dir}" && '
-        f"sudo docker run -d --name {container_name} --network=host {gpu_flag} "
+        f"sudo docker run -d --name {container_name} {label_flags} "
+        f"--network=host {gpu_flag} "
         f'-v "{out_dir}:/out" '
         f"{runner_env} {env_flags} "
         f"{REMOTE_IMAGE_TAG} python -m runplz._bootstrap >/dev/null; "

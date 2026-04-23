@@ -5,6 +5,7 @@ Usage:
     runplz brev --instance my-gpu-box <script.py>
     runplz ssh  --host gpu.example.com <script.py>
     runplz modal <script.py>
+    runplz ps [local|brev|modal] [--ssh <host>]
 
 Extra arguments after <script.py> are passed through to the script's
 @app.local_entrypoint — modal-style:
@@ -43,6 +44,11 @@ def main(argv=None):
         sys.stderr.reconfigure(line_buffering=True)
     except (AttributeError, io.UnsupportedOperation):
         pass
+
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    if argv_list and argv_list[0] == "ps":
+        return _ps_main(argv_list[1:])
+
     p = argparse.ArgumentParser(
         prog="runplz", description="Run a Python @app.function on a chosen backend."
     )
@@ -273,6 +279,88 @@ def _load_app(script_path: Path):
     if len(apps) > 1:
         raise SystemExit(f"Multiple Apps found in {script_path}; expected exactly one.")
     return apps[0]
+
+
+_PS_BACKENDS = ("local", "brev", "modal")
+
+
+def _ps_main(argv):
+    """Dispatch ``runplz ps`` — list runplz jobs across backends."""
+    p = argparse.ArgumentParser(
+        prog="runplz ps",
+        description="List runplz jobs currently running across backends.",
+    )
+    p.add_argument(
+        "backend",
+        nargs="?",
+        choices=_PS_BACKENDS,
+        help="Limit listing to one backend. Default: fan out to all of local, brev, modal.",
+    )
+    p.add_argument(
+        "--ssh",
+        dest="ssh_host",
+        help=(
+            "[ssh] Also probe this SSH host. SSH has no job registry, so the "
+            "host must be supplied. May be given multiple times (comma-separated)."
+        ),
+    )
+    args = p.parse_args(argv)
+
+    backends = [args.backend] if args.backend else list(_PS_BACKENDS)
+    ssh_hosts = [h.strip() for h in (args.ssh_host or "").split(",") if h.strip()]
+
+    rows = []
+    errors = []
+    for backend in backends:
+        try:
+            rows.extend(_collect_backend_jobs(backend))
+        except Exception as exc:  # noqa: BLE001
+            errors.append((backend, exc))
+    for host in ssh_hosts:
+        try:
+            from runplz.backends import ssh as ssh_backend
+
+            rows.extend(ssh_backend.list_jobs(host=host))
+        except Exception as exc:  # noqa: BLE001
+            errors.append((f"ssh:{host}", exc))
+
+    if rows or not errors:
+        _print_ps_table(rows)
+    for name, exc in errors:
+        print(f"warning: {name} listing failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+    return 1 if errors and not rows else 0
+
+
+def _collect_backend_jobs(backend: str) -> list[dict]:
+    if backend == "local":
+        from runplz.backends import local as local_backend
+
+        return local_backend.list_jobs()
+    if backend == "brev":
+        from runplz.backends import brev as brev_backend
+
+        return brev_backend.list_jobs()
+    if backend == "modal":
+        from runplz.backends import modal as modal_backend
+
+        return modal_backend.list_jobs()
+    raise ValueError(f"unknown backend: {backend}")
+
+
+def _print_ps_table(rows: list[dict]) -> None:
+    if not rows:
+        print("(no runplz jobs running)")
+        return
+    headers = ["BACKEND", "NAME", "APP", "FUNCTION", "STARTED", "STATUS"]
+    keys = ["backend", "name", "app", "function", "started", "status"]
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, key in enumerate(keys):
+            widths[i] = max(widths[i], len(str(row.get(key, ""))))
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*headers))
+    for row in rows:
+        print(fmt.format(*(str(row.get(k, "")) for k in keys)))
 
 
 if __name__ == "__main__":

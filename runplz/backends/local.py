@@ -50,6 +50,12 @@ def run(
         "--rm",
         "--name",
         f"runplz-{app.name}-{function.name}",
+        "--label",
+        "runplz=1",
+        "--label",
+        f"runplz-app={app.name}",
+        "--label",
+        f"runplz-function={function.name}",
         "-v",
         f"{host_out}:/out",
         "-w",
@@ -114,6 +120,69 @@ def _print_cmd(cmd):
     # users tailing a log file see status prints land before subprocess
     # output.
     print("+ " + " ".join(cmd), flush=True)
+
+
+def list_jobs() -> list[dict]:
+    """Return runplz jobs currently running under the local docker daemon.
+
+    Filters on the ``runplz=1`` label so this never returns unrelated
+    containers a user may have started by hand.
+    """
+    r = subprocess.run(
+        [
+            "docker",
+            "ps",
+            "--filter",
+            "label=runplz=1",
+            "--format",
+            "{{json .}}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"`docker ps` failed (rc={r.returncode}); is Docker running? "
+            f"stderr: {(r.stderr or '').strip()[:300]}"
+        )
+    return _parse_docker_ps_rows(r.stdout)
+
+
+def _parse_docker_ps_rows(stdout: str) -> list[dict]:
+    rows = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        labels = _parse_docker_labels(raw.get("Labels", ""))
+        rows.append(
+            {
+                "backend": "local",
+                "name": raw.get("Names", "") or raw.get("ID", ""),
+                "app": labels.get("runplz-app", ""),
+                "function": labels.get("runplz-function", ""),
+                "started": raw.get("CreatedAt", "") or raw.get("RunningFor", ""),
+                "status": raw.get("Status", ""),
+            }
+        )
+    return rows
+
+
+def _parse_docker_labels(labels: str) -> dict:
+    """Parse the comma-separated `key=value,key=value` label string from
+    `docker ps --format '{{json .}}'` into a dict. Ignores malformed entries."""
+    out = {}
+    if not labels:
+        return out
+    for part in labels.split(","):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
 
 
 def _print_reused_image(tag: str) -> None:

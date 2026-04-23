@@ -85,6 +85,124 @@ def main():
 '''
 
 
+def list_jobs() -> list[dict]:
+    """Return Modal apps created by runplz.
+
+    Filters on the ``runplz-`` prefix that the entrypoint generator stamps on
+    every app name (see :data:`_ENTRYPOINT_TEMPLATE`). Runs dispatched before
+    the prefix was introduced won't show up — those eventually finish on their
+    own.
+
+    Uses ``modal app list --json`` when available and falls back to text
+    parsing. The json flag has been supported for a while but this keeps the
+    command usable against older Modal CLIs.
+    """
+    try:
+        import modal  # noqa: F401
+    except ImportError:
+        return []
+
+    r = subprocess.run(
+        ["modal", "app", "list", "--json"],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode == 0 and r.stdout.strip().startswith(("[", "{")):
+        return _jobs_from_modal_json(r.stdout)
+
+    # Fallback: parse the plain-text table.
+    r = subprocess.run(
+        ["modal", "app", "list"],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"`modal app list` failed (rc={r.returncode}). stderr: {(r.stderr or '').strip()[:300]}"
+        )
+    return _jobs_from_modal_text(r.stdout)
+
+
+def _jobs_from_modal_json(stdout: str) -> list[dict]:
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return []
+    rows = (
+        data if isinstance(data, list) else data.get("apps", []) if isinstance(data, dict) else []
+    )
+    jobs = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("name") or row.get("App Name") or row.get("Name") or ""
+        state = row.get("state") or row.get("State") or ""
+        if not name.startswith("runplz-"):
+            continue
+        # Skip terminal states — we want running/active apps.
+        if str(state).lower() in {"stopped", "finished", "terminated", "deleted"}:
+            continue
+        app_name, fn_name = _split_modal_app_name(name)
+        jobs.append(
+            {
+                "backend": "modal",
+                "name": name,
+                "app": app_name,
+                "function": fn_name,
+                "started": row.get("created_at") or row.get("Created at") or "",
+                "status": str(state),
+            }
+        )
+    return jobs
+
+
+def _jobs_from_modal_text(stdout: str) -> list[dict]:
+    """Parse the plain-text `modal app list` table.
+
+    Format is column-delimited; we look for lines containing ``runplz-`` and
+    split on runs of whitespace. Best-effort — used only when ``--json`` isn't
+    available. Columns we look for (order varies across Modal CLI versions):
+    App ID, Name, State, Created at.
+    """
+    jobs = []
+    for line in stdout.splitlines():
+        if "runplz-" not in line:
+            continue
+        parts = [p.strip() for p in re.split(r"\s{2,}|\|", line.strip()) if p.strip()]
+        name = next((p for p in parts if p.startswith("runplz-")), "")
+        if not name:
+            continue
+        app_name, fn_name = _split_modal_app_name(name)
+        # Pick the token that looks like a known state; leave blank otherwise.
+        state_tokens = {"running", "ready", "stopped", "finished", "terminated", "deploying"}
+        state = next((p for p in parts if p.lower() in state_tokens), "")
+        if state.lower() in {"stopped", "finished", "terminated"}:
+            continue
+        jobs.append(
+            {
+                "backend": "modal",
+                "name": name,
+                "app": app_name,
+                "function": fn_name,
+                "started": "",
+                "status": state,
+            }
+        )
+    return jobs
+
+
+def _split_modal_app_name(name: str) -> tuple[str, str]:
+    """Reverse of ``runplz-{app}-{function}``. Takes the final hyphen segment
+    as the function name and everything before it as the app name."""
+    if not name.startswith("runplz-"):
+        return ("", "")
+    core = name[len("runplz-") :]
+    parts = core.split("-")
+    if len(parts) < 2:
+        return ("", "")
+    return ("-".join(parts[:-1]), parts[-1])
+
+
 def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
     try:
         import modal  # noqa: F401
@@ -142,7 +260,7 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
         )
 
     entrypoint_src = _ENTRYPOINT_TEMPLATE.format(
-        app_name=f"{app.name}-{function.name}",
+        app_name=f"runplz-{app.name}-{function.name}",
         gpu=modal_gpu,
         cpu=function.min_cpu,
         memory=modal_memory,

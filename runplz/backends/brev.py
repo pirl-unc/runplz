@@ -294,6 +294,7 @@ def run(
                     args=args,
                     kwargs=kwargs,
                     gpu_flag=gpu_flag,
+                    app_name=app.name,
                     remote_run=remote_run,
                 )
                 exit_code = _stream_and_wait(
@@ -373,6 +374,73 @@ def _skip_onboarding():
             )
     except OSError:
         pass
+
+
+def list_jobs() -> list[dict]:
+    """Return Brev instances runplz created for ephemeral runs.
+
+    Matches the full shape :func:`_make_ephemeral_name` generates —
+    ``runplz-<app>-<fn>-<uuid8>`` where uuid8 is 8 lowercase hex chars. A
+    user-named ``--instance runplz-mygpu`` box won't match (no uuid suffix),
+    so we won't falsely report it as a live job. Jobs dispatched to a reused
+    ``--instance`` box are not included — from ``brev ls`` alone we can't
+    tell whether a job is actively running inside such a box.
+    """
+    r = _brev_capture(["brev", "ls", "--json"], label="brev ls --json (ps)")
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"`brev ls --json` failed with exit code {r.returncode}. "
+            f"stderr: {(r.stderr or '').strip()[:300]}"
+        )
+    return _jobs_from_brev_rows(_parse_brev_ls_rows(r.stdout))
+
+
+_EPHEMERAL_NAME_RE = re.compile(r"^runplz-.+-[0-9a-f]{8}$")
+
+
+def _jobs_from_brev_rows(rows: list[dict]) -> list[dict]:
+    jobs = []
+    for row in rows:
+        name = row.get("name") or ""
+        if not _EPHEMERAL_NAME_RE.match(name):
+            continue
+        app_name, fn_name = _split_ephemeral_name(name)
+        jobs.append(
+            {
+                "backend": "brev",
+                "name": name,
+                "app": app_name,
+                "function": fn_name,
+                "started": row.get("createdAt") or row.get("created_at") or "",
+                "status": _snapshot_status(row) or "",
+            }
+        )
+    return jobs
+
+
+def _split_ephemeral_name(name: str) -> tuple[str, str]:
+    """Best-effort reverse of :func:`_make_ephemeral_name`: ``runplz-<app>-<fn>-<uuid8>``.
+
+    The user's app / function names can themselves contain hyphens (they're
+    slugified but hyphens survive), so we can't perfectly unambiguously split.
+    We trim the ``runplz-`` prefix and the trailing uuid, then take the final
+    remaining segment as the function name and everything before it as the app
+    name — the common convention for ephemeral runs. Returns empty strings if
+    the shape doesn't match.
+    """
+    if not name.startswith("runplz-"):
+        return ("", "")
+    core = name[len("runplz-") :]
+    parts = core.split("-")
+    if len(parts) < 3:
+        return ("", "")
+    # Drop the uuid8 suffix.
+    parts = parts[:-1]
+    if len(parts) < 2:
+        return ("", "")
+    fn = parts[-1]
+    app = "-".join(parts[:-1])
+    return (app, fn)
 
 
 def _instance_exists(name: str) -> bool:
