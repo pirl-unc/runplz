@@ -14,7 +14,9 @@ This backend shares all the SSH plumbing with the brev backend via
 `runplz.backends._ssh_common`.
 """
 
+import json
 import re
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -31,6 +33,7 @@ from runplz.backends._ssh_common import (
     _run_container_detached,
     _run_native,
     _ssh_capture,
+    _ssh_cmd_opts,
     _stream_and_wait,
     _wait_until_ssh_reachable,
     build_remote_run_manifest,
@@ -38,7 +41,7 @@ from runplz.backends._ssh_common import (
     make_remote_run_context,
 )
 
-__all__ = ["run"]
+__all__ = ["run", "list_jobs"]
 
 
 def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
@@ -92,6 +95,7 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
                 args=args,
                 kwargs=kwargs,
                 gpu_flag=gpu_flag,
+                app_name=app.name,
                 remote_run=remote_run,
                 port=port,
             )
@@ -146,6 +150,63 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
                 f"--- end remote output ---"
             )
         raise RuntimeError(msg)
+
+
+def list_jobs(*, host: str, user: Optional[str] = None, port: Optional[int] = None) -> list[dict]:
+    """Return runplz jobs currently running on the SSH target ``host``.
+
+    SSH has no registry of hosts, so the caller must supply one. Filters on
+    the ``runplz=1`` label — the same label stamped by :func:`_run_container_detached`.
+    """
+    target, resolved_port = _build_ssh_target(host, user=user, port=port)
+    cmd = [
+        "ssh",
+        *_ssh_cmd_opts(resolved_port),
+        target,
+        "sudo docker ps --filter label=runplz=1 --format '{{json .}}' 2>/dev/null || true",
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"ssh to {target!r} failed (rc={r.returncode}). "
+            f"stderr: {(r.stderr or '').strip()[:300]}"
+        )
+    return _parse_remote_docker_ps(r.stdout, target=target)
+
+
+def _parse_remote_docker_ps(stdout: str, *, target: str) -> list[dict]:
+    rows = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        labels = _parse_docker_labels(raw.get("Labels", ""))
+        rows.append(
+            {
+                "backend": "ssh",
+                "name": f"{target}:{raw.get('Names', '') or raw.get('ID', '')}",
+                "app": labels.get("runplz-app", ""),
+                "function": labels.get("runplz-function", ""),
+                "started": raw.get("CreatedAt", "") or raw.get("RunningFor", ""),
+                "status": raw.get("Status", ""),
+            }
+        )
+    return rows
+
+
+def _parse_docker_labels(labels: str) -> dict:
+    out = {}
+    if not labels:
+        return out
+    for part in labels.split(","):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
 
 
 def _build_ssh_target(
