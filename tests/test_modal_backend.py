@@ -7,6 +7,7 @@ import io
 import sys
 import tarfile
 import types
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -138,8 +139,28 @@ def test_extract_tar_unpacks_to_dest(tmp_path):
 
     dest = tmp_path / "unpacked"
     dest.mkdir()
-    modal_backend._extract_tar(str(blob_path), dest)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        modal_backend._extract_tar(str(blob_path), dest)
     assert (dest / "a" / "b.txt").read_text() == "hello from modal\n"
+    assert not [w for w in caught if issubclass(w.category, DeprecationWarning)]
+
+
+def test_extract_tar_rejects_path_traversal(tmp_path):
+    blob_buf = io.BytesIO()
+    with tarfile.open(fileobj=blob_buf, mode="w:gz") as tar:
+        content = b"boom\n"
+        info = tarfile.TarInfo("../escape.txt")
+        info.size = len(content)
+        tar.addfile(info, io.BytesIO(content))
+    blob_path = tmp_path / "blob.tar.gz"
+    blob_path.write_bytes(blob_buf.getvalue())
+
+    dest = tmp_path / "unpacked"
+    dest.mkdir()
+    with pytest.raises(RuntimeError, match="unsafe tar member"):
+        modal_backend._extract_tar(str(blob_path), dest)
+    assert not (tmp_path / "escape.txt").exists()
 
 
 # --- run() end-to-end (mocked) -------------------------------------------

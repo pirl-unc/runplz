@@ -451,11 +451,12 @@ def _build_image(target: str, image, *, port: Optional[int] = None):
     """Build a docker image on the remote — either from the user's
     Dockerfile or from a synthesized one (Image.from_registry + DSL ops)."""
     if image.dockerfile is not None:
+        context = image.context or "."
         build = (
             f"set -euo pipefail; "
             f"cd ~/{REMOTE_REPO_DIR} && "
             f"sudo docker build -f {shlex.quote(image.dockerfile)} "
-            f"-t {REMOTE_IMAGE_TAG} ."
+            f"-t {REMOTE_IMAGE_TAG} {shlex.quote(context)}"
         )
     else:
         df = image.render_dockerfile()
@@ -541,8 +542,9 @@ def _stream_and_wait(
         if reconnects > max_reconnects:
             print(
                 f"+ ssh reconnected {max_reconnects} times without finishing; "
-                f"giving up on log stream. Container {container_name} may "
-                f"still be running on {target}.",
+                f"giving up on log stream and waiting for container exit "
+                f"only. Container {container_name} is still running on "
+                f"{target}.",
                 flush=True,
             )
             break
@@ -554,11 +556,17 @@ def _stream_and_wait(
         )
         tail = "0"
         time.sleep(2)
-    r = subprocess.run(
-        ["ssh", *_ssh_cmd_opts(port), target, f"sudo docker wait {container_name}"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        r = subprocess.run(
+            ["ssh", *_ssh_cmd_opts(port), target, f"sudo docker wait {container_name}"],
+            capture_output=True,
+            text=True,
+            timeout=_remaining_s(),
+        )
+    except subprocess.TimeoutExpired:
+        _raise_for_runtime_cap(
+            target, max_runtime_seconds, container_name=container_name, port=port
+        )
     try:
         return int(r.stdout.strip() or "1")
     except ValueError:

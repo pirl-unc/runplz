@@ -286,4 +286,32 @@ def _extract_tar(blob_path: str, dest: Path):
         blob = f.read()
     buf = io.BytesIO(blob)
     with tarfile.open(fileobj=buf, mode="r:gz") as tar:
-        tar.extractall(dest)
+        members = _validated_tar_members(tar, dest)
+        try:
+            tar.extractall(dest, members=members, filter="data")
+        except TypeError:
+            tar.extractall(dest, members=members)
+
+
+def _validated_tar_members(tar: tarfile.TarFile, dest: Path) -> list[tarfile.TarInfo]:
+    """Reject tar members that would escape `dest` or create links.
+
+    The Modal backend round-trips `/out` through a returned tarball, so we
+    treat that archive as untrusted input. Extracting `../x` or symlink
+    members verbatim would let a malformed archive write outside the outputs
+    dir. Python 3.14 also tightens tar extraction defaults in this direction.
+    """
+    base = dest.resolve()
+    safe_members = []
+    for member in tar.getmembers():
+        target = (base / member.name).resolve()
+        try:
+            target.relative_to(base)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Refusing to extract unsafe tar member {member.name!r} outside {dest}."
+            ) from exc
+        if member.issym() or member.islnk():
+            raise RuntimeError(f"Refusing to extract tar link member {member.name!r}.")
+        safe_members.append(member)
+    return safe_members
