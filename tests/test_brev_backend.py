@@ -714,6 +714,11 @@ def test_rsync_up_uses_remote_run_repo_when_provided(tmp_path):
 
 
 def test_run_native_with_remote_run_uses_per_run_lifecycle_files(tmp_path):
+    """The launcher script handed to ssh must reference the per-run meta
+    files (out/, last.log, heartbeat.ndjson) and the wrapper's
+    ``bootstrap_start`` event. Post-3.11 this is visible on the _ssh
+    launcher call (not subprocess.run) because the bootstrap is now
+    detached."""
     app = _app(tmp_path)
     fn = _function(
         app,
@@ -722,14 +727,26 @@ def test_run_native_with_remote_run_uses_per_run_lifecycle_files(tmp_path):
         env={"EXTRA": "ok"},
     )
     remote_run = brev.make_remote_run_context(backend="ssh", target="box", function_name="train")
-    recorded = {}
+    recorded = {"ssh_cmds": []}
 
-    def fake_ssh(i, c, **kw):
-        recorded.setdefault("setup", c)
+    def fake_ssh(target, cmd, **kw):
+        recorded["ssh_cmds"].append(cmd)
 
     def fake_sub_run(cmd, *a, **kw):
-        recorded["run_cmd"] = cmd
-        return mock.Mock(returncode=0)
+        # Return a "pid is dead" / "exit_code 0" stdout so the poll loop
+        # exits immediately and we can make assertions. stdout must be
+        # a real string — the exit-code parser uses json.loads on it.
+        cmd_str = " ".join(cmd)
+        if "kill -0" in cmd_str:
+            return mock.Mock(returncode=0, stdout="dead", stderr="")
+        if "remote_command_exit" in cmd_str:
+            return mock.Mock(
+                returncode=0,
+                stdout='{"ts":"x","event":"remote_command_exit","exit_code":0}\n',
+                stderr="",
+            )
+        # tail -F: pretend we streamed then EOF.
+        return mock.Mock(returncode=0, stdout="", stderr="")
 
     with mock.patch("runplz.backends._ssh_common._ssh", fake_ssh):
         with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_sub_run):
@@ -744,11 +761,17 @@ def test_run_native_with_remote_run_uses_per_run_lifecycle_files(tmp_path):
             )
 
     assert rc == 0
-    joined = " ".join(recorded["run_cmd"])
-    assert remote_run.out_rel in joined
-    assert remote_run.last_log_rel in joined
-    assert "heartbeat.ndjson" in joined
-    assert "bootstrap_start" in joined
+    # The launcher script (2nd _ssh call: 1st is the apt-get setup) must
+    # embed the per-run paths through the heredoc-wrapped inner command.
+    launcher = recorded["ssh_cmds"][-1]
+    assert remote_run.out_rel in launcher
+    assert remote_run.last_log_rel in launcher
+    assert "heartbeat.ndjson" in launcher
+    assert "bootstrap_start" in launcher
+    # And the new detach plumbing: setsid + nohup + pid file.
+    assert "setsid" in launcher
+    assert "nohup" in launcher
+    assert "bootstrap.pid" in launcher
 
 
 def test_ssh_packages_cmd_in_bash_lc():
@@ -1977,6 +2000,229 @@ def test_stream_and_wait_raises_when_cap_exceeded():
     with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_sub):
         with pytest.raises(RuntimeError, match="max_runtime_seconds=2"):
             brev._stream_and_wait("box", "container-xyz", max_runtime_seconds=2)
+
+
+def test_launch_detached_and_wait_falls_back_to_blocking_without_remote_run():
+    """No ``remote_run`` means no meta/events files to poll, so the helper
+    keeps the old synchronous ssh behavior. This preserves back-compat
+    with any ad-hoc caller that doesn't construct a remote_run."""
+    from runplz.backends._ssh_common import _launch_detached_and_wait
+
+    recorded = []
+
+    def fake_sub(cmd, *a, **kw):
+        recorded.append((cmd, kw.get("timeout")))
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_sub):
+        rc = _launch_detached_and_wait(
+            target="box",
+            wrapped_command="echo hi",
+            remote_run=None,
+            max_runtime_seconds=42,
+        )
+    assert rc == 0
+    assert len(recorded) == 1, "fallback path should make exactly one ssh call"
+    assert recorded[0][1] == 42
+
+
+def test_launch_detached_and_wait_writes_pid_and_uses_setsid_nohup(tmp_path):
+    """The launcher script must include all three detach ingredients:
+    setsid (new session), nohup (SIGHUP-proof + /dev/null stdin), and
+    stdout+stderr redirected to a file (no pipe to the ssh socket).
+
+    Missing any one of these leaves the process tethered to the ssh
+    session — the bug we're fixing."""
+    from runplz.backends._ssh_common import _launch_detached_and_wait
+
+    remote_run = brev.make_remote_run_context(backend="ssh", target="box", function_name="train")
+    launcher_seen = {}
+
+    def fake_ssh(target, cmd, **kw):
+        launcher_seen["cmd"] = cmd
+
+    def fake_sub(cmd, *a, **kw):
+        cmd_str = " ".join(cmd)
+        if "kill -0" in cmd_str:
+            return mock.Mock(returncode=0, stdout="dead", stderr="")
+        if "remote_command_exit" in cmd_str:
+            return mock.Mock(
+                returncode=0,
+                stdout='{"event":"remote_command_exit","exit_code":0}\n',
+                stderr="",
+            )
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("runplz.backends._ssh_common._ssh", fake_ssh):
+        with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_sub):
+            rc = _launch_detached_and_wait(
+                target="box",
+                wrapped_command="echo hi",
+                remote_run=remote_run,
+            )
+    assert rc == 0
+    cmd = launcher_seen["cmd"]
+    assert "setsid" in cmd
+    assert "nohup" in cmd
+    assert "</dev/null" in cmd
+    assert "bootstrap.pid" in cmd
+    # Heredoc carries the user command through verbatim.
+    assert "echo hi" in cmd
+
+
+def test_tail_and_wait_reconnects_when_pid_still_alive():
+    """If ``tail -F`` exits while the remote pid is still live, the helper
+    must reconnect. Direct test of the resilience we care about."""
+    from runplz.backends._ssh_common import _tail_and_wait_for_detached
+
+    call_log = []
+    # Non-exhausting: first 2 pid checks say alive (forcing reconnects),
+    # the rest say dead so both the main loop break AND the post-break
+    # "wait until clear" loop exit cleanly. Using a counter so the
+    # iterator can't run out mid-test.
+    pid_check_count = {"n": 0}
+
+    def fake_sub(cmd, *a, **kw):
+        cmd_str = " ".join(cmd)
+        call_log.append(cmd_str)
+        if "tail -n +1 -F" in cmd_str:
+            return mock.Mock(returncode=255, stdout="", stderr="")
+        if "kill -0" in cmd_str:
+            pid_check_count["n"] += 1
+            state = "alive" if pid_check_count["n"] <= 2 else "dead"
+            return mock.Mock(returncode=0, stdout=state, stderr="")
+        if "remote_command_exit" in cmd_str:
+            return mock.Mock(
+                returncode=0,
+                stdout='{"event":"remote_command_exit","exit_code":0}\n',
+                stderr="",
+            )
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_sub):
+        with mock.patch("runplz.backends._ssh_common.time.sleep"):
+            rc = _tail_and_wait_for_detached(
+                target="box",
+                pid_file="/tmp/pid",
+                log_file="/tmp/log",
+                events_file="/tmp/events.ndjson",
+            )
+    assert rc == 0
+    # Three tail invocations: initial + 2 reconnects before pid died.
+    tail_calls = [c for c in call_log if "tail -n +1 -F" in c]
+    assert len(tail_calls) == 3
+
+
+def test_tail_and_wait_gives_up_streaming_after_max_reconnects_but_still_returns_exit_code():
+    """After ``max_reconnects`` we stop re-tailing but MUST keep polling
+    until the pid clears so the caller sees the real exit code."""
+    from runplz.backends._ssh_common import _tail_and_wait_for_detached
+
+    tail_calls = 0
+    pid_calls = 0
+
+    def fake_sub(cmd, *a, **kw):
+        nonlocal tail_calls, pid_calls
+        cmd_str = " ".join(cmd)
+        if "tail -n +1 -F" in cmd_str:
+            tail_calls += 1
+            return mock.Mock(returncode=255, stdout="", stderr="")
+        if "kill -0" in cmd_str:
+            pid_calls += 1
+            # First N probes report alive (forces reconnects), last probe
+            # reports dead so the wait-after-giveup loop can exit.
+            return mock.Mock(
+                returncode=0,
+                stdout="alive" if pid_calls < 4 else "dead",
+                stderr="",
+            )
+        if "remote_command_exit" in cmd_str:
+            return mock.Mock(
+                returncode=0,
+                stdout='{"event":"remote_command_exit","exit_code":7}\n',
+                stderr="",
+            )
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_sub):
+        with mock.patch("runplz.backends._ssh_common.time.sleep"):
+            rc = _tail_and_wait_for_detached(
+                target="box",
+                pid_file="/tmp/pid",
+                log_file="/tmp/log",
+                events_file="/tmp/events.ndjson",
+                max_reconnects=2,
+            )
+    assert rc == 7
+    # After 2 reconnects (tail called 3 times: initial + 2 reconnects)
+    # we stop tailing but continue polling the pid.
+    assert tail_calls == 3
+    assert pid_calls >= 3
+
+
+def test_read_remote_exit_code_parses_last_entry():
+    """The file can accumulate multiple ``remote_command_exit`` entries
+    across retries; we want the last one."""
+    from runplz.backends._ssh_common import _read_remote_exit_code
+
+    def fake_sub(cmd, *a, **kw):
+        return mock.Mock(
+            returncode=0,
+            stdout=(
+                # Two lines; `tail -n 1` in the probe would strip the first.
+                # We emulate that by returning only the last line.
+                '{"event":"remote_command_exit","exit_code":13}\n'
+            ),
+            stderr="",
+        )
+
+    with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_sub):
+        assert _read_remote_exit_code("box", "/tmp/events") == 13
+
+
+def test_read_remote_exit_code_defaults_to_1_on_missing_or_malformed():
+    """Unknown exit code must NOT return 0 — a missing remote_command_exit
+    entry means something went sideways before the trap fired, which is
+    exactly a failure we want the caller to see as nonzero."""
+    from runplz.backends._ssh_common import _read_remote_exit_code
+
+    # Empty stdout (grep matched nothing).
+    with mock.patch(
+        "runplz.backends._ssh_common.subprocess.run",
+        return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+    ):
+        assert _read_remote_exit_code("box", "/tmp/events") == 1
+
+    # Malformed JSON.
+    with mock.patch(
+        "runplz.backends._ssh_common.subprocess.run",
+        return_value=mock.Mock(returncode=0, stdout="not-json\n", stderr=""),
+    ):
+        assert _read_remote_exit_code("box", "/tmp/events") == 1
+
+    # Exit code missing from the entry.
+    with mock.patch(
+        "runplz.backends._ssh_common.subprocess.run",
+        return_value=mock.Mock(
+            returncode=0,
+            stdout='{"event":"remote_command_exit"}\n',
+            stderr="",
+        ),
+    ):
+        assert _read_remote_exit_code("box", "/tmp/events") == 1
+
+
+def test_remote_pid_alive_treats_ssh_timeout_as_alive():
+    """If ssh itself hangs, we can't prove the remote job is dead, so the
+    safe default is "still alive" — let the caller keep polling instead
+    of prematurely returning a fake exit code."""
+    from runplz.backends._ssh_common import _remote_pid_alive
+
+    def fake_sub(cmd, *a, **kw):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kw.get("timeout", 0))
+
+    with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_sub):
+        assert _remote_pid_alive("box", "/tmp/pid") is True
 
 
 def test_stream_and_wait_no_cap_passes_none_timeout():
