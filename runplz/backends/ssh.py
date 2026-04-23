@@ -24,6 +24,7 @@ from runplz.backends._ssh_common import (
     _ensure_docker,
     _ensure_remote_rsync,
     _fetch_failure_tail,
+    _prepare_remote_run,
     _remote_has_nvidia,
     _rsync_down,
     _rsync_up,
@@ -32,7 +33,9 @@ from runplz.backends._ssh_common import (
     _ssh_capture,
     _stream_and_wait,
     _wait_until_ssh_reachable,
+    build_remote_run_manifest,
     make_container_name,
+    make_remote_run_context,
 )
 
 __all__ = ["run"]
@@ -48,10 +51,28 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
     repo = app._repo_root
     host_out = (repo / outputs_dir).resolve()
     host_out.mkdir(parents=True, exist_ok=True)
+    remote_run = make_remote_run_context(
+        backend="ssh",
+        target=target,
+        function_name=function.name,
+    )
+    _prepare_remote_run(
+        target,
+        remote_run,
+        manifest=build_remote_run_manifest(
+            remote_run=remote_run,
+            repo=repo,
+            outputs_dir=outputs_dir,
+            args=args,
+            kwargs=kwargs,
+            env=function.env,
+        ),
+        port=port,
+    )
 
     # Make sure rsync is present before we try to upload.
     _ensure_remote_rsync(target, port=port)
-    _rsync_up(repo, target, port=port)
+    _rsync_up(repo, target, remote_run=remote_run, port=port)
 
     rel_script = Path(function.module_file).resolve().relative_to(repo)
 
@@ -62,7 +83,7 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
             _ensure_docker(target, port=port)
             gpu_flag = "--gpus all" if _remote_has_nvidia(target, port=port) else ""
             container_name = make_container_name(function.name)
-            _build_image(target, function.image, port=port)
+            _build_image(target, function.image, remote_run=remote_run, port=port)
             _run_container_detached(
                 target=target,
                 container_name=container_name,
@@ -71,6 +92,7 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
                 args=args,
                 kwargs=kwargs,
                 gpu_flag=gpu_flag,
+                remote_run=remote_run,
                 port=port,
             )
             exit_code = _stream_and_wait(
@@ -90,15 +112,19 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
                 args=args,
                 kwargs=kwargs,
                 has_nvidia=_remote_has_nvidia(target, port=port),
+                remote_run=remote_run,
                 max_runtime_seconds=cfg.max_runtime_seconds,
                 port=port,
             )
-        _rsync_down(target, host_out, port=port)
+        _rsync_down(target, host_out, remote_run=remote_run, port=port)
     finally:
         failure_tail = ""
         if exit_code is not None and exit_code != 0:
             failure_tail = _fetch_failure_tail(
-                target=target, container_name=container_name, port=port
+                target=target,
+                container_name=container_name,
+                remote_run=remote_run,
+                port=port,
             )
         if container_name is not None:
             try:

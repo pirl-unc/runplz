@@ -1,3 +1,71 @@
+## 2026-04-23 PR Plan — Remote Run Forensics + Brev Lifecycle Diagnostics
+
+- [x] Introduce a shared per-launch remote run context for SSH/Brev
+- [x] Replace fixed `~/runplz-repo` / `~/runplz-out` usage with unique per-run paths
+- [x] Emit structured remote lifecycle metadata (`run.json`, `events.ndjson`, `heartbeat.ndjson`)
+- [x] Sync lifecycle metadata back through the normal outputs download path
+- [x] Preserve richer per-attempt Brev lifecycle diagnostics in the driver log
+- [x] Verify post-action Brev state after `create`, `start`, `stop`, and `delete`
+- [x] Add regression coverage for the new remote pathing, lifecycle logging, and Brev verification
+- [x] Bump `runplz/version.py` for the PR
+- [x] Run `./format.sh`
+- [x] Run `./lint.sh`
+- [x] Run `./test.sh`
+- [x] Commit, push branch, and open a draft PR linked to `#48`, `#49`, and `#50`
+
+### Scope / design
+
+- Shared SSH layer:
+  - add a `RemoteRunContext` that generates a stable `run_id` plus unique
+    remote directories under `~/runplz-runs/<run_id>/`
+  - use per-run `repo/`, `out/`, and metadata paths instead of fixed
+    `~/runplz-repo` / `~/runplz-out`
+  - print the chosen remote paths in the local driver log
+  - write `run.json`, `events.ndjson`, and `heartbeat.ndjson` under the
+    remote out tree so `rsync_down` brings them back automatically
+  - wrap native/container-mode remote commands with event/heartbeat/trap
+    logging so parent-process lifecycle is auditable even when the user
+    payload fails
+  - record host-side events around rsync/build/cleanup transitions
+
+- Brev backend:
+  - preserve fuller stdout/stderr context for each retry attempt, including
+    timestamps and elapsed time in `_brev_capture`
+  - add an instance snapshot helper over `brev ls --json`
+  - verify lifecycle post-state after create/start/stop/delete with a short
+    poll window and loud warnings when the CLI says success but the box still
+    exists / stays running
+  - include a final instance snapshot in create-failure paths
+
+- Tests:
+  - assert rsync/build/run helpers use the new per-run paths
+  - assert lifecycle files/paths are threaded into run helpers
+  - assert Brev lifecycle verification and diagnostics fire on the expected paths
+  - keep SSH/Brev end-to-end happy-path tests patched against the new helper API
+
+### Review section
+
+- Implemented:
+  - shared `RemoteRunContext` plumbing for SSH/Brev with unique remote
+    `~/runplz-runs/<run_id>/repo` and `out` directories plus a stable
+    `~/runplz-latest` symlink
+  - per-run remote metadata under `out/.runplz/` with `run.json`,
+    `events.ndjson`, `heartbeat.ndjson`, and per-run `last.log`
+  - remote event/heartbeat/trap logging for native and container-mode
+    execution, plus detached-container monitoring for the VM+docker path
+  - richer Brev lifecycle diagnostics with attempt timestamps, elapsed
+    time, full retry-attempt stdout/stderr, and post-action `brev ls`
+    verification
+  - create-failure snapshots and loud warnings when `stop` / `delete`
+    report success but the instance still looks alive afterward
+  - version bump to `3.9.2`
+
+- Validation:
+  - `./format.sh` passed
+  - `./lint.sh` passed
+  - `./test.sh` passed (`342 passed`, `95%` total coverage)
+  - draft PR opened: `pirl-unc/runplz#51`
+
 ## 2026-04-23 PR Plan — Fix Review Issue #46
 
 - [x] Fix unsafe Modal tar extraction and add regression coverage
