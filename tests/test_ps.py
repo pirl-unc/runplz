@@ -118,6 +118,9 @@ def test_brev_list_jobs_filters_on_runplz_prefix():
             {"name": "runplz-demo-train-abcd1234", "status": "RUNNING"},
             {"name": "my-own-box", "status": "RUNNING"},
             {"name": "runplz-demo-eval-deadbeef", "status": "DEPLOYING"},
+            # User-named --instance box that happens to start with runplz-.
+            # Must NOT be treated as a live ephemeral run (no uuid suffix).
+            {"name": "runplz-mygpu", "status": "RUNNING"},
         ]
     )
     fake = mock.Mock(returncode=0, stdout=rows_json, stderr="")

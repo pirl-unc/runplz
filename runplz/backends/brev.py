@@ -379,10 +379,12 @@ def _skip_onboarding():
 def list_jobs() -> list[dict]:
     """Return Brev instances runplz created for ephemeral runs.
 
-    Filters on the ``runplz-`` name prefix that :func:`_make_ephemeral_name`
-    stamps onto every ephemeral box. Jobs dispatched to a user-named
-    ``--instance`` box are not included — from ``brev ls`` alone we can't tell
-    whether a job is actively running inside such a box.
+    Matches the full shape :func:`_make_ephemeral_name` generates —
+    ``runplz-<app>-<fn>-<uuid8>`` where uuid8 is 8 lowercase hex chars. A
+    user-named ``--instance runplz-mygpu`` box won't match (no uuid suffix),
+    so we won't falsely report it as a live job. Jobs dispatched to a reused
+    ``--instance`` box are not included — from ``brev ls`` alone we can't
+    tell whether a job is actively running inside such a box.
     """
     r = _brev_capture(["brev", "ls", "--json"], label="brev ls --json (ps)")
     if r.returncode != 0:
@@ -393,11 +395,14 @@ def list_jobs() -> list[dict]:
     return _jobs_from_brev_rows(_parse_brev_ls_rows(r.stdout))
 
 
+_EPHEMERAL_NAME_RE = re.compile(r"^runplz-.+-[0-9a-f]{8}$")
+
+
 def _jobs_from_brev_rows(rows: list[dict]) -> list[dict]:
     jobs = []
     for row in rows:
         name = row.get("name") or ""
-        if not name.startswith("runplz-"):
+        if not _EPHEMERAL_NAME_RE.match(name):
             continue
         app_name, fn_name = _split_ephemeral_name(name)
         jobs.append(
