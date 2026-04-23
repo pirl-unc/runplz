@@ -9,7 +9,7 @@
 - [x] Run `./format.sh`
 - [x] Run `./lint.sh`
 - [x] Run `./test.sh`
-- [ ] Commit, push branch, and open a draft PR linked to `#46`
+- [x] Commit, push branch, and open a draft PR linked to `#46`
 
 ### Review section
 
@@ -28,6 +28,7 @@
   - `./test.sh` passed (`336 passed`)
   - coverage now reports real local-checkout data (`95%` total) instead of
     `CoverageWarning: No data was collected`
+  - draft PR opened: `pirl-unc/runplz#47`
 
 ## 2026-04-23 Bug / Error Review
 
