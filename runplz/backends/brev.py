@@ -16,6 +16,7 @@ import json
 import re
 import signal
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -28,6 +29,7 @@ from runplz.backends._ssh_common import (
     _ensure_docker,
     _ensure_remote_rsync,
     _fetch_failure_tail,
+    _prepare_remote_run,
     _raise_for_runtime_cap,
     _remote_has_nvidia,
     _render_ops_script,
@@ -41,7 +43,9 @@ from runplz.backends._ssh_common import (
     _ssh_capture,
     _stream_and_wait,
     _wait_until_ssh_reachable,
+    build_remote_run_manifest,
     make_container_name,
+    make_remote_run_context,
 )
 
 # Re-exports so older test patches and external code that patched these
@@ -198,6 +202,7 @@ def run(
 
     container_name: Optional[str] = None
     exit_code: Optional[int] = None
+    remote_run = None
     # Signal handlers: SIGTERM / SIGHUP on the orchestrator used to exit
     # cleanly without firing the finally's _apply_on_finish, leaking a
     # billed box (issue #38). Install translators that convert the signal
@@ -241,12 +246,29 @@ def run(
             repo = app._repo_root
             host_out = (repo / outputs_dir).resolve()
             host_out.mkdir(parents=True, exist_ok=True)
+            remote_run = make_remote_run_context(
+                backend="brev",
+                target=instance,
+                function_name=function.name,
+            )
+            _prepare_remote_run(
+                instance,
+                remote_run,
+                manifest=build_remote_run_manifest(
+                    remote_run=remote_run,
+                    repo=repo,
+                    outputs_dir=outputs_dir,
+                    args=args,
+                    kwargs=kwargs,
+                    env=function.env,
+                ),
+            )
 
             if cfg.mode == "container":
                 # Pre-built container images (e.g. pytorch/pytorch) don't
                 # ship with rsync. Install it before the first rsync call.
                 _ensure_remote_rsync(instance)
-            _rsync_up(repo, instance)
+            _rsync_up(repo, instance, remote_run=remote_run)
             rel_script = Path(function.module_file).resolve().relative_to(repo)
 
             if cfg.mode == "container":
@@ -256,13 +278,14 @@ def run(
                     rel_script=str(rel_script),
                     args=args,
                     kwargs=kwargs,
+                    remote_run=remote_run,
                     max_runtime_seconds=cfg.max_runtime_seconds,
                 )
             elif cfg.use_docker:
                 _ensure_docker(instance)
                 gpu_flag = "--gpus all" if _remote_has_nvidia(instance) else ""
                 container_name = make_container_name(function.name)
-                _build_image(instance, function.image)
+                _build_image(instance, function.image, remote_run=remote_run)
                 _run_container_detached(
                     target=instance,
                     container_name=container_name,
@@ -271,6 +294,7 @@ def run(
                     args=args,
                     kwargs=kwargs,
                     gpu_flag=gpu_flag,
+                    remote_run=remote_run,
                 )
                 exit_code = _stream_and_wait(
                     instance, container_name, max_runtime_seconds=cfg.max_runtime_seconds
@@ -285,9 +309,10 @@ def run(
                     args=args,
                     kwargs=kwargs,
                     has_nvidia=_remote_has_nvidia(instance),
+                    remote_run=remote_run,
                     max_runtime_seconds=cfg.max_runtime_seconds,
                 )
-            _rsync_down(instance, host_out)
+            _rsync_down(instance, host_out, remote_run=remote_run)
         finally:
             # Fetch a log tail BEFORE container/box cleanup — afterwards
             # the logs are gone (docker rm wipes container state; brev
@@ -295,7 +320,11 @@ def run(
             # failure.
             failure_tail = ""
             if exit_code is not None and exit_code != 0:
-                failure_tail = _fetch_failure_tail(target=instance, container_name=container_name)
+                failure_tail = _fetch_failure_tail(
+                    target=instance,
+                    container_name=container_name,
+                    remote_run=remote_run,
+                )
             if container_name is not None:
                 try:
                     _ssh_capture(
@@ -368,25 +397,7 @@ def _instance_exists(name: str) -> bool:
             f"billed box. Run `brev login` / check the `brev` CLI and retry. "
             f"stderr: {(r.stderr or '').strip()[:500]}"
         )
-    try:
-        data = json.loads(r.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"`brev ls --json` returned unparseable JSON. Refusing to continue "
-            f"(see _instance_exists docstring for why). stdout head: "
-            f"{(r.stdout or '').strip()[:200]!r}"
-        ) from exc
-    if data is None:
-        return False
-    if isinstance(data, list):
-        instances = data
-    elif isinstance(data, dict):
-        instances = data.get("instances", []) or []
-    else:
-        raise RuntimeError(
-            f"`brev ls --json` returned an unexpected shape ({type(data).__name__}). "
-            f"Refusing to continue (see _instance_exists docstring)."
-        )
+    instances = _parse_brev_ls_rows(r.stdout)
     return any(i.get("name") == name for i in instances)
 
 
@@ -413,6 +424,113 @@ _BREV_TERMINAL_FAILED_STATES = {
 }
 
 
+def _parse_brev_ls_rows(stdout: str) -> list[dict]:
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"`brev ls --json` returned unparseable JSON. stdout head: "
+            f"{(stdout or '').strip()[:200]!r}"
+        ) from exc
+    if data is None:
+        return []
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        rows = data.get("instances", []) or []
+    else:
+        raise RuntimeError(
+            f"`brev ls --json` returned an unexpected shape ({type(data).__name__})."
+        )
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _snapshot_status(snapshot: Optional[dict]) -> Optional[str]:
+    if snapshot is None:
+        return None
+    for key in _BREV_STATUS_FIELDS:
+        value = snapshot.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _format_instance_snapshot(snapshot: Optional[dict]) -> str:
+    if snapshot is None:
+        return "<missing>"
+    parts = []
+    for key in ("name", "status", "state", "power_state", "lifecycle_status", "provider", "id"):
+        value = snapshot.get(key)
+        if value:
+            parts.append(f"{key}={value}")
+    return ", ".join(parts) if parts else json.dumps(snapshot, sort_keys=True)
+
+
+def _instance_snapshot(name: str) -> Optional[dict]:
+    r = _brev_capture(["brev", "ls", "--json"], label=f"brev ls --json (snapshot {name})")
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"`brev ls --json` failed while checking {name!r}. "
+            f"stderr: {(r.stderr or '').strip()[:500]}"
+        )
+    for row in _parse_brev_ls_rows(r.stdout):
+        if row.get("name") == name:
+            return row
+    return None
+
+
+def _verify_post_action_state(
+    action: str,
+    name: str,
+    *,
+    timeout_s: int = 20,
+    poll_interval_s: int = 5,
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    last_snapshot: Optional[dict] = None
+    while True:
+        try:
+            last_snapshot = _instance_snapshot(name)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"+ warning: could not verify `brev {action} {name}` via `brev ls`: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return
+        status = (_snapshot_status(last_snapshot) or "").strip().lower()
+        if action == "create" and last_snapshot is not None:
+            print(
+                f"+ verified create: {_format_instance_snapshot(last_snapshot)}",
+                flush=True,
+            )
+            return
+        if action == "start" and last_snapshot is not None and status not in _BREV_STOPPED_STATES:
+            print(
+                f"+ verified start: {_format_instance_snapshot(last_snapshot)}",
+                flush=True,
+            )
+            return
+        if action == "stop" and (
+            last_snapshot is None or status in _BREV_STOPPED_STATES or status == "deleted"
+        ):
+            suffix = _format_instance_snapshot(last_snapshot)
+            print(f"+ verified stop: {suffix}", flush=True)
+            return
+        if action == "delete" and last_snapshot is None:
+            print(f"+ verified delete: {name!r} no longer listed by `brev ls`", flush=True)
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(poll_interval_s)
+
+    print(
+        f"+ warning: `brev {action} {name}` returned success but post-action "
+        f"state is still {_format_instance_snapshot(last_snapshot)}",
+        flush=True,
+    )
+
+
 def _instance_status(name: str) -> Optional[str]:
     """Return the raw status string for `name` from `brev ls --json`, or
     None if the instance isn't listed or no recognized status field is
@@ -421,34 +539,9 @@ def _instance_status(name: str) -> Optional[str]:
     failure quietly returns None (the SSH reachability loop will surface
     a real problem if there is one)."""
     try:
-        r = _brev_capture(["brev", "ls", "--json"], label="brev ls --json (status)")
+        return _snapshot_status(_instance_snapshot(name))
     except Exception:  # noqa: BLE001
         return None
-    if r.returncode != 0:
-        return None
-    try:
-        data = json.loads(r.stdout)
-    except json.JSONDecodeError:
-        return None
-    if data is None:
-        return None
-    if isinstance(data, list):
-        rows = data
-    elif isinstance(data, dict):
-        rows = data.get("instances", []) or []
-    else:
-        return None
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        if row.get("name") != name:
-            continue
-        for key in _BREV_STATUS_FIELDS:
-            v = row.get(key)
-            if v:
-                return str(v)
-        return None
-    return None
 
 
 class BrevInstanceFailed(RuntimeError):
@@ -516,6 +609,8 @@ def _start_instance_if_stopped(name: str) -> None:
             f"SSH reachability probe will decide whether to continue.",
             flush=True,
         )
+        return
+    _verify_post_action_state("start", name)
 
 
 def _create_instance(name: str, *, cfg=None, image=None, function=None):
@@ -562,6 +657,7 @@ def _create_instance(name: str, *, cfg=None, image=None, function=None):
     print("+ " + " ".join(str(c) for c in cmd), flush=True)
     r = _brev_capture(cmd, timeout=600, label=f"brev create {name}")
     if r.returncode == 0:
+        _verify_post_action_state("create", name)
         return
 
     err_str = ((r.stderr or "") + (r.stdout or "")).strip()
@@ -578,13 +674,20 @@ def _create_instance(name: str, *, cfg=None, image=None, function=None):
         try:
             if _instance_exists(name):
                 print(f"+ {name!r} confirmed created — treating as success", flush=True)
+                _verify_post_action_state("create", name)
                 return
         except RuntimeError:
             pass  # fall through to the hard error below
 
+    try:
+        snapshot_text = _format_instance_snapshot(_instance_snapshot(name))
+    except Exception as exc:  # noqa: BLE001
+        snapshot_text = f"[snapshot unavailable: {type(exc).__name__}: {exc}]"
+
     raise RuntimeError(
         f"`brev create {name}` failed after {len(_BREV_DEFAULT_RETRIES)} attempt(s) "
-        f"with exit {r.returncode}. stderr: {err_str[:500]}"
+        f"with exit {r.returncode}. stderr: {err_str[:500]}. "
+        f"Final instance snapshot: {snapshot_text}"
     )
 
 
@@ -666,38 +769,58 @@ def _brev_capture(
 
     `subprocess.TimeoutExpired` is always treated as transient.
     """
-    import time
-
     label = label or " ".join(str(c) for c in cmd[:3])
     last: Optional[subprocess.CompletedProcess] = None
+    total_attempts = len(retry_waits)
     for attempt, wait_s in enumerate(retry_waits, start=1):
         if wait_s:
             time.sleep(wait_s)
+        started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        started = time.monotonic()
+        print(
+            f"+ {label} attempt {attempt}/{total_attempts} started {started_at}",
+            flush=True,
+        )
         try:
             last = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
-            if attempt < len(retry_waits):
+            elapsed_s = time.monotonic() - started
+            print(
+                f"+ {label} attempt {attempt}/{total_attempts} timed out "
+                f"after {elapsed_s:.1f}s (timeout={timeout}s)",
+                flush=True,
+            )
+            if attempt < total_attempts:
                 print(
-                    f"+ {label} attempt {attempt}/{len(retry_waits)} timed out "
-                    f"after {timeout}s; retrying",
+                    f"+ {label} attempt {attempt}/{total_attempts} will retry",
                     flush=True,
                 )
                 continue
             raise RuntimeError(
-                f"`{label}` timed out after {timeout}s on all {len(retry_waits)} attempts."
+                f"`{label}` timed out after {timeout}s on all {total_attempts} attempts."
             ) from None
+        elapsed_s = time.monotonic() - started
+        stdout = str(last.stdout or "")
+        stderr = str(last.stderr or "")
+        print(
+            f"+ {label} attempt {attempt}/{total_attempts} finished "
+            f"rc={last.returncode} elapsed={elapsed_s:.1f}s",
+            flush=True,
+        )
+        if (last.returncode != 0 or attempt > 1) and stdout.strip():
+            print(f"+ {label} attempt {attempt} stdout:\n{stdout.rstrip()}", flush=True)
+        if (last.returncode != 0 or attempt > 1) and stderr.strip():
+            print(f"+ {label} attempt {attempt} stderr:\n{stderr.rstrip()}", flush=True)
         if last.returncode == 0:
             if attempt > 1:
                 print(f"+ {label} succeeded on attempt {attempt}", flush=True)
             return last
         # Coerce to str in case stderr/stdout are Mocks (test harness) or
         # None (some subprocess configurations) — we only want the text.
-        err = str(last.stderr or "") + str(last.stdout or "")
-        if _looks_transient(err) and attempt < len(retry_waits):
-            snippet = str(last.stderr or last.stdout or "").strip()[:200]
+        err = stderr + stdout
+        if _looks_transient(err) and attempt < total_attempts:
             print(
-                f"+ {label} attempt {attempt}/{len(retry_waits)} hit transient "
-                f"error; retrying. stderr: {snippet}",
+                f"+ {label} attempt {attempt}/{total_attempts} hit transient error; retrying",
                 flush=True,
             )
             continue
@@ -776,6 +899,8 @@ def _apply_on_finish(*, instance: str, cfg) -> None:
             f"stderr: {(r.stderr or '').strip()[:500]}",
             flush=True,
         )
+        return
+    _verify_post_action_state(action, instance)
 
 
 # --- Brev instance-type picker -------------------------------------------

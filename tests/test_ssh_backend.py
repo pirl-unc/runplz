@@ -227,10 +227,10 @@ def test_ssh_run_end_to_end_passes_port_through_to_helpers(tmp_path):
     def fake_wait(target, *, port=None, **kw):
         seen_ports["reachable"] = port
 
-    def fake_rsync_up(repo, target, *, port=None):
+    def fake_rsync_up(repo, target, *, remote_run=None, port=None):
         seen_ports["rsync_up"] = port
 
-    def fake_build(target, image, *, port=None):
+    def fake_build(target, image, *, remote_run=None, port=None):
         seen_ports["build"] = port
 
     def fake_stream(target, container_name, *, port=None, **kw):
@@ -241,6 +241,7 @@ def test_ssh_run_end_to_end_passes_port_through_to_helpers(tmp_path):
         "runplz.backends.ssh",
         _wait_until_ssh_reachable=fake_wait,
         _warn_on_spec_mismatch=mock.DEFAULT,
+        _prepare_remote_run=mock.DEFAULT,
         _ensure_remote_rsync=mock.DEFAULT,
         _rsync_up=fake_rsync_up,
         _ensure_docker=mock.DEFAULT,
@@ -410,6 +411,7 @@ def test_ssh_run_vm_docker_happy_path(tmp_path):
         "runplz.backends.ssh",
         _wait_until_ssh_reachable=mock.DEFAULT,
         _warn_on_spec_mismatch=mock.DEFAULT,
+        _prepare_remote_run=mock.DEFAULT,
         _ensure_remote_rsync=mock.DEFAULT,
         _rsync_up=mock.DEFAULT,
         _ensure_docker=mock.DEFAULT,
@@ -432,6 +434,7 @@ def test_ssh_run_native_happy_path(tmp_path):
         "runplz.backends.ssh",
         _wait_until_ssh_reachable=mock.DEFAULT,
         _warn_on_spec_mismatch=mock.DEFAULT,
+        _prepare_remote_run=mock.DEFAULT,
         _ensure_remote_rsync=mock.DEFAULT,
         _rsync_up=mock.DEFAULT,
         _remote_has_nvidia=mock.Mock(return_value=False),
@@ -452,6 +455,7 @@ def test_ssh_run_nonzero_exit_raises_with_tail(tmp_path):
         "runplz.backends.ssh",
         _wait_until_ssh_reachable=mock.DEFAULT,
         _warn_on_spec_mismatch=mock.DEFAULT,
+        _prepare_remote_run=mock.DEFAULT,
         _ensure_remote_rsync=mock.DEFAULT,
         _rsync_up=mock.DEFAULT,
         _ensure_docker=mock.DEFAULT,

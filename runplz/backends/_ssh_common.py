@@ -16,12 +16,15 @@ holds its own module-level reference to the imported function.
 """
 
 import json
+import re
 import shlex
 import subprocess
 import time
 import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from runplz._excludes import DEFAULT_TRANSFER_EXCLUDES
 
@@ -29,6 +32,9 @@ from runplz._excludes import DEFAULT_TRANSFER_EXCLUDES
 
 REMOTE_REPO_DIR = "runplz-repo"
 REMOTE_OUT_DIR = "runplz-out"
+REMOTE_RUNS_DIR = "runplz-runs"
+REMOTE_LATEST_LINK = "runplz-latest"
+REMOTE_META_DIRNAME = ".runplz"
 REMOTE_IMAGE_TAG = "runplz-train:remote"
 
 # container-mode / native paths tee the bootstrap's combined stdout+stderr
@@ -38,6 +44,7 @@ REMOTE_LAST_LOG = ".runplz-last.log"
 
 # How many lines of remote log to include in a failure RuntimeError.
 FAILURE_TAIL_LINES = 50
+HEARTBEAT_INTERVAL_S = 30
 
 # Directories that are noise on every upload and exclusions we apply on
 # top of DEFAULT_TRANSFER_EXCLUDES (which only covers secrets).
@@ -76,6 +83,299 @@ SSH_OPTS = [
 ]
 
 _NATIVE_VENV = "$HOME/runplz-venv"
+_REMOTE_SLUG_RE = re.compile(r"[^a-z0-9]+")
+_MASKED_ENV_TOKENS = ("SECRET", "TOKEN", "PASSWORD", "KEY", "CREDENTIAL", "AUTH")
+
+
+@dataclass(frozen=True)
+class RemoteRunContext:
+    run_id: str
+    backend: str
+    target: str
+    function_name: str
+    run_root_rel: str
+    repo_rel: str
+    out_rel: str
+    meta_rel: str
+    run_json_rel: str
+    events_rel: str
+    heartbeat_rel: str
+    last_log_rel: str
+
+    def _shell_path(self, rel: str) -> str:
+        return f"$HOME/{rel}"
+
+    def _display_path(self, rel: str) -> str:
+        return f"~/{rel}"
+
+    @property
+    def run_root_shell(self) -> str:
+        return self._shell_path(self.run_root_rel)
+
+    @property
+    def repo_shell(self) -> str:
+        return self._shell_path(self.repo_rel)
+
+    @property
+    def out_shell(self) -> str:
+        return self._shell_path(self.out_rel)
+
+    @property
+    def meta_shell(self) -> str:
+        return self._shell_path(self.meta_rel)
+
+    @property
+    def run_json_shell(self) -> str:
+        return self._shell_path(self.run_json_rel)
+
+    @property
+    def events_shell(self) -> str:
+        return self._shell_path(self.events_rel)
+
+    @property
+    def heartbeat_shell(self) -> str:
+        return self._shell_path(self.heartbeat_rel)
+
+    @property
+    def last_log_shell(self) -> str:
+        return self._shell_path(self.last_log_rel)
+
+    @property
+    def repo_display(self) -> str:
+        return self._display_path(self.repo_rel)
+
+    @property
+    def out_display(self) -> str:
+        return self._display_path(self.out_rel)
+
+    @property
+    def meta_display(self) -> str:
+        return self._display_path(self.meta_rel)
+
+    @property
+    def repo_rsync(self) -> str:
+        return self._display_path(self.repo_rel)
+
+    @property
+    def out_rsync(self) -> str:
+        return self._display_path(self.out_rel)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _slug_for_remote_path(value: str, *, max_len: int = 18) -> str:
+    slug = _REMOTE_SLUG_RE.sub("-", value.lower()).strip("-")
+    if not slug:
+        return "x"
+    clipped = slug[:max_len].strip("-")
+    return clipped or "x"
+
+
+def make_remote_run_context(*, backend: str, target: str, function_name: str) -> RemoteRunContext:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_id = (
+        f"{timestamp}-"
+        f"{_slug_for_remote_path(target)}-"
+        f"{_slug_for_remote_path(function_name)}-"
+        f"{uuid.uuid4().hex[:8]}"
+    )
+    run_root_rel = f"{REMOTE_RUNS_DIR}/{run_id}"
+    out_rel = f"{run_root_rel}/out"
+    meta_rel = f"{out_rel}/{REMOTE_META_DIRNAME}"
+    return RemoteRunContext(
+        run_id=run_id,
+        backend=backend,
+        target=target,
+        function_name=function_name,
+        run_root_rel=run_root_rel,
+        repo_rel=f"{run_root_rel}/repo",
+        out_rel=out_rel,
+        meta_rel=meta_rel,
+        run_json_rel=f"{meta_rel}/run.json",
+        events_rel=f"{meta_rel}/events.ndjson",
+        heartbeat_rel=f"{meta_rel}/heartbeat.ndjson",
+        last_log_rel=f"{meta_rel}/last.log",
+    )
+
+
+def _masked_env_for_manifest(env: dict[str, Any]) -> dict[str, str]:
+    masked = {}
+    for key, value in env.items():
+        text = str(value)
+        if any(token in key.upper() for token in _MASKED_ENV_TOKENS):
+            masked[key] = "***"
+        else:
+            masked[key] = text
+    return masked
+
+
+def _local_repo_git_info(repo: Path) -> dict[str, Any]:
+    info: dict[str, Any] = {"revision": None, "dirty": None}
+    try:
+        rev = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if rev.returncode == 0:
+            info["revision"] = rev.stdout.strip() or None
+        dirty = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if dirty.returncode == 0:
+            info["dirty"] = bool(dirty.stdout.strip())
+    except Exception:  # noqa: BLE001
+        pass
+    return info
+
+
+def build_remote_run_manifest(
+    *,
+    remote_run: RemoteRunContext,
+    repo: Path,
+    outputs_dir: str,
+    args: list,
+    kwargs: dict,
+    env: dict[str, Any],
+) -> dict[str, Any]:
+    git_info = _local_repo_git_info(repo)
+    return {
+        "run_id": remote_run.run_id,
+        "started_at": _utc_now_iso(),
+        "backend": remote_run.backend,
+        "target": remote_run.target,
+        "function": remote_run.function_name,
+        "cwd": str(repo),
+        "outputs_dir": outputs_dir,
+        "repo_revision": git_info["revision"],
+        "repo_dirty": git_info["dirty"],
+        "args": args,
+        "kwargs": kwargs,
+        "env": _masked_env_for_manifest(env),
+        "remote_paths": {
+            "run_root": f"~/{remote_run.run_root_rel}",
+            "repo": remote_run.repo_display,
+            "out": remote_run.out_display,
+            "meta": remote_run.meta_display,
+            "latest": f"~/{REMOTE_LATEST_LINK}",
+        },
+    }
+
+
+def _prepare_remote_run(
+    target: str,
+    remote_run: RemoteRunContext,
+    *,
+    manifest: dict[str, Any],
+    port: Optional[int] = None,
+) -> None:
+    print(
+        f"+ remote run {remote_run.run_id}: "
+        f"repo={remote_run.repo_display} out={remote_run.out_display}",
+        flush=True,
+    )
+    initial_event = json.dumps(
+        {"ts": _utc_now_iso(), "run_id": remote_run.run_id, "event": "launch_prepared"},
+        sort_keys=True,
+    )
+    manifest_json = json.dumps(manifest, indent=2, sort_keys=True)
+    remote = (
+        "set -euo pipefail\n"
+        f'mkdir -p "{remote_run.run_root_shell}" "{remote_run.repo_shell}" '
+        f'"{remote_run.out_shell}" "{remote_run.meta_shell}"\n'
+        f'ln -sfn "{remote_run.run_root_shell}" "$HOME/{REMOTE_LATEST_LINK}"\n'
+        f"cat <<'__RUNPLZ_MANIFEST__' > \"{remote_run.run_json_shell}\"\n"
+        f"{manifest_json}\n"
+        "__RUNPLZ_MANIFEST__\n"
+        f"cat <<'__RUNPLZ_EVENTS__' > \"{remote_run.events_shell}\"\n"
+        f"{initial_event}\n"
+        "__RUNPLZ_EVENTS__\n"
+        f': > "{remote_run.heartbeat_shell}"\n'
+        f': > "{remote_run.last_log_shell}"\n'
+    )
+    _ssh(target, remote, port=port)
+
+
+def _record_remote_event(
+    target: str,
+    remote_run: Optional[RemoteRunContext],
+    event: str,
+    *,
+    port: Optional[int] = None,
+    **fields: Any,
+) -> None:
+    if remote_run is None:
+        return
+    payload = {"ts": _utc_now_iso(), "run_id": remote_run.run_id, "event": event}
+    payload.update({k: v for k, v in fields.items() if v is not None})
+    line = json.dumps(payload, sort_keys=True)
+    remote = (
+        "set -euo pipefail; "
+        f'mkdir -p "{remote_run.meta_shell}"; '
+        f"printf '%s\\n' {shlex.quote(line)} >> \"{remote_run.events_shell}\""
+    )
+    try:
+        _ssh(target, remote, port=port)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"+ warning: failed to record remote lifecycle event "
+            f"{event!r} for {remote_run.run_id}: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+
+def _remote_logging_shell(remote_run: RemoteRunContext) -> str:
+    return (
+        f'RUNPLZ_EVENTS="{remote_run.events_shell}"\n'
+        f'RUNPLZ_HEARTBEAT="{remote_run.heartbeat_shell}"\n'
+        f'RUNPLZ_LAST_LOG="{remote_run.last_log_shell}"\n'
+        f'RUNPLZ_RUN_ID="{remote_run.run_id}"\n'
+        "runplz_ts() {\n"
+        "  date -u +%Y-%m-%dT%H:%M:%SZ\n"
+        "}\n"
+        "runplz_event() {\n"
+        '  runplz_event_name="$1"\n'
+        '  runplz_exit_code="${2:-null}"\n'
+        '  printf \'{"ts":"%s","run_id":"%s","event":"%s","exit_code":%s}\\n\' \\\n'
+        '    "$(runplz_ts)" "$RUNPLZ_RUN_ID" "$runplz_event_name" "$runplz_exit_code" \\\n'
+        '    >> "$RUNPLZ_EVENTS"\n'
+        "}\n"
+        "runplz_heartbeat() {\n"
+        '  printf \'{"ts":"%s","run_id":"%s","event":"heartbeat","pid":%s}\\n\' \\\n'
+        '    "$(runplz_ts)" "$RUNPLZ_RUN_ID" "$$" >> "$RUNPLZ_HEARTBEAT"\n'
+        "}\n"
+    )
+
+
+def _wrap_remote_command_for_logging(command: str, remote_run: RemoteRunContext) -> str:
+    return (
+        "set -euo pipefail\n"
+        f"{_remote_logging_shell(remote_run)}"
+        "runplz_heartbeat_loop() {\n"
+        "  while true; do\n"
+        "    runplz_heartbeat\n"
+        f"    sleep {HEARTBEAT_INTERVAL_S}\n"
+        "  done\n"
+        "}\n"
+        "runplz_heartbeat_loop &\n"
+        "runplz_hb_pid=$!\n"
+        "runplz_cleanup() {\n"
+        "  runplz_status=$?\n"
+        '  kill "$runplz_hb_pid" >/dev/null 2>&1 || true\n'
+        '  wait "$runplz_hb_pid" >/dev/null 2>&1 || true\n'
+        '  runplz_event remote_command_exit "$runplz_status"\n'
+        "}\n"
+        "trap 'runplz_cleanup' EXIT\n"
+        "runplz_event remote_command_start\n"
+        "runplz_event bootstrap_start\n"
+        f"{command}\n"
+    )
 
 
 # --- ssh-opts / rsync-transport builders --------------------------------
@@ -125,7 +425,43 @@ def _ssh_capture(target: str, remote_cmd: str, *, port: Optional[int] = None) ->
     return r.stdout
 
 
-def _rsync_up(repo: Path, target: str, *, port: Optional[int] = None):
+def _remote_repo_shell(remote_run: Optional[RemoteRunContext]) -> str:
+    if remote_run is not None:
+        return remote_run.repo_shell
+    return f"$HOME/{REMOTE_REPO_DIR}"
+
+
+def _remote_out_shell(remote_run: Optional[RemoteRunContext]) -> str:
+    if remote_run is not None:
+        return remote_run.out_shell
+    return f"$HOME/{REMOTE_OUT_DIR}"
+
+
+def _remote_last_log_shell(remote_run: Optional[RemoteRunContext]) -> str:
+    if remote_run is not None:
+        return remote_run.last_log_shell
+    return f"$HOME/{REMOTE_LAST_LOG}"
+
+
+def _remote_repo_rsync(target: str, remote_run: Optional[RemoteRunContext]) -> str:
+    if remote_run is not None:
+        return f"{target}:{remote_run.repo_rsync}/"
+    return f"{target}:{REMOTE_REPO_DIR}/"
+
+
+def _remote_out_rsync(target: str, remote_run: Optional[RemoteRunContext]) -> str:
+    if remote_run is not None:
+        return f"{target}:{remote_run.out_rsync}/"
+    return f"{target}:{REMOTE_OUT_DIR}/"
+
+
+def _rsync_up(
+    repo: Path,
+    target: str,
+    *,
+    remote_run: Optional[RemoteRunContext] = None,
+    port: Optional[int] = None,
+):
     # Intentionally no --delete: a user who sshes in and leaves files under
     # ~/runplz-repo/ (logs, probe scripts, local edits) shouldn't have those
     # wiped by the next run. Stale files on the remote are cheap; accidental
@@ -139,15 +475,23 @@ def _rsync_up(repo: Path, target: str, *, port: Optional[int] = None):
     # See runplz/_excludes.py for the rationale.
     for pat in DEFAULT_TRANSFER_EXCLUDES:
         cmd.append(f"--exclude={pat}")
-    cmd.extend([f"{repo}/", f"{target}:{REMOTE_REPO_DIR}/"])
+    cmd.extend([f"{repo}/", _remote_repo_rsync(target, remote_run)])
     _sh(cmd)
+    _record_remote_event(target, remote_run, "rsync_up_done", port=port)
 
 
-def _rsync_down(target: str, local_out: Path, *, port: Optional[int] = None):
+def _rsync_down(
+    target: str,
+    local_out: Path,
+    *,
+    remote_run: Optional[RemoteRunContext] = None,
+    port: Optional[int] = None,
+):
+    _record_remote_event(target, remote_run, "rsync_down_start", port=port)
     cmd = ["rsync", "-az"]
     if port:
         cmd += ["-e", _rsync_ssh_transport(port)]
-    cmd.extend([f"{target}:{REMOTE_OUT_DIR}/", f"{local_out}/"])
+    cmd.extend([_remote_out_rsync(target, remote_run), f"{local_out}/"])
     _sh(cmd)
 
 
@@ -299,7 +643,7 @@ def _remote_has_nvidia(target: str, *, port: Optional[int] = None) -> bool:
 # --- dispatch: container-mode / native / VM+docker -----------------------
 
 
-def _render_ops_script(image) -> str:
+def _render_ops_script(image, *, remote_run: Optional[RemoteRunContext] = None) -> str:
     """Translate Image DSL ops into a bash script for container-mode
     dispatch — the remote box is already the user's image, so apt/pip ops
     run inline over ssh. Idempotent: apt/pip on already-present packages
@@ -308,6 +652,7 @@ def _render_ops_script(image) -> str:
     Requires `Image.from_registry(...)` — Dockerfile images are rejected
     upstream by the dispatch-time validator.
     """
+    remote_repo = _remote_repo_shell(remote_run)
     lines = ["set -euo pipefail"]
     lines.append(
         "for i in $(seq 1 60); do "
@@ -339,7 +684,7 @@ def _render_ops_script(image) -> str:
             flags = "-e " if editable else ""
             rel = path.lstrip("./")
             sub = f"/{rel}" if rel else ""
-            lines.append(f'pip install --quiet {flags}"$HOME/{REMOTE_REPO_DIR}{sub}"')
+            lines.append(f'pip install --quiet {flags}"{remote_repo}{sub}"')
         elif op.kind == "run" and op.args:
             for cmd in op.args:
                 lines.append(cmd)
@@ -347,34 +692,43 @@ def _render_ops_script(image) -> str:
 
 
 def _run_container_mode(
-    *, target, function, rel_script, args, kwargs, max_runtime_seconds=None, port=None
+    *,
+    target,
+    function,
+    rel_script,
+    args,
+    kwargs,
+    remote_run: Optional[RemoteRunContext] = None,
+    max_runtime_seconds=None,
+    port=None,
 ):
     """Container-mode dispatch: the box IS the user's image. Apply Image
     DSL ops inline over ssh, then invoke the bootstrap. No docker-in-
     docker, no nvidia-container-toolkit."""
-    ops_script = _render_ops_script(function.image)
+    ops_script = _render_ops_script(function.image, remote_run=remote_run)
     if ops_script:
         _ssh(target, ops_script, port=port)
 
     user_env_exports = " ".join(
         f"export {k}={shlex.quote(str(v))};" for k, v in function.env.items()
     )
-    remote = (
+    run_cmd = (
         "set -euo pipefail; "
         "export PATH=/opt/conda/bin:$PATH; "
-        f'export RUNPLZ_OUT="$HOME/{REMOTE_OUT_DIR}"; '
-        f'export RUNPLZ_SCRIPT="$HOME/{REMOTE_REPO_DIR}/{rel_script}"; '
+        f'export RUNPLZ_OUT="{_remote_out_shell(remote_run)}"; '
+        f'export RUNPLZ_SCRIPT="{_remote_repo_shell(remote_run)}/{rel_script}"; '
         f"export RUNPLZ_FUNCTION={shlex.quote(function.name)}; "
         f"export RUNPLZ_ARGS={shlex.quote(json.dumps(args))}; "
         f"export RUNPLZ_KWARGS={shlex.quote(json.dumps(kwargs))}; "
         f"{user_env_exports} "
         'mkdir -p "$RUNPLZ_OUT"; '
-        f'cd "$HOME/{REMOTE_REPO_DIR}"; '
+        f'cd "{_remote_repo_shell(remote_run)}"; '
         # Tee combined stdout+stderr to a remote file so we can tail it for
         # failure context (issue #17). `pipefail` + `set -e` above ensure the
         # bootstrap's exit code (not tee's) is what escapes this block.
-        f'python -m runplz._bootstrap 2>&1 | tee "$HOME/{REMOTE_LAST_LOG}"'
+        f'python -m runplz._bootstrap 2>&1 | tee "{_remote_last_log_shell(remote_run)}"'
     )
+    remote = _wrap_remote_command_for_logging(run_cmd, remote_run) if remote_run else run_cmd
     try:
         r = subprocess.run(
             ["ssh", *_ssh_cmd_opts(port), target, f"bash -lc {shlex.quote(remote)}"],
@@ -393,6 +747,7 @@ def _run_native(
     args,
     kwargs,
     has_nvidia,
+    remote_run: Optional[RemoteRunContext] = None,
     max_runtime_seconds=None,
     port=None,
 ):
@@ -417,26 +772,27 @@ def _run_native(
         f"source {_NATIVE_VENV}/bin/activate; "
         "pip install --quiet --upgrade pip; "
         f"pip install --quiet torch --index-url {torch_index}; "
-        f"pip install --quiet -e $HOME/{REMOTE_REPO_DIR}"
+        f"pip install --quiet -e {_remote_repo_shell(remote_run)}"
     )
     _ssh(target, setup, port=port)
 
     user_env_exports = " ".join(
         f"export {k}={shlex.quote(str(v))};" for k, v in function.env.items()
     )
-    remote = (
+    run_cmd = (
         "set -euo pipefail; "
         f'source "$HOME/runplz-venv/bin/activate"; '
-        f'export RUNPLZ_OUT="$HOME/{REMOTE_OUT_DIR}"; '
-        f'export RUNPLZ_SCRIPT="$HOME/{REMOTE_REPO_DIR}/{rel_script}"; '
+        f'export RUNPLZ_OUT="{_remote_out_shell(remote_run)}"; '
+        f'export RUNPLZ_SCRIPT="{_remote_repo_shell(remote_run)}/{rel_script}"; '
         f"export RUNPLZ_FUNCTION={shlex.quote(function.name)}; "
         f"export RUNPLZ_ARGS={shlex.quote(json.dumps(args))}; "
         f"export RUNPLZ_KWARGS={shlex.quote(json.dumps(kwargs))}; "
         f"{user_env_exports} "
         'mkdir -p "$RUNPLZ_OUT"; '
-        f'cd "$HOME/{REMOTE_REPO_DIR}"; '
-        f'python -m runplz._bootstrap 2>&1 | tee "$HOME/{REMOTE_LAST_LOG}"'
+        f'cd "{_remote_repo_shell(remote_run)}"; '
+        f'python -m runplz._bootstrap 2>&1 | tee "{_remote_last_log_shell(remote_run)}"'
     )
+    remote = _wrap_remote_command_for_logging(run_cmd, remote_run) if remote_run else run_cmd
     try:
         r = subprocess.run(
             ["ssh", *_ssh_cmd_opts(port), target, f"bash -lc {shlex.quote(remote)}"],
@@ -447,14 +803,22 @@ def _run_native(
     return r.returncode
 
 
-def _build_image(target: str, image, *, port: Optional[int] = None):
+def _build_image(
+    target: str,
+    image,
+    *,
+    remote_run: Optional[RemoteRunContext] = None,
+    port: Optional[int] = None,
+):
     """Build a docker image on the remote — either from the user's
     Dockerfile or from a synthesized one (Image.from_registry + DSL ops)."""
+    remote_repo = _remote_repo_shell(remote_run)
+    _record_remote_event(target, remote_run, "build_image_start", port=port)
     if image.dockerfile is not None:
         context = image.context or "."
         build = (
             f"set -euo pipefail; "
-            f"cd ~/{REMOTE_REPO_DIR} && "
+            f'cd "{remote_repo}" && '
             f"sudo docker build -f {shlex.quote(image.dockerfile)} "
             f"-t {REMOTE_IMAGE_TAG} {shlex.quote(context)}"
         )
@@ -462,16 +826,26 @@ def _build_image(target: str, image, *, port: Optional[int] = None):
         df = image.render_dockerfile()
         build = (
             f"set -euo pipefail; "
-            f"cd ~/{REMOTE_REPO_DIR} && "
+            f'cd "{remote_repo}" && '
             f"cat <<'__EOF__' | sudo docker build -f - -t {REMOTE_IMAGE_TAG} .\n"
             f"{df}\n"
             f"__EOF__"
         )
     _ssh(target, build, port=port)
+    _record_remote_event(target, remote_run, "build_image_done", port=port)
 
 
 def _run_container_detached(
-    *, target, container_name, function, rel_script, args, kwargs, gpu_flag, port=None
+    *,
+    target,
+    container_name,
+    function,
+    rel_script,
+    args,
+    kwargs,
+    gpu_flag,
+    remote_run: Optional[RemoteRunContext] = None,
+    port=None,
 ):
     env_flags = " ".join(f"-e {shlex.quote(f'{k}={v}')}" for k, v in function.env.items())
     runner_env = (
@@ -481,15 +855,38 @@ def _run_container_detached(
         f"-e RUNPLZ_ARGS={shlex.quote(json.dumps(args))} "
         f"-e RUNPLZ_KWARGS={shlex.quote(json.dumps(kwargs))}"
     )
+    out_dir = _remote_out_shell(remote_run)
+    monitor = ""
+    if remote_run is not None:
+        monitor = (
+            f"{_remote_logging_shell(remote_run)}"
+            f"runplz_event remote_command_start; "
+            f"runplz_event container_started; "
+            f"("
+            f"  ("
+            f"    while sudo docker inspect --format '{{{{.State.Running}}}}' {container_name} "
+            f"      2>/dev/null | grep -qx true; do "
+            f"      runplz_heartbeat; "
+            f"      sleep {HEARTBEAT_INTERVAL_S}; "
+            f"    done"
+            f"  ) & "
+            f"  runplz_hb_pid=$!; "
+            f"  runplz_status=$(sudo docker wait {container_name} 2>/dev/null || echo null); "
+            f'  kill "$runplz_hb_pid" >/dev/null 2>&1 || true; '
+            f'  wait "$runplz_hb_pid" >/dev/null 2>&1 || true; '
+            f'  runplz_event remote_command_exit "$runplz_status"'
+            f") >/dev/null 2>&1 & "
+        )
     # --network=host: simpler networking, no NAT overhead. See the long
     # comment in the old brev.py for the GPU-SSH-wedging backstory.
     start = (
         f"set -euo pipefail; "
-        f"mkdir -p ~/{REMOTE_OUT_DIR} && "
+        f'mkdir -p "{out_dir}" && '
         f"sudo docker run -d --name {container_name} --network=host {gpu_flag} "
-        f"-v $HOME/{REMOTE_OUT_DIR}:/out "
+        f'-v "{out_dir}:/out" '
         f"{runner_env} {env_flags} "
-        f"{REMOTE_IMAGE_TAG} python -m runplz._bootstrap"
+        f"{REMOTE_IMAGE_TAG} python -m runplz._bootstrap >/dev/null; "
+        f"{monitor}"
     )
     _ssh(target, start, port=port)
 
@@ -599,7 +996,11 @@ def _container_running(target: str, container_name: str, *, port: Optional[int] 
 
 
 def _fetch_failure_tail(
-    *, target: str, container_name: Optional[str], port: Optional[int] = None
+    *,
+    target: str,
+    container_name: Optional[str],
+    remote_run: Optional[RemoteRunContext] = None,
+    port: Optional[int] = None,
 ) -> str:
     """Fetch the last N lines of remote output for a failed run.
 
@@ -616,8 +1017,8 @@ def _fetch_failure_tail(
             cmd = f"sudo docker logs --tail {FAILURE_TAIL_LINES} {container_name} 2>&1"
         else:
             cmd = (
-                f'if [ -f "$HOME/{REMOTE_LAST_LOG}" ]; then '
-                f'tail -n {FAILURE_TAIL_LINES} "$HOME/{REMOTE_LAST_LOG}"; '
+                f'if [ -f "{_remote_last_log_shell(remote_run)}" ]; then '
+                f'tail -n {FAILURE_TAIL_LINES} "{_remote_last_log_shell(remote_run)}"; '
                 f"fi"
             )
         out = _ssh_capture(target, cmd, port=port)
