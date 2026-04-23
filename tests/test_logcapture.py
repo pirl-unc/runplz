@@ -273,3 +273,40 @@ def test_cli_default_creates_log_under_outputs_dir(tmp_path, monkeypatch):
     assert len(logs) == 1, f"expected 1 default log, got {logs}"
     body = Path(logs[0]).read_text()
     assert "# argv:" in body
+
+
+def test_cli_default_log_follows_repo_outputs_dir_when_invoked_outside_repo(tmp_path, monkeypatch):
+    """The default log path should track the backend outputs dir rooted at
+    the repo, not the caller's current working directory."""
+    import textwrap
+
+    from runplz import _cli
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    script = repo / "job.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            from runplz import App, Image
+            app = App("outside")
+            image = Image.from_registry("ubuntu:22.04")
+            @app.function(image=image)
+            def fn(): pass
+            @app.local_entrypoint()
+            def main(): pass
+            """
+        )
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+
+    with mock.patch("runplz.backends.local.run", lambda *a, **kw: None):
+        _cli.main(["local", str(script), "--outputs-dir", "out"])
+
+    repo_logs = list((repo / "out").glob("runplz-outside-*.log"))
+    cwd_logs = list((outside / "out").glob("runplz-outside-*.log"))
+    assert len(repo_logs) == 1, f"expected 1 repo-rooted log, got {repo_logs}"
+    assert cwd_logs == []

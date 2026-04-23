@@ -120,7 +120,7 @@ def main(argv=None):
     # including the entrypoint and the backend dispatch.
     from runplz._logcapture import resolve_log_path, tee_stdio_to
 
-    outputs_dir_abs = (Path.cwd() / args.outputs_dir).resolve()
+    outputs_dir_abs = (app._repo_root / args.outputs_dir).resolve()
     log_path = resolve_log_path(
         log_file_flag=args.log_file,
         no_log_file_flag=args.no_log_file,

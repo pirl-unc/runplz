@@ -696,6 +696,18 @@ def test_build_image_dockerfile_uses_docker_build_f(tmp_path):
     assert "__EOF__" not in recorded["c"]  # no synthesized Dockerfile heredoc
 
 
+def test_build_image_dockerfile_honors_context():
+    img = Image.from_dockerfile("docker/Dockerfile", context="docker")
+    recorded = {}
+    with mock.patch(
+        "runplz.backends._ssh_common._ssh",
+        lambda i, c, **kw: recorded.setdefault("c", c),
+    ):
+        brev._build_image("box", img)
+    assert "docker build -f docker/Dockerfile" in recorded["c"]
+    assert recorded["c"].endswith(" runplz-train:remote docker")
+
+
 def test_build_image_from_registry_pipes_synthesized_dockerfile():
     img = Image.from_registry("pytorch/pytorch:2.4.0").pip_install("numpy")
     recorded = {}
@@ -789,6 +801,31 @@ def test_stream_and_wait_reconnects_then_gives_up(capsys):
     assert rc == 137
     # Should have emitted the give-up message once max_reconnects hit.
     assert "giving up on log stream" in capsys.readouterr().out
+
+
+def test_stream_and_wait_wait_path_still_honors_runtime_cap_after_give_up():
+    wait_timeouts = []
+
+    def fake_run(cmd, *a, **kw):
+        joined = " ".join(str(x) for x in cmd)
+        if "docker logs" in joined:
+            return mock.Mock(returncode=255, stdout="", stderr="")
+        if "docker inspect" in joined:
+            return mock.Mock(returncode=0, stdout="true", stderr="")
+        if "docker wait" in joined:
+            wait_timeouts.append(kw.get("timeout"))
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kw.get("timeout", 0))
+        if "docker kill" in joined:
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_run):
+        with mock.patch("runplz.backends._ssh_common.time.sleep", lambda _s: None):
+            with pytest.raises(RuntimeError, match="max_runtime_seconds=7"):
+                brev._stream_and_wait("box", "c", max_reconnects=0, max_runtime_seconds=7)
+
+    assert wait_timeouts
+    assert 0 < wait_timeouts[0] <= 7
 
 
 def test_container_running_treats_ssh_failure_as_still_running():
