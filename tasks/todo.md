@@ -11,7 +11,7 @@
 - [x] Run `./format.sh`
 - [x] Run `./lint.sh`
 - [x] Run `./test.sh`
-- [ ] Commit, push branch, and open a draft PR linked to `#48`, `#49`, and `#50`
+- [x] Commit, push branch, and open a draft PR linked to `#48`, `#49`, and `#50`
 
 ### Scope / design
 
@@ -64,6 +64,7 @@
   - `./format.sh` passed
   - `./lint.sh` passed
   - `./test.sh` passed (`342 passed`, `95%` total coverage)
+  - draft PR opened: `pirl-unc/runplz#51`
 
 ## 2026-04-23 PR Plan — Fix Review Issue #46
 
