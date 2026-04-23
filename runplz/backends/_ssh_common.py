@@ -704,7 +704,14 @@ def _run_container_mode(
 ):
     """Container-mode dispatch: the box IS the user's image. Apply Image
     DSL ops inline over ssh, then invoke the bootstrap. No docker-in-
-    docker, no nvidia-container-toolkit."""
+    docker, no nvidia-container-toolkit.
+
+    The bootstrap is launched detached (``setsid`` + ``nohup`` + stdio
+    redirected to files) so a flaky client-side network connection can't
+    kill the remote training job. Local streaming + completion tracking
+    runs through a reconnect-tolerant tail-and-poll loop that mirrors
+    the docker-mode ``_stream_and_wait`` pattern.
+    """
     ops_script = _render_ops_script(function.image, remote_run=remote_run)
     if ops_script:
         _ssh(target, ops_script, port=port)
@@ -712,7 +719,7 @@ def _run_container_mode(
     user_env_exports = " ".join(
         f"export {k}={shlex.quote(str(v))};" for k, v in function.env.items()
     )
-    run_cmd = (
+    inner = (
         "set -euo pipefail; "
         "export PATH=/opt/conda/bin:$PATH; "
         f'export RUNPLZ_OUT="{_remote_out_shell(remote_run)}"; '
@@ -723,20 +730,23 @@ def _run_container_mode(
         f"{user_env_exports} "
         'mkdir -p "$RUNPLZ_OUT"; '
         f'cd "{_remote_repo_shell(remote_run)}"; '
-        # Tee combined stdout+stderr to a remote file so we can tail it for
-        # failure context (issue #17). `pipefail` + `set -e` above ensure the
-        # bootstrap's exit code (not tee's) is what escapes this block.
-        f'python -m runplz._bootstrap 2>&1 | tee "{_remote_last_log_shell(remote_run)}"'
+        # Direct file redirect — no ``tee`` + no pipe. The previous
+        # ``python ... 2>&1 | tee last.log`` pipeline chained python's
+        # stdout through tee whose OWN stdout was the ssh socket. When
+        # ssh dropped, tee took a SIGPIPE and the pipeline unwound back
+        # through python, killing training. With a plain file redirect
+        # inside a detached session, nothing in the pipeline is tethered
+        # to the client's network.
+        f'python -m runplz._bootstrap > "{_remote_last_log_shell(remote_run)}" 2>&1'
     )
-    remote = _wrap_remote_command_for_logging(run_cmd, remote_run) if remote_run else run_cmd
-    try:
-        r = subprocess.run(
-            ["ssh", *_ssh_cmd_opts(port), target, f"bash -lc {shlex.quote(remote)}"],
-            timeout=max_runtime_seconds,
-        )
-    except subprocess.TimeoutExpired:
-        _raise_for_runtime_cap(target, max_runtime_seconds, container_name=None, port=port)
-    return r.returncode
+    wrapped = _wrap_remote_command_for_logging(inner, remote_run) if remote_run else inner
+    return _launch_detached_and_wait(
+        target=target,
+        wrapped_command=wrapped,
+        remote_run=remote_run,
+        max_runtime_seconds=max_runtime_seconds,
+        port=port,
+    )
 
 
 def _run_native(
@@ -779,7 +789,10 @@ def _run_native(
     user_env_exports = " ".join(
         f"export {k}={shlex.quote(str(v))};" for k, v in function.env.items()
     )
-    run_cmd = (
+    # Launch detached and stream with reconnect tolerance — same pattern
+    # as ``_run_container_mode``. See that function's docstring for the
+    # SIGPIPE / SSH-drop rationale.
+    inner = (
         "set -euo pipefail; "
         f'source "$HOME/runplz-venv/bin/activate"; '
         f'export RUNPLZ_OUT="{_remote_out_shell(remote_run)}"; '
@@ -790,17 +803,16 @@ def _run_native(
         f"{user_env_exports} "
         'mkdir -p "$RUNPLZ_OUT"; '
         f'cd "{_remote_repo_shell(remote_run)}"; '
-        f'python -m runplz._bootstrap 2>&1 | tee "{_remote_last_log_shell(remote_run)}"'
+        f'python -m runplz._bootstrap > "{_remote_last_log_shell(remote_run)}" 2>&1'
     )
-    remote = _wrap_remote_command_for_logging(run_cmd, remote_run) if remote_run else run_cmd
-    try:
-        r = subprocess.run(
-            ["ssh", *_ssh_cmd_opts(port), target, f"bash -lc {shlex.quote(remote)}"],
-            timeout=max_runtime_seconds,
-        )
-    except subprocess.TimeoutExpired:
-        _raise_for_runtime_cap(target, max_runtime_seconds, container_name=None, port=port)
-    return r.returncode
+    wrapped = _wrap_remote_command_for_logging(inner, remote_run) if remote_run else inner
+    return _launch_detached_and_wait(
+        target=target,
+        wrapped_command=wrapped,
+        remote_run=remote_run,
+        max_runtime_seconds=max_runtime_seconds,
+        port=port,
+    )
 
 
 def _build_image(
@@ -895,6 +907,244 @@ def _run_container_detached(
         f"{monitor}"
     )
     _ssh(target, start, port=port)
+
+
+def _launch_detached_and_wait(
+    *,
+    target: str,
+    wrapped_command: str,
+    remote_run: Optional["RemoteRunContext"] = None,
+    max_runtime_seconds: Optional[int] = None,
+    port: Optional[int] = None,
+    max_reconnects: int = 20,
+) -> int:
+    """Launch a bash command in a detached session and stream+wait locally.
+
+    Core SSH-drop-survival path for container-mode and native backends.
+    Before this helper, ``_run_container_mode`` and ``_run_native`` ran
+    the bootstrap as a foreground ssh command whose stdout pipeline
+    ended with ``tee`` — which meant any ssh drop SIGPIPEd tee and
+    cascaded SIGPIPE / BrokenPipeError back through the whole pipeline,
+    killing training.
+
+    Detaching requires three elements, and missing any one of them
+    leaves the process tethered to the client:
+
+    - ``setsid`` — new process session. The old session's ``pg`` getting
+      HUP'd doesn't propagate here.
+    - ``nohup`` — SIGHUP is ignored explicitly (belt-and-suspenders with
+      setsid) and stdin is wired to /dev/null.
+    - Explicit stdout/stderr redirection to a file — nothing pipe-ward
+      toward the ssh socket. Without this, even a detached session
+      can SIGPIPE when the socket closes.
+
+    Backend-agnostic: ``wrapped_command`` is arbitrary bash — typically
+    the output of ``_wrap_remote_command_for_logging`` so events.ndjson
+    records command start / exit with their real exit codes. We read
+    the exit code back from that events file after the remote PID
+    disappears.
+
+    If ``remote_run`` is ``None`` (no events file available), falls
+    back to the previous blocking ssh path. This keeps old call sites
+    (tests, ad-hoc harnesses) working.
+    """
+    if remote_run is None:
+        # Pre-remote_run call sites (early code paths) stay synchronous —
+        # the whole point of the detach/poll path is the events file +
+        # meta-dir it provides for PID / exit-code bookkeeping.
+        try:
+            r = subprocess.run(
+                ["ssh", *_ssh_cmd_opts(port), target, f"bash -lc {shlex.quote(wrapped_command)}"],
+                timeout=max_runtime_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            _raise_for_runtime_cap(target, max_runtime_seconds, container_name=None, port=port)
+        return r.returncode
+
+    meta = remote_run.meta_shell
+    pid_file = f"{meta}/bootstrap.pid"
+    run_script = f"{meta}/run.sh"
+    driver_log = f"{meta}/run_driver.log"
+    log_file = remote_run.last_log_shell
+    events_file = remote_run.events_shell
+
+    # Heredoc delimiter unique enough to guarantee no collision with
+    # anything inside ``wrapped_command``. Single-quote the delimiter so
+    # the heredoc body is passed through verbatim (no $-expansion, no
+    # backtick execution, no \-escapes).
+    delim = f"__RUNPLZ_CMD_{uuid.uuid4().hex}__"
+    launcher = (
+        "set -euo pipefail\n"
+        f'mkdir -p "{meta}"\n'
+        f"cat > {shlex.quote(run_script)} << '{delim}'\n"
+        f"{wrapped_command}\n"
+        f"{delim}\n"
+        f"chmod +x {shlex.quote(run_script)}\n"
+        # Detach. setsid makes a new session leader (SIGHUP-immune),
+        # nohup re-redirects stdin from /dev/null and ignores SIGHUP
+        # for belt-and-suspenders, and the explicit >>/2>& redirects
+        # give stdio fresh file destinations so nothing in the pipeline
+        # reaches back to the ssh socket.
+        f"nohup setsid bash {shlex.quote(run_script)} </dev/null "
+        f">> {shlex.quote(driver_log)} 2>&1 & "
+        f"echo $! > {shlex.quote(pid_file)}\n"
+        "disown || true\n"
+    )
+    # Launch ssh returns quickly once the detached job is running + PID
+    # recorded. Anything that follows in this function is local polling.
+    _ssh(target, launcher, port=port)
+
+    return _tail_and_wait_for_detached(
+        target=target,
+        pid_file=pid_file,
+        log_file=log_file,
+        events_file=events_file,
+        max_runtime_seconds=max_runtime_seconds,
+        max_reconnects=max_reconnects,
+        port=port,
+    )
+
+
+def _tail_and_wait_for_detached(
+    *,
+    target: str,
+    pid_file: str,
+    log_file: str,
+    events_file: str,
+    max_runtime_seconds: Optional[int] = None,
+    max_reconnects: int = 20,
+    port: Optional[int] = None,
+) -> int:
+    """Stream log_file via ssh ``tail -F`` and return remote exit code.
+
+    Mirrors ``_stream_and_wait``'s reconnect pattern but uses a PID file
+    + events file instead of docker commands for the "is the job still
+    alive" and "what was the exit code" checks.
+
+    If ssh drops mid-stream but the remote PID is still alive, reconnect
+    and keep tailing. If the PID is gone, read the exit code from the
+    events file and return it.
+    """
+    print(
+        "+ streaming detached remote log (resilient to ssh reconnects)",
+        flush=True,
+    )
+    started = time.monotonic()
+
+    def _remaining_s() -> Optional[float]:
+        if max_runtime_seconds is None:
+            return None
+        left = max_runtime_seconds - (time.monotonic() - started)
+        return max(1.0, left)
+
+    reconnects = 0
+    while True:
+        cmd = f"tail -n +1 -F {shlex.quote(log_file)}"
+        try:
+            r = subprocess.run(
+                ["ssh", *_ssh_cmd_opts(port), target, cmd],
+                timeout=_remaining_s(),
+            )
+        except subprocess.TimeoutExpired:
+            _raise_for_runtime_cap(target, max_runtime_seconds, container_name=None, port=port)
+        if not _remote_pid_alive(target, pid_file, port=port):
+            break
+        if max_runtime_seconds is not None and (time.monotonic() - started) >= max_runtime_seconds:
+            _raise_for_runtime_cap(target, max_runtime_seconds, container_name=None, port=port)
+        reconnects += 1
+        if reconnects > max_reconnects:
+            print(
+                f"+ ssh reconnected {max_reconnects} times without the remote "
+                f"job finishing; giving up on live log stream and waiting for "
+                f"remote exit only. The detached job on {target} is still "
+                f"running and will finish on its own.",
+                flush=True,
+            )
+            break
+        print(
+            f"+ ssh disconnected (rc={r.returncode}); remote job still "
+            f"alive, reconnecting log stream ({reconnects}/{max_reconnects})",
+            flush=True,
+        )
+        time.sleep(2)
+
+    # If we gave up streaming while the remote was still alive, block
+    # here until the pid file clears (so the caller sees the real exit
+    # code, not a premature "unknown").
+    while _remote_pid_alive(target, pid_file, port=port):
+        if max_runtime_seconds is not None and (time.monotonic() - started) >= max_runtime_seconds:
+            _raise_for_runtime_cap(target, max_runtime_seconds, container_name=None, port=port)
+        time.sleep(min(30, HEARTBEAT_INTERVAL_S))
+
+    return _read_remote_exit_code(target, events_file, port=port)
+
+
+def _remote_pid_alive(target: str, pid_file: str, *, port: Optional[int] = None) -> bool:
+    """Return True if the PID in ``pid_file`` is still running on the remote.
+
+    Conservative on ssh errors: if we can't reach the box right now,
+    assume the job is still alive so the caller keeps polling instead
+    of prematurely declaring the job done. A real dead job will surface
+    next poll once ssh recovers.
+    """
+    probe = (
+        f"pid=$(cat {shlex.quote(pid_file)} 2>/dev/null || true); "
+        f'if [ -z "$pid" ]; then echo "no-pid"; exit 0; fi; '
+        f'if kill -0 "$pid" 2>/dev/null; then echo "alive"; else echo "dead"; fi'
+    )
+    try:
+        r = subprocess.run(
+            ["ssh", *_ssh_cmd_opts(port), target, probe],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return True
+    if r.returncode != 0:
+        return True
+    return r.stdout.strip() == "alive"
+
+
+def _read_remote_exit_code(target: str, events_file: str, *, port: Optional[int] = None) -> int:
+    """Parse the last ``remote_command_exit`` entry from events.ndjson.
+
+    Returns 1 when the events file is missing, unreadable, or has no
+    exit entry yet — treating "unknown" as failure keeps a silent
+    exit-code regression from masquerading as success.
+    """
+    probe = (
+        f"grep -F 'remote_command_exit' {shlex.quote(events_file)} 2>/dev/null | tail -n 1 || true"
+    )
+    try:
+        r = subprocess.run(
+            ["ssh", *_ssh_cmd_opts(port), target, probe],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return 1
+    line = r.stdout.strip()
+    if not line:
+        return 1
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return 1
+    ec = obj.get("exit_code")
+    if isinstance(ec, bool):
+        # bool is a subclass of int in Python; explicit check keeps
+        # ``true`` / ``false`` exit codes from sneaking through.
+        return 1
+    if isinstance(ec, int):
+        return ec
+    if isinstance(ec, str):
+        try:
+            return int(ec)
+        except ValueError:
+            return 1
+    return 1
 
 
 def _stream_and_wait(
