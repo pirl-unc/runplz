@@ -2026,6 +2026,59 @@ def test_launch_detached_and_wait_falls_back_to_blocking_without_remote_run():
     assert recorded[0][1] == 42
 
 
+def test_launch_detached_and_wait_double_quotes_home_paths_for_expansion():
+    """The launcher script writes to ``$HOME``-relative paths; those must
+    be double-quoted (allowing ``$HOME`` expansion) not single-quoted /
+    shlex.quote'd (which would pass the literal string ``$HOME/…`` to the
+    remote shell and fail under ``set -euo pipefail``).
+
+    Regression lock for the 2026-04-24 launch bug: ``shlex.quote`` was
+    wrapping paths like ``$HOME/runplz-runs/…/run.sh`` in single quotes,
+    causing ``cat > '$HOME/…'`` to try to write to a literal path in
+    cwd. Training never started — events log stopped at
+    ``rsync_up_done`` with no ``remote_command_start``.
+    """
+    from runplz.backends._ssh_common import _launch_detached_and_wait
+
+    remote_run = brev.make_remote_run_context(backend="ssh", target="box", function_name="train")
+    captured = {}
+
+    def fake_ssh(target, cmd, **kw):
+        captured["cmd"] = cmd
+
+    def fake_sub(cmd, *a, **kw):
+        cmd_str = " ".join(cmd)
+        if "kill -0" in cmd_str:
+            return mock.Mock(returncode=0, stdout="dead", stderr="")
+        if "remote_command_exit" in cmd_str:
+            return mock.Mock(
+                returncode=0,
+                stdout='{"event":"remote_command_exit","exit_code":0}\n',
+                stderr="",
+            )
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("runplz.backends._ssh_common._ssh", fake_ssh):
+        with mock.patch("runplz.backends._ssh_common.subprocess.run", fake_sub):
+            _launch_detached_and_wait(
+                target="box",
+                wrapped_command="echo hi",
+                remote_run=remote_run,
+            )
+    launcher = captured["cmd"]
+    # ``cat >`` target must be double-quoted (so $HOME expands), not
+    # single-quoted. Same for chmod / nohup / echo-pid targets.
+    assert f'cat > "{remote_run.meta_shell}/run.sh"' in launcher
+    assert f'chmod +x "{remote_run.meta_shell}/run.sh"' in launcher
+    assert f'nohup setsid bash "{remote_run.meta_shell}/run.sh"' in launcher
+    assert f'echo $! > "{remote_run.meta_shell}/bootstrap.pid"' in launcher
+    # And explicitly NOT the shlex.quote form that broke the previous
+    # release.
+    assert f"'{remote_run.meta_shell}/run.sh'" not in launcher, (
+        "shlex-quoted path would suppress $HOME expansion on the remote"
+    )
+
+
 def test_launch_detached_and_wait_writes_pid_and_uses_setsid_nohup(tmp_path):
     """The launcher script must include all three detach ingredients:
     setsid (new session), nohup (SIGHUP-proof + /dev/null stdin), and

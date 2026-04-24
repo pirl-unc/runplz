@@ -973,21 +973,30 @@ def _launch_detached_and_wait(
     # the heredoc body is passed through verbatim (no $-expansion, no
     # backtick execution, no \-escapes).
     delim = f"__RUNPLZ_CMD_{uuid.uuid4().hex}__"
+    # All paths here start with ``$HOME/...`` (via ``RemoteRunContext._shell_path``).
+    # ``shlex.quote`` would wrap the whole path in single quotes, which
+    # suppresses ``$HOME`` expansion — ``cat > '$HOME/runplz-runs/…'``
+    # tries to write to a literal ``$HOME/…`` path in cwd and fails.
+    # Use double quotes instead so the remote shell expands ``$HOME``
+    # while still tolerating characters like spaces in the run-id slug.
+    # The paths themselves are all constructed from a fixed
+    # ``RemoteRunContext`` template so they can't contain ``"`` or ``$``
+    # sequences outside of the intentional ``$HOME`` prefix.
     launcher = (
         "set -euo pipefail\n"
         f'mkdir -p "{meta}"\n'
-        f"cat > {shlex.quote(run_script)} << '{delim}'\n"
+        f"cat > \"{run_script}\" << '{delim}'\n"
         f"{wrapped_command}\n"
         f"{delim}\n"
-        f"chmod +x {shlex.quote(run_script)}\n"
+        f'chmod +x "{run_script}"\n'
         # Detach. setsid makes a new session leader (SIGHUP-immune),
         # nohup re-redirects stdin from /dev/null and ignores SIGHUP
         # for belt-and-suspenders, and the explicit >>/2>& redirects
         # give stdio fresh file destinations so nothing in the pipeline
         # reaches back to the ssh socket.
-        f"nohup setsid bash {shlex.quote(run_script)} </dev/null "
-        f">> {shlex.quote(driver_log)} 2>&1 & "
-        f"echo $! > {shlex.quote(pid_file)}\n"
+        f'nohup setsid bash "{run_script}" </dev/null '
+        f'>> "{driver_log}" 2>&1 & '
+        f'echo $! > "{pid_file}"\n'
         "disown || true\n"
     )
     # Launch ssh returns quickly once the detached job is running + PID
@@ -1039,7 +1048,8 @@ def _tail_and_wait_for_detached(
 
     reconnects = 0
     while True:
-        cmd = f"tail -n +1 -F {shlex.quote(log_file)}"
+        # Double-quoted for $HOME expansion (see launcher).
+        cmd = f'tail -n +1 -F "{log_file}"'
         try:
             r = subprocess.run(
                 ["ssh", *_ssh_cmd_opts(port), target, cmd],
@@ -1087,8 +1097,11 @@ def _remote_pid_alive(target: str, pid_file: str, *, port: Optional[int] = None)
     of prematurely declaring the job done. A real dead job will surface
     next poll once ssh recovers.
     """
+    # Double-quoted path, not shlex.quote'd: ``pid_file`` starts with
+    # ``$HOME/...`` and must expand on the remote shell. Same rationale
+    # as the launcher in ``_launch_detached_and_wait``.
     probe = (
-        f"pid=$(cat {shlex.quote(pid_file)} 2>/dev/null || true); "
+        f'pid=$(cat "{pid_file}" 2>/dev/null || true); '
         f'if [ -z "$pid" ]; then echo "no-pid"; exit 0; fi; '
         f'if kill -0 "$pid" 2>/dev/null; then echo "alive"; else echo "dead"; fi'
     )
@@ -1113,9 +1126,8 @@ def _read_remote_exit_code(target: str, events_file: str, *, port: Optional[int]
     exit entry yet — treating "unknown" as failure keeps a silent
     exit-code regression from masquerading as success.
     """
-    probe = (
-        f"grep -F 'remote_command_exit' {shlex.quote(events_file)} 2>/dev/null | tail -n 1 || true"
-    )
+    # Same expansion rule: ``events_file`` is a $HOME-relative path.
+    probe = f"grep -F 'remote_command_exit' \"{events_file}\" 2>/dev/null | tail -n 1 || true"
     try:
         r = subprocess.run(
             ["ssh", *_ssh_cmd_opts(port), target, probe],
