@@ -83,6 +83,17 @@ class BrevConfig:
     # `instance_type` is pinned explicitly, that one type is still the
     # only one passed. Set to 1 for the pre-3.9 behavior (single type).
     instance_type_fallback_count: int = 3
+    # Provider prefixes to drop from `brev search` results before the
+    # selector ranks candidates. Match is case-insensitive against the
+    # type string's leading dotted/underscored segment(s) — e.g. the
+    # default `("oci",)` filters out types like `oci.a100x8.sxm.brev-dgxc`.
+    # Default blocks OCI because Brev support has confirmed (issue #62)
+    # that the OCI launchpad path is broken at their backend layer
+    # (cloudCredId/workspaceGroupId rejection on every create call), so
+    # silently feeding it to runplz costs the user a confusing failure
+    # that no client-side fix can resolve. Set to () to disable, or
+    # extend if other providers misbehave for your org.
+    exclude_providers: tuple = ("oci",)
 
     def __post_init__(self):
         if self.mode not in _VALID_BREV_MODES:
@@ -120,6 +131,17 @@ class BrevConfig:
                 f"BrevConfig.instance_type_fallback_count must be a positive int "
                 f"(1 = no fallback); got {self.instance_type_fallback_count!r}."
             )
+        if not isinstance(self.exclude_providers, tuple):
+            raise ValueError(
+                f"BrevConfig.exclude_providers must be a tuple of strings; "
+                f"got {type(self.exclude_providers).__name__}."
+            )
+        for prefix in self.exclude_providers:
+            if not isinstance(prefix, str) or not prefix.strip():
+                raise ValueError(
+                    f"BrevConfig.exclude_providers entries must be non-empty strings; "
+                    f"got {prefix!r}."
+                )
 
 
 @dataclass(frozen=True)

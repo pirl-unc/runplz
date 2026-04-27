@@ -456,7 +456,7 @@ def test_create_instance_pinned_instance_type_skips_fallback(tmp_path):
             stderr="",
         )
 
-    def fake_picker(fn, *, n):
+    def fake_picker(fn, *, n, exclude_providers=()):
         picker_called["n"] += 1
         return ["SHOULD-NEVER-BE-USED"]
 
@@ -492,7 +492,7 @@ def test_create_instance_fallback_count_one_passes_single_type(tmp_path):
 
     seen_n = {}
 
-    def fake_picker(fn, *, n):
+    def fake_picker(fn, *, n, exclude_providers=()):
         seen_n["n"] = n
         return ["only-type"]
 
