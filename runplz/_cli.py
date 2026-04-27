@@ -6,6 +6,8 @@ Usage:
     runplz ssh  --host gpu.example.com <script.py>
     runplz modal <script.py>
     runplz ps [local|brev|modal] [--ssh <host>]
+    runplz tail [--outputs-dir <path>] [--host <host>] [--run-id <id>] [-n N] [-f]
+    runplz status [--outputs-dir <path>] [--host <host>] [--run-id <id>]
 
 Extra arguments after <script.py> are passed through to the script's
 @app.local_entrypoint — modal-style:
@@ -48,6 +50,10 @@ def main(argv=None):
     argv_list = list(sys.argv[1:] if argv is None else argv)
     if argv_list and argv_list[0] == "ps":
         return _ps_main(argv_list[1:])
+    if argv_list and argv_list[0] == "tail":
+        return _tail_main(argv_list[1:])
+    if argv_list and argv_list[0] == "status":
+        return _status_main(argv_list[1:])
 
     p = argparse.ArgumentParser(
         prog="runplz", description="Run a Python @app.function on a chosen backend."
@@ -361,6 +367,83 @@ def _print_ps_table(rows: list[dict]) -> None:
     print(fmt.format(*headers))
     for row in rows:
         print(fmt.format(*(str(row.get(k, "")) for k in keys)))
+
+
+def _tail_main(argv):
+    from runplz import _runs
+
+    p = argparse.ArgumentParser(
+        prog="runplz tail",
+        description="Tail the remote driver log of the most recent run.",
+    )
+    _add_run_lookup_args(p)
+    p.add_argument(
+        "-n",
+        dest="lines",
+        type=int,
+        default=120,
+        help="Number of lines to show (default: 120).",
+    )
+    p.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help="Stream new lines as they arrive (passes -F to remote tail).",
+    )
+    args = p.parse_args(argv)
+    try:
+        return _runs.tail(
+            outputs_dir=Path(args.outputs_dir).resolve(),
+            host_override=args.host,
+            run_id_override=args.run_id,
+            lines=args.lines,
+            follow=args.follow,
+        )
+    except _runs.ManifestNotFound as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+
+def _status_main(argv):
+    from runplz import _runs
+
+    p = argparse.ArgumentParser(
+        prog="runplz status",
+        description="Print a one-screen summary of the most recent run's state.",
+    )
+    _add_run_lookup_args(p)
+    args = p.parse_args(argv)
+    try:
+        return _runs.status(
+            outputs_dir=Path(args.outputs_dir).resolve(),
+            host_override=args.host,
+            run_id_override=args.run_id,
+        )
+    except _runs.ManifestNotFound as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+
+def _add_run_lookup_args(parser):
+    parser.add_argument(
+        "--outputs-dir",
+        default="out",
+        help="Local outputs dir to read run.json from (default: out/).",
+    )
+    parser.add_argument(
+        "--host",
+        help="Override the SSH target. Required when --run-id is given without a local manifest.",
+    )
+    parser.add_argument(
+        "--run-id",
+        help="Pin to a specific remote run_id instead of the most recent. Requires --host.",
+    )
 
 
 if __name__ == "__main__":
