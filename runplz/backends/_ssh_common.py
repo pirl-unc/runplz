@@ -47,7 +47,10 @@ FAILURE_TAIL_LINES = 50
 HEARTBEAT_INTERVAL_S = 30
 
 # Directories that are noise on every upload and exclusions we apply on
-# top of DEFAULT_TRANSFER_EXCLUDES (which only covers secrets).
+# top of DEFAULT_TRANSFER_EXCLUDES (which only covers secrets). The
+# default outputs dir name "out" is excluded here so the common case
+# works without extra plumbing; non-default outputs_dir values are
+# threaded into _rsync_up explicitly via _outputs_dir_excludes.
 _RSYNC_NOISE_EXCLUDES = (
     ".git",
     ".venv",
@@ -459,6 +462,7 @@ def _rsync_up(
     repo: Path,
     target: str,
     *,
+    outputs_dir: Optional[str] = None,
     remote_run: Optional[RemoteRunContext] = None,
     port: Optional[int] = None,
 ):
@@ -475,9 +479,49 @@ def _rsync_up(
     # See runplz/_excludes.py for the rationale.
     for pat in DEFAULT_TRANSFER_EXCLUDES:
         cmd.append(f"--exclude={pat}")
+    # Don't re-upload the outputs we'll rsync_down later. _RSYNC_NOISE_EXCLUDES
+    # already covers `out/`; this catches a user-configured `outputs_dir`
+    # (issue #55 — a 15 GB local outputs tree was getting shipped on every
+    # launch when outputs_dir != "out").
+    for pat in _outputs_dir_excludes(outputs_dir, repo):
+        cmd.append(f"--exclude={pat}")
     cmd.extend([f"{repo}/", _remote_repo_rsync(target, remote_run)])
     _sh(cmd)
     _record_remote_event(target, remote_run, "rsync_up_done", port=port)
+
+
+def _outputs_dir_excludes(outputs_dir: Optional[str], repo: Path) -> list[str]:
+    """Translate the App's ``outputs_dir`` into rsync `--exclude` patterns.
+
+    Returns an empty list for the default ``"out"`` (already in
+    :data:`_RSYNC_NOISE_EXCLUDES`) and for absolute paths that don't live
+    inside the repo (rsync's source root). Otherwise emits one anchored
+    pattern (``/<rel>/``) plus, when the path is a single segment, the
+    unanchored basename — matching the existing ``out`` convention so a
+    nested ``foo/out`` would also be excluded.
+    """
+    if not outputs_dir:
+        return []
+    raw = str(outputs_dir).strip()
+    if not raw or raw == "out":
+        return []
+    p = Path(raw)
+    if p.is_absolute():
+        try:
+            rel = p.resolve().relative_to(repo.resolve())
+        except ValueError:
+            # outputs_dir lives outside the repo — rsync source root won't
+            # see it anyway. Nothing to exclude.
+            return []
+    else:
+        rel = p
+    rel_posix = rel.as_posix().strip("/")
+    if not rel_posix:
+        return []
+    patterns = [f"/{rel_posix}/"]
+    if "/" not in rel_posix:
+        patterns.append(rel_posix)
+    return patterns
 
 
 def _rsync_down(

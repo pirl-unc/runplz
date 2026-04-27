@@ -268,7 +268,7 @@ def run(
                 # Pre-built container images (e.g. pytorch/pytorch) don't
                 # ship with rsync. Install it before the first rsync call.
                 _ensure_remote_rsync(instance)
-            _rsync_up(repo, instance, remote_run=remote_run)
+            _rsync_up(repo, instance, outputs_dir=outputs_dir, remote_run=remote_run)
             rel_script = Path(function.module_file).resolve().relative_to(repo)
 
             if cfg.mode == "container":

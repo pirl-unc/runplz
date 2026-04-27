@@ -227,7 +227,7 @@ def test_ssh_run_end_to_end_passes_port_through_to_helpers(tmp_path):
     def fake_wait(target, *, port=None, **kw):
         seen_ports["reachable"] = port
 
-    def fake_rsync_up(repo, target, *, remote_run=None, port=None):
+    def fake_rsync_up(repo, target, *, remote_run=None, port=None, **_):
         seen_ports["rsync_up"] = port
 
     def fake_build(target, image, *, remote_run=None, port=None):
