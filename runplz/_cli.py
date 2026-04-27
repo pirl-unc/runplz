@@ -124,7 +124,7 @@ def main(argv=None):
         app._backend_kwargs["build"] = False
 
     if app._entrypoint is None:
-        p.error(f"{script_path} has no @app.local_entrypoint() function")
+        _install_default_entrypoint_or_error(app, script_path, p.error)
     entrypoint_kwargs = _parse_entrypoint_args(app._entrypoint, entrypoint_argv, p.error)
 
     # Resolve the log path relative to the same outputs-dir we'll hand to
@@ -269,6 +269,42 @@ def _add_bool_flag(parser, flag, dest, has_default, default_value):
         dest=dest,
         action="store_false",
     )
+
+
+def _install_default_entrypoint_or_error(app, script_path, fail):
+    """Synthesize a one-line entrypoint when the user didn't write one.
+
+    The default behavior is unambiguous *only* when the script declares
+    exactly one ``@app.function``: we wire that function's ``.remote(**kwargs)``
+    as the entrypoint, with the function's own signature driving CLI argument
+    parsing. With zero or multiple functions there's no good default — error
+    out with guidance on what to do next.
+    """
+    fns = list(app.functions.values())
+    if len(fns) == 0:
+        fail(
+            f"{script_path} declares no @app.function and no @app.local_entrypoint. "
+            f"Add at least one @app.function so runplz has something to run."
+        )
+    if len(fns) > 1:
+        names = ", ".join(sorted(app.functions))
+        fail(
+            f"{script_path} declares {len(fns)} @app.function "
+            f"({names}) but no @app.local_entrypoint. "
+            f"runplz only auto-runs a default function when exactly one exists. "
+            f"Either remove the extras, or add an @app.local_entrypoint that picks one explicitly."
+        )
+    only_fn = fns[0]
+
+    def _default_entrypoint(**kwargs):
+        return only_fn.remote(**kwargs)
+
+    # Mirror the function's signature so _parse_entrypoint_args can build the
+    # right --flag set, and copy the name so the generated --help and error
+    # messages still point at something meaningful.
+    _default_entrypoint.__signature__ = inspect.signature(only_fn.fn)
+    _default_entrypoint.__name__ = only_fn.name
+    app._entrypoint = _default_entrypoint
 
 
 def _load_app(script_path: Path):

@@ -21,8 +21,12 @@ from runplz.backends import modal as modal_backend
 
 def test_modal_gpu_string_passthrough_when_no_min_vram():
     assert modal_backend._modal_gpu_string("A100", None) == "A100"
+    # No GPU constraints at all → no GPU.
     assert modal_backend._modal_gpu_string(None, None) is None
-    assert modal_backend._modal_gpu_string(None, 80) is None
+    # 3.14.0+: gpu=None with min_gpu_memory= now derives a default model
+    # so the same script runs on Modal as on Brev. 80 GB → A100-80GB; the
+    # VRAM suffix is already in the derived name so no double-suffixing.
+    assert modal_backend._modal_gpu_string(None, 80) == "A100-80GB"
 
 
 def test_modal_gpu_string_appends_suffix():

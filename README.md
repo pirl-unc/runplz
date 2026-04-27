@@ -4,6 +4,38 @@
 
 Tiny Modal-shaped job harness — one Python decoration, multiple backends.
 
+### Smallest working example
+
+A single `@app.function` is enough — no `@app.local_entrypoint` needed.
+runplz auto-runs the function as the entrypoint when there's exactly one.
+
+```python
+# jobs/train.py
+from runplz import App, Image
+
+app = App("my-job")
+
+@app.function(
+    image=Image.from_registry("pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime"),
+    gpu="T4",
+)
+def train():
+    import torch
+    print("cuda available:", torch.cuda.is_available())
+```
+
+```bash
+runplz brev jobs/train.py     # ephemeral GPU box, runs train(), tears down
+runplz local jobs/train.py    # docker on your machine
+runplz modal jobs/train.py    # Modal serverless
+```
+
+### Adding constraints + outputs
+
+Resource minimums (`min_cpu`, `min_memory`, `min_gpu_memory`, `min_gpus`,
+`min_disk`) shape what the brev / modal selector picks. Anything written
+under `$RUNPLZ_OUT` rsyncs back to `./out/` on your machine.
+
 ```python
 # jobs/train.py
 from runplz import App, Image
@@ -16,25 +48,47 @@ image = (
     .pip_install_local_dir(".", editable=True)
 )
 
-@app.function(image=image, gpu="T4", min_cpu=4, min_memory=16)
-def train():
-    import os, torch
-    print("cuda available:", torch.cuda.is_available())
-    # ... your training code ...
-    # Anything under $RUNPLZ_OUT comes back to ./out/ on your machine.
-    os.makedirs(os.environ["RUNPLZ_OUT"], exist_ok=True)
-    with open(f"{os.environ['RUNPLZ_OUT']}/result.txt", "w") as f:
-        f.write("done\n")
-
-@app.local_entrypoint()
-def main():
-    train.remote()
+# "Any GPU with at least 24 GB VRAM" — selector picks the cheapest match.
+# On Brev: searches across all matching models. On Modal: maps to the
+# smallest standard model that meets the bar (here: L4).
+@app.function(image=image, min_gpu_memory=24, min_cpu=4, min_memory=16)
+def train(steps: int = 1000):
+    import os
+    out = os.environ["RUNPLZ_OUT"]
+    os.makedirs(out, exist_ok=True)
+    with open(f"{out}/result.txt", "w") as f:
+        f.write(f"trained {steps} steps\n")
 ```
 
-`.remote()` doesn't bring the function's return value back — the
-remote body runs in a separate process, possibly on a separate
-machine. Communicate via files (see ["Data in and out"](#data-in-and-out) below) or stdout
-(captured to the driver log).
+```bash
+runplz brev jobs/train.py --steps=5000   # entrypoint args parse from the tail of argv
+```
+
+### Custom driver
+
+When you need to do more than fire-and-forget — multiple `.remote()`
+calls, post-processing, picking which function to run — declare an
+explicit `@app.local_entrypoint`. It runs *in the local CLI process*;
+`.remote()` dispatches to the chosen backend.
+
+```python
+@app.function(image=image, gpu="A100", num_gpus=4)
+def train(fold: int): ...
+
+@app.function(image=image, min_cpu=8)
+def aggregate(): ...
+
+@app.local_entrypoint()
+def main(folds: int = 4):
+    for i in range(folds):
+        train.remote(fold=i)
+    aggregate.remote()
+```
+
+`.remote()` doesn't bring the function's return value back — the remote
+body runs in a separate process, possibly on a separate machine.
+Communicate via files (see ["Data in and out"](#data-in-and-out) below)
+or stdout (captured to the driver log).
 
 Invoke via the CLI:
 

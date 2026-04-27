@@ -73,7 +73,9 @@ def test_cli_rejects_script_with_multiple_apps(tmp_path):
         _cli.main(["local", str(script)])
 
 
-def test_cli_rejects_script_without_local_entrypoint(tmp_path, capsys):
+def test_cli_rejects_script_with_multiple_functions_and_no_entrypoint(tmp_path, capsys):
+    """A single @app.function auto-runs as the entrypoint (3.14.0+), but
+    multiple functions remain ambiguous and must be explicit."""
     script = _write_job(
         tmp_path,
         """
@@ -81,12 +83,29 @@ def test_cli_rejects_script_without_local_entrypoint(tmp_path, capsys):
         app = App("t")
         image = Image.from_registry("ubuntu:22.04")
         @app.function(image=image)
-        def fn(): pass
+        def first(): pass
+        @app.function(image=image)
+        def second(): pass
         """,
     )
     with pytest.raises(SystemExit):
         _cli.main(["local", str(script)])
-    assert "has no @app.local_entrypoint" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "@app.local_entrypoint" in err
+    assert "first" in err and "second" in err
+
+
+def test_cli_rejects_script_with_no_function_and_no_entrypoint(tmp_path, capsys):
+    script = _write_job(
+        tmp_path,
+        """
+        from runplz import App
+        app = App("t")
+        """,
+    )
+    with pytest.raises(SystemExit):
+        _cli.main(["local", str(script)])
+    assert "declares no @app.function" in capsys.readouterr().err
 
 
 def test_cli_local_no_build_sets_flag(tmp_path):
