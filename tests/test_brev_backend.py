@@ -1850,6 +1850,114 @@ def test_create_instance_already_exists_but_not_listed_raises():
                 brev._create_instance("ghost", cfg=cfg, image=img, function=fn)
 
 
+def test_brev_capture_bails_early_on_missing_cloudcredid():
+    """Issue #62: org/config-gap errors like missing OCI cloudCredId must
+    NOT eat the full retry budget — they're guaranteed-fail until a human
+    fixes them in the Brev console."""
+    attempts = []
+
+    def fake_run(cmd, *a, **kw):
+        attempts.append(list(cmd))
+        return mock.Mock(
+            returncode=1,
+            stdout="",
+            stderr="cloudCredId or workspaceGroupId must be specified on request",
+        )
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        with mock.patch("time.sleep", lambda _s: None):
+            r = brev._brev_capture(["brev", "create", "x"], label="brev create")
+    assert r.returncode == 1
+    # 1 attempt, not the full 4 — non-retriable error.
+    assert len(attempts) == 1
+
+
+def test_brev_capture_bails_early_on_quota_exceeded():
+    """Quota exhaustion is server-side capacity — retrying won't help."""
+    attempts = []
+
+    def fake_run(cmd, *a, **kw):
+        attempts.append(list(cmd))
+        return mock.Mock(
+            returncode=1,
+            stdout="",
+            stderr="ERROR: quota exceeded for region us-west-2",
+        )
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        with mock.patch("time.sleep", lambda _s: None):
+            brev._brev_capture(["brev", "create", "x"], label="brev create")
+    assert len(attempts) == 1
+
+
+def test_brev_capture_still_retries_genuine_transient():
+    """Sanity: the early-bail logic doesn't accidentally short-circuit the
+    transient-retry path that 3.8.0 introduced."""
+    attempts = []
+
+    def fake_run(cmd, *a, **kw):
+        attempts.append(list(cmd))
+        if len(attempts) < 3:
+            return mock.Mock(returncode=1, stdout="", stderr="HTTP 500")
+        return mock.Mock(returncode=0, stdout="ok", stderr="")
+
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        with mock.patch("time.sleep", lambda _s: None):
+            r = brev._brev_capture(["brev", "ls"], label="brev ls")
+    assert r.returncode == 0
+    assert len(attempts) == 3
+
+
+def test_create_instance_reframes_cloudcredid_error():
+    """The raw API string is opaque — runplz should translate it into
+    actionable guidance (issue #62)."""
+
+    def fake_run(cmd, *a, **kw):
+        if cmd[:2] == ["brev", "create"]:
+            return mock.Mock(
+                returncode=1,
+                stdout="",
+                stderr="cloudCredId or workspaceGroupId must be specified on request",
+            )
+        # Any subsequent ls / snapshot — empty.
+        return mock.Mock(returncode=0, stdout="[]", stderr="")
+
+    cfg = BrevConfig(
+        auto_create_instances=True, mode="vm", instance_type="oci.a100x8.sxm.brev-dgxc"
+    )
+    fn = types.SimpleNamespace(
+        name="t",
+        gpu=None,
+        min_cpu=None,
+        min_memory=None,
+        min_gpu_memory=None,
+        min_disk=None,
+        num_gpus=1,
+    )
+    img = Image.from_registry("ubuntu:22.04")
+    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+        with mock.patch("time.sleep", lambda _s: None):
+            with pytest.raises(RuntimeError) as ei:
+                brev._create_instance("release-exact", cfg=cfg, image=img, function=fn)
+    msg = str(ei.value)
+    assert "no cloud credential" in msg
+    assert "oci.a100x8.sxm.brev-dgxc" in msg
+    assert "Brev web UI" in msg
+    # The raw API error is appended at the end so users / support can grep for it.
+    assert "cloudCredId" in msg
+
+
+def test_looks_non_retriable_recognizes_known_patterns():
+    assert brev._looks_non_retriable("cloudCredId or workspaceGroupId must be specified on request")
+    assert brev._looks_non_retriable("ERROR: quota exceeded for this region")
+    assert brev._looks_non_retriable("provider not enabled in this org")
+    assert brev._looks_non_retriable("401 Unauthorized")
+    # Genuine transient — must NOT match.
+    assert not brev._looks_non_retriable("HTTP 500 Internal Server Error")
+    assert not brev._looks_non_retriable("context deadline exceeded")
+    assert not brev._looks_non_retriable("")
+
+
 def test_check_terminal_state_raises_for_failure_status():
     """3.8.0: if `brev ls` shows the instance in FAILURE (Nebius / shadeform
     provisioning died at the provider layer), we must bail early from

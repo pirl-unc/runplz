@@ -753,6 +753,13 @@ def _create_instance(name: str, *, cfg=None, image=None, function=None):
         except RuntimeError:
             pass  # fall through to the hard error below
 
+    # Non-retriable org/config gaps (missing OCI cred, provider not enabled,
+    # quota exceeded, auth expired) get a reframed error pointing the user
+    # at the actual fix — see _reframe_brev_create_error. Skip the snapshot
+    # probe since we know nothing was created. (Issue #62.)
+    if _looks_non_retriable(err_str):
+        raise RuntimeError(_reframe_brev_create_error(name, instance_types, err_str))
+
     try:
         snapshot_text = _format_instance_snapshot(_instance_snapshot(name))
     except Exception as exc:  # noqa: BLE001
@@ -804,6 +811,81 @@ _BREV_ALREADY_EXISTS_PATTERNS = (
     "instance with name",
     "conflict",
 )
+
+# Error signatures from the Brev API that are NOT transient — retrying them
+# burns the whole retry budget on guaranteed-fail attempts and delays the
+# real failure by ~21s for nothing. These are all org/config gaps that
+# require human action (Brev admin console / web UI / support ticket); no
+# amount of CLI tweaking from runplz makes them succeed. (Issue #62.)
+_BREV_NON_RETRIABLE_PATTERNS = (
+    # OCI launchpad path: org has no OCI cloud credential registered.
+    "cloudcredid or workspacegroupid must be specified",
+    # Provider integration not enabled at the org level.
+    "provider not enabled",
+    "provider is not configured",
+    # Server-side quota gates — retrying won't conjure capacity.
+    "quota exceeded",
+    "quota has been exceeded",
+    # Auth gone — no point retrying with the same expired token.
+    "unauthorized",
+    "401 unauthorized",
+    "403 forbidden",
+)
+
+
+def _looks_non_retriable(err: str) -> bool:
+    """True iff ``err`` matches a Brev error pattern we know retrying can't fix."""
+    low = (err or "").lower()
+    return any(pat in low for pat in _BREV_NON_RETRIABLE_PATTERNS)
+
+
+def _reframe_brev_create_error(name: str, types: list, err_str: str) -> str:
+    """Translate a known Brev API error into a message a user can act on.
+
+    Falls through to the raw error if the pattern isn't one we recognize.
+    The known patterns all have the same shape — "this won't work until your
+    Brev org is reconfigured" — so the suggestions are roughly the same.
+    """
+    low = err_str.lower()
+    type_hint = ", ".join(str(t) for t in types) if types else "<unknown>"
+    if "cloudcredid or workspacegroupid must be specified" in low:
+        return (
+            f"`brev create {name} --type {type_hint}` failed: this Brev org has "
+            f"no cloud credential registered for the provider that hosts the "
+            f"requested instance type. The credential is configured server-side "
+            f"in the Brev console — runplz cannot pass it as a CLI flag.\n\n"
+            f"Fix options:\n"
+            f"  - Pick a --type whose provider is already configured for your "
+            f"org (run `brev search gpu` to see what your org can provision).\n"
+            f"  - Pre-create the instance once via the Brev web UI, which walks "
+            f"through cred setup. Subsequent `runplz brev --instance <name>` "
+            f"calls will reuse that box.\n"
+            f"  - Ask your Brev admin / support to register a cloudCredId for "
+            f"the provider that hosts {type_hint}.\n\n"
+            f"The instance was NOT created. No charge. Raw API error: {err_str[:300]}"
+        )
+    if "provider not enabled" in low or "provider is not configured" in low:
+        return (
+            f"`brev create {name} --type {type_hint}` failed: the requested "
+            f"provider is not enabled on your Brev org. Pick a different --type "
+            f"or have your Brev admin enable the provider in the console. "
+            f"No instance created. Raw API error: {err_str[:300]}"
+        )
+    if "quota" in low and "exceeded" in low:
+        return (
+            f"`brev create {name} --type {type_hint}` failed: provider quota "
+            f"exceeded. This is server-side capacity — wait, request a quota "
+            f"increase, or pick a --type from a different provider. "
+            f"No instance created. Raw API error: {err_str[:300]}"
+        )
+    if "unauthorized" in low or "403 forbidden" in low:
+        return (
+            f"`brev create {name} --type {type_hint}` failed: Brev rejected the "
+            f"call as unauthorized. Re-run `brev login` and try again. "
+            f"No instance created. Raw API error: {err_str[:300]}"
+        )
+    return f"`brev create {name}` failed (non-retriable). Raw API error: {err_str[:500]}"
+
 
 # Attempts: (0, 3, 6, 12) = 4 tries, ~21s total retry budget per CLI call.
 # Enough to ride out typical Brev API blips without delaying hard-failures
@@ -892,6 +974,17 @@ def _brev_capture(
         # Coerce to str in case stderr/stdout are Mocks (test harness) or
         # None (some subprocess configurations) — we only want the text.
         err = stderr + stdout
+        # Early-bail on org/config-gap errors that retrying can never fix —
+        # otherwise we burn the full retry budget on guaranteed-fail attempts
+        # and delay the real failure (issue #62). Caller still gets the
+        # CompletedProcess so it can produce a reframed message.
+        if _looks_non_retriable(err):
+            print(
+                f"+ {label} attempt {attempt}/{total_attempts} hit "
+                f"non-retriable error; bailing out (no point retrying org/config gaps)",
+                flush=True,
+            )
+            return last
         if _looks_transient(err) and attempt < total_attempts:
             print(
                 f"+ {label} attempt {attempt}/{total_attempts} hit transient error; retrying",
