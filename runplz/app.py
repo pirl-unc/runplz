@@ -33,6 +33,7 @@ class Function:
         min_gpu_memory: Optional[float] = None,
         min_disk: Optional[float] = None,
         num_gpus: int = 1,
+        preconditions: Optional[dict] = None,
     ):
         _validate_resources(
             fn_name=fn.__name__,
@@ -74,6 +75,13 @@ class Function:
         self.num_gpus = num_gpus
         self.timeout = timeout
         self.env = dict(env or {})
+        # Preconditions: declarative remote-state requirements probed *after*
+        # rsync_up but *before* bootstrap, so a misprovisioned box (small
+        # /dev/shm, full disk, missing GPU) fails fast instead of wasting
+        # paid GPU minutes on a doomed run. See runplz/backends/_ssh_common.py
+        # `_check_preconditions`. v1 keys: shm_gb, disk_free_gb, gpu_count,
+        # gpu_memory_gb. Issue #56.
+        self.preconditions = _normalize_preconditions(fn.__name__, preconditions)
         self.name = fn.__name__
         self.module_file = str(Path(inspect.getfile(fn)).resolve())
 
@@ -127,6 +135,7 @@ class App:
         num_gpus: int = 1,
         timeout: int = 60 * 60,
         env: Optional[dict] = None,
+        preconditions: Optional[dict] = None,
     ):
         def decorator(fn: Callable) -> Function:
             f = Function(
@@ -141,6 +150,7 @@ class App:
                 num_gpus=num_gpus,
                 timeout=timeout,
                 env=env or {},
+                preconditions=preconditions,
             )
             self.functions[f.name] = f
             return f
@@ -339,3 +349,36 @@ def _validate_resources(
         raise ValueError(
             f"@app.function({fn_name}): timeout must be a positive int (seconds); got {timeout!r}."
         )
+
+
+# Precondition keys we know how to probe. Adding a new key is a two-place
+# change: list it here so user-supplied values are validated, then teach
+# `_check_preconditions` how to probe and compare it.
+PRECONDITION_KEYS = ("shm_gb", "disk_free_gb", "gpu_count", "gpu_memory_gb")
+
+
+def _normalize_preconditions(fn_name: str, raw: Optional[dict]) -> dict:
+    """Validate the user's `preconditions=` dict and return a clean copy.
+
+    Rejects unknown keys (typos like ``shm_gib`` would silently no-op
+    otherwise) and non-positive values.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"@app.function({fn_name}): preconditions must be a dict; got {type(raw).__name__}."
+        )
+    cleaned: dict = {}
+    for key, value in raw.items():
+        if key not in PRECONDITION_KEYS:
+            raise ValueError(
+                f"@app.function({fn_name}): unknown precondition key {key!r}. "
+                f"Supported: {', '.join(PRECONDITION_KEYS)}."
+            )
+        if not isinstance(value, (int, float)) or value <= 0:
+            raise ValueError(
+                f"@app.function({fn_name}): precondition {key}={value!r} must be a positive number."
+            )
+        cleaned[key] = float(value)
+    return cleaned
