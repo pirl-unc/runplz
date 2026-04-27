@@ -704,10 +704,13 @@ def _create_instance(name: str, *, cfg=None, image=None, function=None):
     # the selector's top-N ranked candidates when auto-picking; a
     # user-pinned `instance_type` is always the one-and-only.
     if cfg is not None and cfg.instance_type is not None:
+        # User pinned the type explicitly — respect it even if it's on the
+        # provider blocklist. Their pin, their consequences.
         instance_types = [cfg.instance_type]
     else:
         n = cfg.instance_type_fallback_count if cfg is not None else 1
-        instance_types = _pick_instance_types(function, n=n)
+        exclude = cfg.exclude_providers if cfg is not None else ()
+        instance_types = _pick_instance_types(function, n=n, exclude_providers=exclude)
         if not instance_types:
             raise RuntimeError(
                 "`brev search` returned no matching instances. Loosen the "
@@ -1151,7 +1154,7 @@ def _candidate_from_brev_row(row: dict) -> Optional[Candidate]:
     return Candidate(name=name, hourly_usd=price, availability_hint=hint, region=region, raw=row)
 
 
-def _pick_instance_types(function, *, n: int = 1) -> list:
+def _pick_instance_types(function, *, n: int = 1, exclude_providers: tuple = ()) -> list:
     """Run `brev search` with filters from `function`'s resource requests
     and return up to `n` ranked TYPE strings for multi-type fallback
     dispatch (issue #44).
@@ -1202,6 +1205,27 @@ def _pick_instance_types(function, *, n: int = 1) -> list:
     if not isinstance(results, list) or not results:
         return []
 
+    # Drop rows whose type matches an excluded provider prefix BEFORE the
+    # selector ranks anything (issue #62 follow-up: OCI is the canonical
+    # offender — its launchpad path fails server-side on most orgs and
+    # there's nothing runplz can do about it from the client).
+    if exclude_providers:
+        before = len(results)
+        results = [
+            row
+            for row in results
+            if not _matches_excluded_provider(_brev_row_type(row), exclude_providers)
+        ]
+        dropped = before - len(results)
+        if dropped:
+            print(
+                f"+ selector excluded {dropped} candidate(s) matching "
+                f"BrevConfig.exclude_providers={list(exclude_providers)}",
+                flush=True,
+            )
+        if not results:
+            return []
+
     candidates = [_candidate_from_brev_row(row) for row in results]
     priced = [c for c in candidates if c is not None and c.hourly_usd is not None]
     if priced:
@@ -1223,6 +1247,28 @@ def _pick_instance_types(function, *, n: int = 1) -> list:
         if t:
             fallback.append(t)
     return fallback
+
+
+def _matches_excluded_provider(type_str: Optional[str], exclude_providers: tuple) -> bool:
+    """True iff ``type_str`` starts with any excluded provider prefix.
+
+    Match is case-insensitive and provider-segment-aware: a prefix ``"oci"``
+    matches ``"oci.a100x8.sxm.brev-dgxc"`` and ``"OCI_..."`` but not
+    ``"ocifoo"`` (so a type happening to share leading letters doesn't get
+    nuked). The boundary characters we accept are ``.`` and ``_`` because
+    those are what Brev uses to delimit the provider segment in practice
+    (``oci.a100x8...``, ``massedcompute_A100_...``).
+    """
+    if not type_str or not exclude_providers:
+        return False
+    low = type_str.lower()
+    for prefix in exclude_providers:
+        p = prefix.lower()
+        if low == p:
+            return True
+        if low.startswith(p) and len(low) > len(p) and low[len(p)] in (".", "_", "-"):
+            return True
+    return False
 
 
 def _pick_instance_type(function) -> Optional[str]:
