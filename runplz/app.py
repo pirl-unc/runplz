@@ -33,8 +33,14 @@ class Function:
         min_gpu_memory: Optional[float] = None,
         min_disk: Optional[float] = None,
         num_gpus: int = 1,
+        min_gpus: Optional[int] = None,
         preconditions: Optional[dict] = None,
     ):
+        # min_gpus is the canonical name going forward (parallels min_cpu /
+        # min_memory / min_gpu_memory). num_gpus is the legacy alias — kept
+        # so existing scripts don't break. Setting both with conflicting
+        # values is rejected so we never silently drop one.
+        num_gpus = _coalesce_min_gpus(fn.__name__, min_gpus=min_gpus, num_gpus=num_gpus)
         _validate_resources(
             fn_name=fn.__name__,
             gpu=gpu,
@@ -67,12 +73,15 @@ class Function:
         self.min_memory = min_memory  # GB of RAM
         self.min_gpu_memory = min_gpu_memory  # GB of VRAM per GPU
         self.min_disk = min_disk  # GB of disk
-        # Number of GPUs. Maps to `brev search --min-gpus N`, Modal's
+        # Minimum number of GPUs. Maps to `brev search --min-gpus N`, Modal's
         # `gpu="A100-80GB:4"` count-suffix syntax, and the SSH backend's
         # spec-mismatch probe. Default 1 means "give me one of whatever
-        # `gpu=...` asks for" when `gpu` is set. With gpu=None, this is
-        # ignored (we don't allocate GPU-less multi-GPU boxes).
+        # `gpu=...` asks for" when `gpu` is set. With gpu=None and no
+        # min_gpu_memory, this is ignored (we don't allocate GPU-less
+        # multi-GPU boxes). The legacy `num_gpus` attribute is kept as
+        # an alias so existing dispatch code (brev / modal) keeps working.
         self.num_gpus = num_gpus
+        self.min_gpus = num_gpus
         self.timeout = timeout
         self.env = dict(env or {})
         # Preconditions: declarative remote-state requirements probed *after*
@@ -133,6 +142,7 @@ class App:
         min_gpu_memory: Optional[float] = None,
         min_disk: Optional[float] = None,
         num_gpus: int = 1,
+        min_gpus: Optional[int] = None,
         timeout: int = 60 * 60,
         env: Optional[dict] = None,
         preconditions: Optional[dict] = None,
@@ -148,6 +158,7 @@ class App:
                 min_gpu_memory=min_gpu_memory,
                 min_disk=min_disk,
                 num_gpus=num_gpus,
+                min_gpus=min_gpus,
                 timeout=timeout,
                 env=env or {},
                 preconditions=preconditions,
@@ -331,19 +342,18 @@ def _validate_resources(
             raise ValueError(
                 f"@app.function({fn_name}): {label} must be > 0 when set; got {value!r}."
             )
-    if min_gpu_memory is not None and gpu is None:
-        raise ValueError(
-            f"@app.function({fn_name}): min_gpu_memory={min_gpu_memory} requires gpu=... "
-            "(can't filter VRAM without asking for a GPU)."
-        )
     if not isinstance(num_gpus, int) or num_gpus < 1:
         raise ValueError(
-            f"@app.function({fn_name}): num_gpus must be a positive int; got {num_gpus!r}."
+            f"@app.function({fn_name}): min_gpus / num_gpus must be a positive int; "
+            f"got {num_gpus!r}."
         )
-    if num_gpus > 1 and gpu is None:
+    # Multi-GPU without an explicit model is fine *if* the user has at least
+    # told the selector what kind of GPU to look for (via min_gpu_memory).
+    # Otherwise the request is too vague — refuse to provision random GPUs.
+    if num_gpus > 1 and gpu is None and min_gpu_memory is None:
         raise ValueError(
-            f"@app.function({fn_name}): num_gpus={num_gpus} requires gpu=... "
-            "(can't request multiple GPUs without a model)."
+            f"@app.function({fn_name}): min_gpus={num_gpus} without gpu=... "
+            "needs at least min_gpu_memory= so the selector can filter sensibly."
         )
     if not isinstance(timeout, int) or timeout <= 0:
         raise ValueError(
@@ -355,6 +365,28 @@ def _validate_resources(
 # change: list it here so user-supplied values are validated, then teach
 # `_check_preconditions` how to probe and compare it.
 PRECONDITION_KEYS = ("shm_gb", "disk_free_gb", "gpu_count", "gpu_memory_gb")
+
+
+def _coalesce_min_gpus(fn_name: str, *, min_gpus: Optional[int], num_gpus: int) -> int:
+    """Reconcile the new ``min_gpus`` and the legacy ``num_gpus`` kwargs.
+
+    `num_gpus` defaults to 1; treat that default as "unset" so a user passing
+    only `min_gpus=4` doesn't trip a spurious conflict. If both are passed
+    explicitly with different values, refuse silently picking one — the user
+    is asking for two different things.
+    """
+    if min_gpus is None:
+        return num_gpus
+    if not isinstance(min_gpus, int) or min_gpus < 1:
+        raise ValueError(
+            f"@app.function({fn_name}): min_gpus must be a positive int; got {min_gpus!r}."
+        )
+    if num_gpus != 1 and num_gpus != min_gpus:
+        raise ValueError(
+            f"@app.function({fn_name}): conflicting min_gpus={min_gpus} and "
+            f"num_gpus={num_gpus}. Pass only one (prefer min_gpus going forward)."
+        )
+    return min_gpus
 
 
 def _normalize_preconditions(fn_name: str, raw: Optional[dict]) -> dict:

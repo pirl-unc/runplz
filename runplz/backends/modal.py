@@ -337,6 +337,18 @@ def _check_output_blob_size(blob_path: str) -> None:
 _MODAL_GPU_VRAM_RE = re.compile(r"-\d+GB\b", re.IGNORECASE)
 _MODAL_GPU_COUNT_RE = re.compile(r":\d+$")
 
+# Cheapest Modal GPU model that satisfies a given VRAM minimum (GB). Used
+# when the user passes `min_gpu_memory=` without `gpu=` so the same script
+# works on Modal as on Brev. Ordered by VRAM ascending; we pick the first
+# entry whose VRAM >= the requested minimum.
+_MODAL_VRAM_LADDER = (
+    (16, "T4"),
+    (24, "L4"),
+    (40, "A100-40GB"),
+    (80, "A100-80GB"),
+    (141, "H200"),
+)
+
 
 def _modal_gpu_string(gpu, min_gpu_memory, num_gpus: int = 1):
     """Translate (gpu, min_gpu_memory, num_gpus) into Modal's gpu string.
@@ -345,9 +357,15 @@ def _modal_gpu_string(gpu, min_gpu_memory, num_gpus: int = 1):
     count as a ":N" suffix ("A100-80GB:4"). We build the string VRAM-first
     then count-last; if the user already pinned either suffix we leave it
     alone (explicit wins over our augmentation).
+
+    When ``gpu`` is None and ``min_gpu_memory`` is set, we derive a default
+    model from ``_MODAL_VRAM_LADDER`` so a function written as
+    ``min_gpu_memory=24`` works on Modal the same way it works on Brev.
     """
-    if gpu is None:
+    if gpu is None and min_gpu_memory is None:
         return None
+    if gpu is None:
+        gpu = _modal_default_gpu_for_vram(min_gpu_memory)
     result = gpu
     # VRAM check scans anywhere in the string so "A100-80GB:2" is recognized
     # as already-sized even though the ":2" count suffix sits at the end.
@@ -356,6 +374,18 @@ def _modal_gpu_string(gpu, min_gpu_memory, num_gpus: int = 1):
     if num_gpus > 1 and not _MODAL_GPU_COUNT_RE.search(result):
         result = f"{result}:{int(num_gpus)}"
     return result
+
+
+def _modal_default_gpu_for_vram(min_gpu_memory) -> str:
+    """Pick the cheapest Modal-supported model that meets a VRAM minimum."""
+    for vram_gb, model in _MODAL_VRAM_LADDER:
+        if min_gpu_memory <= vram_gb:
+            return model
+    raise ValueError(
+        f"min_gpu_memory={min_gpu_memory!r} GB exceeds the largest known "
+        f"Modal GPU model ({_MODAL_VRAM_LADDER[-1][1]} = "
+        f"{_MODAL_VRAM_LADDER[-1][0]} GB). Pin gpu=... explicitly."
+    )
 
 
 def _render_modal_image(image, *, repo: Path) -> str:

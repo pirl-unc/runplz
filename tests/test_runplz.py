@@ -658,13 +658,17 @@ def test_function_rejects_non_positive_timeout():
             pass
 
 
-def test_function_rejects_min_gpu_memory_without_gpu():
+def test_function_accepts_min_gpu_memory_without_gpu():
+    """3.14.0: `min_gpu_memory=` alone is a valid 'any GPU >= X GB' selector.
+    The brev backend uses it to filter; Modal derives a default model."""
     app = App("t")
-    with pytest.raises(ValueError, match="min_gpu_memory=.* requires gpu"):
 
-        @app.function(image=_sample_image(), min_gpu_memory=16)
-        def train():
-            pass
+    @app.function(image=_sample_image(), min_gpu_memory=24)
+    def train():
+        pass
+
+    assert app.functions["train"].gpu is None
+    assert app.functions["train"].min_gpu_memory == 24
 
 
 def test_function_rejects_empty_gpu_string():
@@ -678,16 +682,18 @@ def test_function_rejects_empty_gpu_string():
 
 def test_function_rejects_num_gpus_zero():
     app = App("t")
-    with pytest.raises(ValueError, match="num_gpus must be a positive int"):
+    with pytest.raises(ValueError, match="must be a positive int"):
 
         @app.function(image=_sample_image(), gpu="A100", num_gpus=0)
         def train():
             pass
 
 
-def test_function_rejects_num_gpus_greater_than_one_without_gpu():
+def test_function_rejects_multi_gpu_without_any_gpu_constraint():
+    """`num_gpus > 1` still needs *something* GPU-shaped — either a model
+    or a min VRAM — so the selector knows what to look for."""
     app = App("t")
-    with pytest.raises(ValueError, match="num_gpus=4 requires gpu="):
+    with pytest.raises(ValueError, match="needs at least min_gpu_memory"):
 
         @app.function(image=_sample_image(), num_gpus=4)
         def train():

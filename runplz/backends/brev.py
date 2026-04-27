@@ -1074,7 +1074,16 @@ def _pick_instance_types(function, *, n: int = 1) -> list:
     """
     from runplz._selector import pick_machines
 
-    mode = "gpu" if function.gpu is not None else "cpu"
+    # gpu mode whenever the user named a model OR set any GPU-shaped
+    # constraint (min_gpu_memory, multi-GPU). This is what makes
+    # `min_gpu_memory=24` without `gpu=` actually search GPU instances
+    # rather than silently falling through to a CPU box.
+    needs_gpu_search = (
+        function.gpu is not None
+        or function.min_gpu_memory is not None
+        or (getattr(function, "num_gpus", 1) or 1) > 1
+    )
+    mode = "gpu" if needs_gpu_search else "cpu"
     cmd = ["brev", "search", mode, "--json", "--sort", "price"]
     if function.gpu:
         cmd += ["--gpu-name", _brev_gpu_name(function.gpu)]
