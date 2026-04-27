@@ -428,6 +428,131 @@ def _ssh_capture(target: str, remote_cmd: str, *, port: Optional[int] = None) ->
     return r.stdout
 
 
+class PreconditionFailed(RuntimeError):
+    """Remote state failed a declared precondition. Raised before bootstrap
+    so we don't waste paid GPU minutes on a doomed run (issue #56)."""
+
+
+# Below the declared minimum → warn. Below this fraction of the minimum →
+# hard-fail. Matches the rule the issue proposes.
+_PRECONDITION_FAIL_FRACTION = 0.5
+
+
+def _check_preconditions(target: str, preconditions: dict, *, port: Optional[int] = None) -> None:
+    """Probe declared preconditions on the remote box and warn-or-fail.
+
+    No-op when ``preconditions`` is empty. Fires a single ssh round-trip
+    that emits a labelled section per probe; we parse and compare each
+    against the declared minimum. Below the minimum prints a warning;
+    below half the minimum raises :class:`PreconditionFailed` so the
+    dispatch path bails before bootstrap.
+    """
+    if not preconditions:
+        return
+    probe = (
+        "echo '---SHM_BYTES---'; df -B1 /dev/shm 2>/dev/null | tail -n 1 "
+        "| awk '{print $4}' || true; "
+        "echo '---HOME_FREE_BYTES---'; df -B1 \"$HOME\" 2>/dev/null | tail -n 1 "
+        "| awk '{print $4}' || true; "
+        "echo '---GPU_COUNT---'; nvidia-smi -L 2>/dev/null | wc -l || echo 0; "
+        "echo '---GPU_MIN_VRAM_MIB---'; "
+        "nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits "
+        "2>/dev/null | sort -n | head -n 1 || echo 0; "
+        "echo '---END---'"
+    )
+    out = _ssh_capture(target, probe, port=port)
+    sections = _parse_probe_sections(out)
+
+    failures: list[str] = []
+    warnings: list[str] = []
+
+    def _check(key, observed_label, observed_value, threshold):
+        """Compare ``observed_value`` to ``threshold`` and route the result.
+
+        ``observed_value`` and ``threshold`` are both in the user-facing unit
+        the precondition key declares (GB for shm_gb / disk_free_gb /
+        gpu_memory_gb, count for gpu_count). One callsite per key keeps the
+        warn/fail logic uniform and the messages legible.
+        """
+        if observed_value is None:
+            warnings.append(
+                f"could not probe {key} on {target} (no value reported); "
+                f"declared minimum {threshold} not enforced."
+            )
+            return
+        if observed_value < threshold * _PRECONDITION_FAIL_FRACTION:
+            failures.append(
+                f"{key}: {observed_label}={observed_value:g} is below "
+                f"{int(_PRECONDITION_FAIL_FRACTION * 100)}% of the declared "
+                f"minimum ({threshold}). Refusing to bootstrap a doomed run."
+            )
+        elif observed_value < threshold:
+            warnings.append(
+                f"{key}: {observed_label}={observed_value:g} is below the "
+                f"declared minimum ({threshold}). Job will continue but may fail."
+            )
+
+    if "shm_gb" in preconditions:
+        observed = _bytes_to_gb(_first_int(sections.get("SHM_BYTES")))
+        _check("shm_gb", "free_shm_gb", observed, preconditions["shm_gb"])
+    if "disk_free_gb" in preconditions:
+        observed = _bytes_to_gb(_first_int(sections.get("HOME_FREE_BYTES")))
+        _check("disk_free_gb", "free_home_gb", observed, preconditions["disk_free_gb"])
+    if "gpu_count" in preconditions:
+        count = _first_int(sections.get("GPU_COUNT"))
+        observed = float(count) if count is not None else None
+        _check("gpu_count", "gpu_count", observed, preconditions["gpu_count"])
+    if "gpu_memory_gb" in preconditions:
+        mib = _first_int(sections.get("GPU_MIN_VRAM_MIB"))
+        observed = (mib / 1024.0) if mib is not None and mib > 0 else None
+        _check("gpu_memory_gb", "min_gpu_memory_gb", observed, preconditions["gpu_memory_gb"])
+
+    for w in warnings:
+        print(f"+ precondition warning: {w}", flush=True)
+    if failures:
+        joined = "\n  - ".join(failures)
+        raise PreconditionFailed(f"remote preconditions failed on {target}:\n  - {joined}")
+
+
+def _parse_probe_sections(stdout: str) -> dict[str, str]:
+    sections: dict[str, str] = {}
+    current = None
+    buf: list[str] = []
+    for line in (stdout or "").splitlines():
+        line = line.rstrip()
+        if line.startswith("---") and line.endswith("---"):
+            if current:
+                sections[current] = "\n".join(buf).strip()
+                buf = []
+            current = line.strip("-").strip()
+        else:
+            buf.append(line)
+    if current and current != "END":
+        sections[current] = "\n".join(buf).strip()
+    return sections
+
+
+def _first_int(text: Optional[str]) -> Optional[int]:
+    """Pull the first integer out of a probe section's output. Tolerates
+    leading whitespace, trailing units, and probes that emitted nothing."""
+    if not text:
+        return None
+    for token in text.split():
+        digits = "".join(ch for ch in token if ch.isdigit())
+        if digits:
+            try:
+                return int(digits)
+            except ValueError:
+                continue
+    return None
+
+
+def _bytes_to_gb(b: Optional[int]) -> Optional[float]:
+    if b is None or b <= 0:
+        return None
+    return b / (1024.0**3)
+
+
 def _remote_repo_shell(remote_run: Optional[RemoteRunContext]) -> str:
     if remote_run is not None:
         return remote_run.repo_shell

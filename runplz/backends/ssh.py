@@ -23,6 +23,7 @@ from typing import Optional
 from runplz.backends._ssh_common import (
     FAILURE_TAIL_LINES,
     _build_image,
+    _check_preconditions,
     _ensure_docker,
     _ensure_remote_rsync,
     _fetch_failure_tail,
@@ -76,6 +77,11 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
     # Make sure rsync is present before we try to upload.
     _ensure_remote_rsync(target, port=port)
     _rsync_up(repo, target, outputs_dir=outputs_dir, remote_run=remote_run, port=port)
+
+    # Probe declared remote preconditions (issue #56) before bootstrap so a
+    # misprovisioned box (small /dev/shm, full disk, missing GPU) fails fast
+    # instead of wasting paid GPU minutes on a doomed run.
+    _check_preconditions(target, function.preconditions, port=port)
 
     rel_script = Path(function.module_file).resolve().relative_to(repo)
 

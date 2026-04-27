@@ -25,6 +25,7 @@ from runplz._selector import Candidate
 from runplz.backends._ssh_common import (
     FAILURE_TAIL_LINES,
     _build_image,
+    _check_preconditions,
     _container_running,
     _ensure_docker,
     _ensure_remote_rsync,
@@ -269,6 +270,11 @@ def run(
                 # ship with rsync. Install it before the first rsync call.
                 _ensure_remote_rsync(instance)
             _rsync_up(repo, instance, outputs_dir=outputs_dir, remote_run=remote_run)
+
+            # Probe declared remote preconditions (issue #56) before bootstrap.
+            # See _ssh_common._check_preconditions for the warn/fail rule.
+            _check_preconditions(instance, function.preconditions)
+
             rel_script = Path(function.module_file).resolve().relative_to(repo)
 
             if cfg.mode == "container":
