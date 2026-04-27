@@ -75,7 +75,7 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
 
     # Make sure rsync is present before we try to upload.
     _ensure_remote_rsync(target, port=port)
-    _rsync_up(repo, target, remote_run=remote_run, port=port)
+    _rsync_up(repo, target, outputs_dir=outputs_dir, remote_run=remote_run, port=port)
 
     rel_script = Path(function.module_file).resolve().relative_to(repo)
 

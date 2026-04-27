@@ -635,6 +635,55 @@ def test_rsync_up_excludes_and_no_delete(tmp_path):
     assert "--exclude=out" in cmd
 
 
+def test_rsync_up_excludes_configured_outputs_dir(tmp_path):
+    """Issue #55: when outputs_dir != "out", the local outputs tree was
+    silently re-uploaded on every launch. Verify the configured outputs_dir
+    is added as an --exclude pattern."""
+    recorded = {}
+    with mock.patch("runplz.backends._ssh_common._sh", lambda c: recorded.setdefault("c", c)):
+        brev._rsync_up(tmp_path, "my-box", outputs_dir="brev_runs")
+    cmd = recorded["c"]
+    assert "--exclude=/brev_runs/" in cmd
+    # Single-segment names also get the unanchored form, matching the
+    # existing convention for "out".
+    assert "--exclude=brev_runs" in cmd
+
+
+def test_rsync_up_skips_outputs_dir_exclude_for_default(tmp_path):
+    """outputs_dir="out" is already in _RSYNC_NOISE_EXCLUDES — don't double up."""
+    recorded = {}
+    with mock.patch("runplz.backends._ssh_common._sh", lambda c: recorded.setdefault("c", c)):
+        brev._rsync_up(tmp_path, "my-box", outputs_dir="out")
+    cmd = recorded["c"]
+    assert cmd.count("--exclude=out") == 1
+    assert "--exclude=/out/" not in cmd
+
+
+def test_rsync_up_handles_nested_outputs_dir(tmp_path):
+    """A multi-segment outputs_dir like 'data/runs' must be anchored so we
+    don't accidentally exclude every directory named 'runs' in the tree."""
+    recorded = {}
+    with mock.patch("runplz.backends._ssh_common._sh", lambda c: recorded.setdefault("c", c)):
+        brev._rsync_up(tmp_path, "my-box", outputs_dir="data/runs")
+    cmd = recorded["c"]
+    assert "--exclude=/data/runs/" in cmd
+    # No unanchored form for multi-segment paths.
+    assert "--exclude=runs" not in cmd
+    assert "--exclude=data/runs" not in cmd
+
+
+def test_rsync_up_skips_outputs_dir_exclude_when_outside_repo(tmp_path):
+    """Absolute outputs_dir paths outside the repo can't be inside the rsync
+    source, so emitting an exclude for them would be noise."""
+    outside = tmp_path.parent / "elsewhere"
+    recorded = {}
+    with mock.patch("runplz.backends._ssh_common._sh", lambda c: recorded.setdefault("c", c)):
+        brev._rsync_up(tmp_path, "my-box", outputs_dir=str(outside))
+    cmd = recorded["c"]
+    # No outputs-dir-derived exclude — only the standard noise + secrets.
+    assert not any(x.startswith(f"--exclude={outside}") for x in cmd)
+
+
 def test_rsync_up_excludes_default_secret_files(tmp_path):
     """Issue #18: a repo with .env / ssh keys / credentials.json must not
     ship those to the remote box by default."""
