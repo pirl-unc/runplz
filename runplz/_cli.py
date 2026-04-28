@@ -5,7 +5,7 @@ Usage:
     runplz brev --instance my-gpu-box <script.py>
     runplz ssh  --host gpu.example.com <script.py>
     runplz modal <script.py>
-    runplz ps [local|brev|modal] [--ssh <host>]
+    runplz ps [local|brev|modal] [--host <host>]
     runplz tail [--outputs-dir <path>] [--host <host>] [--run-id <id>] [-n N] [-f]
     runplz status [--outputs-dir <path>] [--host <host>] [--run-id <id>]
 
@@ -339,7 +339,8 @@ def _ps_main(argv):
         help="Limit listing to one backend. Default: fan out to all of local, brev, modal.",
     )
     p.add_argument(
-        "--ssh",
+        "--host",
+        "--ssh",  # legacy alias: pre-3.15.1 used --ssh here. Kept indefinitely.
         dest="ssh_host",
         help=(
             "[ssh] Also probe this SSH host. SSH has no job registry, so the "

@@ -102,12 +102,20 @@ class Function:
         return self.app._dispatch(self, list(args), dict(kwargs))
 
     def __call__(self, *args, **kwargs):
+        # Show a CWD-relative path when possible — bare absolute paths are
+        # noisy (often /Users/.../code/proj/jobs/long_name.py) and obscure
+        # the actually-actionable suggestion. Falls back to basename when
+        # the file lives outside the cwd (rare; e.g. installed examples).
+        try:
+            display_path = str(Path(self.module_file).relative_to(Path.cwd()))
+        except ValueError:
+            display_path = Path(self.module_file).name
         raise RuntimeError(
             f"Plain-calling a runplz Function is intentionally disabled. Use "
             f"`{self.name}.local(*args, **kwargs)` to run it in this process, "
             f"or `{self.name}.remote(*args, **kwargs)` to dispatch it to the "
             f"backend selected on the command line "
-            f"(e.g. `runplz brev --instance <box> {self.module_file}`)."
+            f"(e.g. `runplz brev --instance <box> {display_path}`)."
         )
 
 

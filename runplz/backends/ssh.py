@@ -27,6 +27,7 @@ from runplz.backends._ssh_common import (
     _ensure_docker,
     _ensure_remote_rsync,
     _fetch_failure_tail,
+    _parse_probe_sections,
     _prepare_remote_run,
     _remote_has_nvidia,
     _rsync_down,
@@ -287,24 +288,6 @@ def _warn_on_spec_mismatch(target: str, function, *, port: Optional[int] = None)
     warnings.extend(_check_gpu(sections.get("NVIDIA", ""), function))
     for w in warnings:
         print(f"+ spec-mismatch warning: {w}", flush=True)
-
-
-def _parse_probe_sections(probe: str) -> dict:
-    sections: dict[str, str] = {}
-    current = None
-    buf: list[str] = []
-    for line in (probe or "").splitlines():
-        line = line.rstrip()
-        if line.startswith("---") and line.endswith("---"):
-            if current:
-                sections[current] = "\n".join(buf).strip()
-                buf = []
-            current = line.strip("-").strip()
-        else:
-            buf.append(line)
-    if current and current != "END":
-        sections[current] = "\n".join(buf).strip()
-    return sections
 
 
 def _check_cpu(nproc_out: str, function) -> list[str]:

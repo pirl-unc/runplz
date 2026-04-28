@@ -72,7 +72,7 @@ explicit `@app.local_entrypoint`. It runs *in the local CLI process*;
 `.remote()` dispatches to the chosen backend.
 
 ```python
-@app.function(image=image, gpu="A100", num_gpus=4)
+@app.function(image=image, gpu="A100", min_gpus=4)
 def train(fold: int): ...
 
 @app.function(image=image, min_cpu=8)
@@ -205,6 +205,29 @@ kwargs must be JSON-serializable.
 All four have `app.bind(...)` equivalents (`instance=`, `host=`,
 `build=False`, `outputs_dir=`) for the pure-Python invocation path.
 
+### Operations CLI: `ps`, `tail`, `status`
+
+Three subcommands let you check on jobs without retyping ssh aliases or
+remembering remote run IDs:
+
+```bash
+runplz ps                          # list runplz jobs across all backends
+runplz ps brev                     # one backend
+runplz ps --host my.gpu.box        # also probe an SSH host
+
+runplz tail                        # tail remote driver log of the most recent run
+runplz tail -n 500                 # last N lines (default 120)
+runplz tail -f                     # stream new lines as they arrive
+
+runplz status                      # one-screen summary: target, last event, last heartbeat, event count
+```
+
+`tail` and `status` default to "most recent run in `./out/`" by reading
+the local `out/.runplz/run.json` manifest the dispatch path writes. Pass
+`--outputs-dir <path>` to point at a different one, or `--host <h>
+--run-id <id>` to inspect a specific run by ID. SSH has no host registry,
+so `runplz ps` skips it unless you pass `--host`.
+
 ## Backend config
 
 `App(..., brev_config=BrevConfig(...), modal_config=ModalConfig(...),
@@ -227,6 +250,8 @@ All fields are validated at construction time — an invalid config raises
 | `on_finish`              | `"stop"` | What runplz does to the Brev box when the App exits (success **or** failure). `"stop"` → `brev stop` (disk cached, small ongoing charge). `"delete"` → `brev delete` (zero ongoing cost, cold rebuild). `"leave"` → never touch the box (opt-in for interactive dev workflows). |
 | `max_runtime_seconds`    | `None`  | Wall-clock kill-switch. When set, runplz kills the remote container/process and raises `RuntimeError` after this many seconds so a wedged job can't keep billing forever. `None` = unlimited.                                                                       |
 | `ssh_ready_wait_seconds` | `1800` (30 min) | How long to wait for the freshly-provisioned Brev box to become SSH-reachable. Default covers 8×A100/H100 cold boots on Denvr / OCI (15-18 min in practice). Bump for slower provider / shape combos. |
+| `instance_type_fallback_count` | `3` | When auto-picking, how many ranked candidate types to pass to `brev create` for transparent fallback (Brev's CLI tries them in order if A fails on Nebius, B on OCI, etc.). Set to 1 for single-type behavior. Ignored when `instance_type=` is pinned. |
+| `exclude_providers` | `("oci",)` | Provider prefixes to drop from `brev search` results before the auto-pick selector ranks them. Match is case-insensitive and segment-aware (`"oci"` matches `oci.a100x8.sxm.brev-dgxc` but not `ocifoo`). Default blocks OCI because Brev support has confirmed the OCI launchpad path fails server-side on most orgs (issue #62). Set to `()` to disable, or extend (`("oci", "shadeform")`) for orgs where another provider is also broken. **A pinned `instance_type=` bypasses this filter** — your pin, your consequences. |
 
 Invalid combinations (raised eagerly):
 
@@ -319,15 +344,16 @@ an existing Dockerfile you maintain; runplz just runs it.
 
 ## Resource constraints
 
-All memory/disk fields in **GB**:
+All memory/disk fields in **GB**, GPU counts unitless:
 
 ```python
 @app.function(
     image=image,
-    gpu="T4",            # modal-style label; "A100", "H100", "L4", ...
+    gpu="T4",            # exact model label; "A100", "H100", "L4", ...
     min_cpu=4,
-    min_memory=26,       # RAM
-    min_gpu_memory=16,   # VRAM
+    min_memory=16,       # RAM
+    min_gpu_memory=24,   # VRAM (works without gpu= — see below)
+    min_gpus=1,          # canonical name; num_gpus accepted as legacy alias
     min_disk=100,
     timeout=60 * 60,
 )
@@ -338,7 +364,7 @@ How they're honored per backend:
 | constraint        | local | brev                              | modal                                   | ssh                              |
 | ----------------- | ----- | --------------------------------- | --------------------------------------- | -------------------------------- |
 | `gpu`             |  —    | `brev search --gpu-name`          | `@app.function(gpu=...)`                | spec-probe warn on model/absent  |
-| `num_gpus`        |  —    | `--min-gpus` (when N > 1)         | `:N` suffix on gpu string (`A100:4`)    | spec-probe warn on count         |
+| `min_gpus`        |  —    | `--min-gpus` when > 1             | `:N` suffix on gpu string (`A100:4`)    | spec-probe warn on count         |
 | `min_cpu`         |  —    | `--min-vcpu`                      | `cpu=`                                  | spec-probe warn on nproc         |
 | `min_memory`      |  —    | `--min-ram`                       | `memory=` (converted to MB)             | spec-probe warn on meminfo       |
 | `min_gpu_memory`  |  —    | `--min-vram`                      | `-NGB` suffix on gpu string             | spec-probe warn on VRAM          |
@@ -357,19 +383,63 @@ worth a job sitting 5 minutes in a queue. If no candidate has a hint,
 plain cheapest wins. Override the whole picker with
 `BrevConfig(instance_type="...")` when you need a specific shape.
 
-### Multi-GPU (`num_gpus=N`)
+### `min_gpu_memory` without `gpu=`: pick any model that fits
 
-`@app.function(gpu="A100-80GB", num_gpus=4)` requests 4 GPUs of that
-model. Defaults to `1`. Maps to:
+Setting only `min_gpu_memory=` with no `gpu=` means "any GPU with at
+least N GB VRAM, you pick the model" — the cheapest match wins:
+
+```python
+@app.function(image=image, min_gpu_memory=24)
+def train(): ...
+```
+
+- **Brev**: `brev search` runs in GPU mode with `--min-vram N`; the
+  selector ranks by price across all matching models.
+- **Modal**: maps to a default model from a small VRAM ladder
+  (`T4`/`L4`/`A100-40GB`/`A100-80GB`/`H200`) — cheapest model that meets
+  the bar.
+
+Pin `gpu="L4"` (or whichever) to opt out of auto-selection.
+
+### Multi-GPU (`min_gpus=N`)
+
+`@app.function(gpu="A100-80GB", min_gpus=4)` requests at least 4 GPUs of
+that model. The legacy `num_gpus=N` is accepted as an alias for
+backwards compatibility (parallels `min_cpu`/`min_memory`/`min_gpu_memory`
+naming). Defaults to `1`. Maps to:
 
 - **brev**: `brev search --min-gpus N` filters the instance-type catalog.
-- **Modal**: appended as `:N` to the gpu string (Modal's native syntax —
-  `A100-80GB:4`).
-- **ssh**: the spec-mismatch probe warns if `nvidia-smi` returns fewer
-  than `N` GPUs on the remote.
-- **local**: ignored, like other specs — your machine is your machine.
+- **Modal**: appended as `:N` to the gpu string (`A100-80GB:4`).
+- **ssh**: spec-probe warns if `nvidia-smi` returns fewer than `N`.
+- **local**: ignored, like other specs.
 
-Requires `gpu=...` (can't ask for multiple GPUs without a model).
+Setting `min_gpus > 1` without `gpu=` requires at least `min_gpu_memory=`
+so the selector knows what kind of GPU to look for.
+
+### Remote preconditions: fail fast on a misprovisioned box
+
+For long, expensive jobs, declare remote-state minimums runplz will probe
+*before* bootstrap so a misconfigured box (small `/dev/shm`, full disk,
+missing GPU) fails immediately instead of crashing 10 minutes into a
+training run:
+
+```python
+@app.function(
+    image=image, gpu="A100", min_gpus=8,
+    preconditions={
+        "shm_gb": 4 * NUM_WORKERS,   # PyTorch DataLoader pain point
+        "disk_free_gb": 50,
+        "gpu_count": 8,
+        "gpu_memory_gb": 80,
+    },
+)
+def train(): ...
+```
+
+Below the declared minimum prints a warning; below 50% of it raises
+`PreconditionFailed` and bails before the bootstrap dispatches. Probe
+runs in a single ssh round-trip on brev/ssh; Modal manages disk/shm
+itself so preconditions are silently no-op there.
 
 ### Multiple functions, multiple shapes?
 

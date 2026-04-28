@@ -278,3 +278,27 @@ def test_ps_cli_surfaces_errors_as_warnings(capsys):
     assert "local listing failed" in err
     # With no rows at all and an error, rc=1.
     assert rc == 1
+
+
+def test_ps_cli_accepts_host_flag_3_15_1():
+    """3.15.1: `--host` is the canonical name (matches `runplz tail`/`status`/`ssh`).
+    `--ssh` is kept as a back-compat alias since pre-3.15.1 used it here."""
+    from runplz.backends import ssh as ssh_backend
+
+    with mock.patch.object(local, "list_jobs", return_value=[]):
+        with mock.patch.object(brev, "list_jobs", return_value=[]):
+            with mock.patch.object(modal, "list_jobs", return_value=[]):
+                with mock.patch.object(ssh_backend, "list_jobs", return_value=[]) as ssh_mock:
+                    _cli.main(["ps", "--host", "my.gpu.box"])
+    ssh_mock.assert_called_once_with(host="my.gpu.box")
+
+
+def test_ps_cli_back_compat_ssh_flag_still_works():
+    from runplz.backends import ssh as ssh_backend
+
+    with mock.patch.object(local, "list_jobs", return_value=[]):
+        with mock.patch.object(brev, "list_jobs", return_value=[]):
+            with mock.patch.object(modal, "list_jobs", return_value=[]):
+                with mock.patch.object(ssh_backend, "list_jobs", return_value=[]) as ssh_mock:
+                    _cli.main(["ps", "--ssh", "my.gpu.box"])
+    ssh_mock.assert_called_once_with(host="my.gpu.box")
