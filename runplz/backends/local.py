@@ -127,25 +127,51 @@ def list_jobs() -> list[dict]:
 
     Filters on the ``runplz=1`` label so this never returns unrelated
     containers a user may have started by hand.
+
+    A non-running Docker daemon is treated as "0 local jobs" (silent
+    return), not an error: there cannot be running local containers if
+    docker isn't running, and on dev machines docker is often off until
+    explicitly needed. Other failures (docker-cli missing, permissions
+    issues) still raise.
     """
-    r = subprocess.run(
-        [
-            "docker",
-            "ps",
-            "--filter",
-            "label=runplz=1",
-            "--format",
-            "{{json .}}",
-        ],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        r = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "--filter",
+                "label=runplz=1",
+                "--format",
+                "{{json .}}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        # No `docker` binary on PATH — treat the same as "no daemon": there
+        # are no local runplz containers because there's no docker at all.
+        return []
     if r.returncode != 0:
+        if _looks_like_docker_daemon_down((r.stderr or "") + (r.stdout or "")):
+            return []
         raise RuntimeError(
-            f"`docker ps` failed (rc={r.returncode}); is Docker running? "
-            f"stderr: {(r.stderr or '').strip()[:300]}"
+            f"`docker ps` failed (rc={r.returncode}). stderr: {(r.stderr or '').strip()[:300]}"
         )
     return _parse_docker_ps_rows(r.stdout)
+
+
+def _looks_like_docker_daemon_down(err: str) -> bool:
+    """Match the canonical 'docker daemon not running' stderr signatures."""
+    low = (err or "").lower()
+    return any(
+        sig in low
+        for sig in (
+            "cannot connect to the docker daemon",
+            "is the docker daemon running",
+            "error during connect",
+            "docker desktop is not running",
+        )
+    )
 
 
 def _parse_docker_ps_rows(stdout: str) -> list[dict]:
