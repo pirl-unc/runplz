@@ -50,8 +50,36 @@ def test_local_list_jobs_parses_docker_ps_json_lines():
     assert rows[1]["function"] == "eval"
 
 
-def test_local_list_jobs_raises_when_docker_fails():
-    fake = mock.Mock(returncode=1, stdout="", stderr="Cannot connect to daemon")
+def test_local_list_jobs_silent_when_docker_daemon_down():
+    """3.15.2: 'docker daemon not running' is informational on dev machines —
+    if the daemon isn't running there can't be any local runplz containers.
+    Treat as zero jobs, not a warning."""
+    fake = mock.Mock(
+        returncode=1,
+        stdout="",
+        stderr=(
+            "Cannot connect to the Docker daemon at unix:///.../docker.sock. "
+            "Is the docker daemon running?"
+        ),
+    )
+    with mock.patch("runplz.backends.local.subprocess.run", return_value=fake):
+        rows = local.list_jobs()
+    assert rows == []
+
+
+def test_local_list_jobs_silent_when_docker_binary_missing():
+    """No `docker` on PATH at all is the same kind of "no local containers
+    possible" condition — return empty rather than raising."""
+    with mock.patch(
+        "runplz.backends.local.subprocess.run", side_effect=FileNotFoundError("docker")
+    ):
+        rows = local.list_jobs()
+    assert rows == []
+
+
+def test_local_list_jobs_still_raises_on_other_docker_failures():
+    """A non-daemon-down docker failure (permissions, etc.) is a real error."""
+    fake = mock.Mock(returncode=1, stdout="", stderr="permission denied: /var/run/docker.sock")
     with mock.patch("runplz.backends.local.subprocess.run", return_value=fake):
         with pytest.raises(RuntimeError, match="docker ps"):
             local.list_jobs()
@@ -270,14 +298,18 @@ def test_ps_cli_single_backend_filter(capsys):
 
 
 def test_ps_cli_surfaces_errors_as_warnings(capsys):
+    """Errors from one backend show up as warnings on stderr while the
+    others' results still print. 3.15.2: rc is 0 as long as at least one
+    backend succeeded (errors are partial, not total)."""
     with mock.patch.object(local, "list_jobs", side_effect=RuntimeError("no daemon")):
         with mock.patch.object(brev, "list_jobs", return_value=[]):
             with mock.patch.object(modal, "list_jobs", return_value=[]):
                 rc = _cli.main(["ps"])
     err = capsys.readouterr().err
     assert "local listing failed" in err
-    # With no rows at all and an error, rc=1.
-    assert rc == 1
+    # Two backends succeeded (with empty results) so rc=0 — partial failures
+    # don't make the whole command fail.
+    assert rc == 0
 
 
 def test_ps_cli_accepts_host_flag_3_15_1():
@@ -291,6 +323,31 @@ def test_ps_cli_accepts_host_flag_3_15_1():
                 with mock.patch.object(ssh_backend, "list_jobs", return_value=[]) as ssh_mock:
                     _cli.main(["ps", "--host", "my.gpu.box"])
     ssh_mock.assert_called_once_with(host="my.gpu.box")
+
+
+def test_ps_cli_prints_no_jobs_when_some_backend_succeeds(capsys):
+    """3.15.2: don't suppress the table just because ONE backend errored.
+    If at least one backend was queryable, an empty result is real
+    information ('no jobs running anywhere reachable')."""
+    with mock.patch.object(local, "list_jobs", side_effect=RuntimeError("docker missing")):
+        with mock.patch.object(brev, "list_jobs", return_value=[]):
+            with mock.patch.object(modal, "list_jobs", return_value=[]):
+                rc = _cli.main(["ps"])
+    out = capsys.readouterr()
+    assert "no runplz jobs running" in out.out
+    assert "local listing failed" in out.err
+    # rc=0 because at least one backend succeeded.
+    assert rc == 0
+
+
+def test_ps_cli_returns_1_only_when_all_backends_fail(capsys):
+    with mock.patch.object(local, "list_jobs", side_effect=RuntimeError("a")):
+        with mock.patch.object(brev, "list_jobs", side_effect=RuntimeError("b")):
+            with mock.patch.object(modal, "list_jobs", side_effect=RuntimeError("c")):
+                rc = _cli.main(["ps"])
+    out = capsys.readouterr()
+    assert "no runplz jobs running" not in out.out
+    assert rc == 1
 
 
 def test_ps_cli_back_compat_ssh_flag_still_works():

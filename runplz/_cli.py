@@ -354,9 +354,11 @@ def _ps_main(argv):
 
     rows = []
     errors = []
+    successes = 0
     for backend in backends:
         try:
             rows.extend(_collect_backend_jobs(backend))
+            successes += 1
         except Exception as exc:  # noqa: BLE001
             errors.append((backend, exc))
     for host in ssh_hosts:
@@ -364,14 +366,19 @@ def _ps_main(argv):
             from runplz.backends import ssh as ssh_backend
 
             rows.extend(ssh_backend.list_jobs(host=host))
+            successes += 1
         except Exception as exc:  # noqa: BLE001
             errors.append((f"ssh:{host}", exc))
 
-    if rows or not errors:
+    # Print the table whenever at least one backend was reachable. Suppress
+    # the "(no runplz jobs running)" line ONLY when every backend errored —
+    # otherwise an empty result from the working backends is real
+    # information the user asked for.
+    if rows or successes > 0:
         _print_ps_table(rows)
     for name, exc in errors:
         print(f"warning: {name} listing failed: {type(exc).__name__}: {exc}", file=sys.stderr)
-    return 1 if errors and not rows else 0
+    return 1 if errors and not rows and successes == 0 else 0
 
 
 def _collect_backend_jobs(backend: str) -> list[dict]:
