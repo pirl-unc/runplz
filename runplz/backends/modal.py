@@ -255,8 +255,10 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
             f"min_disk={function.min_disk!r} is not supported on the Modal backend. "
             f"Modal manages container storage; there is no per-function disk-size kwarg. "
             f"Options: (a) remove min_disk for this function on Modal, "
-            f"(b) mount a Modal Volume inside the function for large/durable storage, "
-            f"or (c) run this function on brev/local where min_disk maps to real capacity."
+            f"(b) mount a Modal Volume inside the function for large/durable storage "
+            f"(see the README's 'Large / persistent outputs on Modal' section for a "
+            f"worked example), or (c) run this function on brev/local where min_disk "
+            f"maps to real capacity."
         )
 
     entrypoint_src = _ENTRYPOINT_TEMPLATE.format(

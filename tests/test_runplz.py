@@ -456,6 +456,26 @@ def test_function_plain_call_raises_with_helpful_message():
     assert train.local() == "ran"  # local() still works
 
 
+def test_function_plain_call_error_uses_friendly_path(tmp_path, monkeypatch):
+    """3.15.1: prefer cwd-relative path, fall back to basename — bare absolute
+    paths obscure the actually-actionable suggestion in the error."""
+    monkeypatch.chdir(tmp_path)
+    app = App("t")
+
+    @app.function(image=_sample_image(), gpu="T4")
+    def train():
+        pass
+
+    # The Function's module_file is wherever this test lives — outside tmp_path,
+    # so the relative_to() lookup fails and we fall back to basename.
+    with pytest.raises(RuntimeError) as ei:
+        train()
+    msg = str(ei.value)
+    # Should NOT contain the absolute path's leading `/`.
+    assert "test_runplz.py" in msg
+    assert "/Users/" not in msg and "/home/" not in msg
+
+
 def test_remote_requires_backend_to_be_selected():
     app = App("t")
 
