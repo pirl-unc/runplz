@@ -6,7 +6,7 @@ meta path, and shells to ``ssh`` to fetch ``last.log`` /
 ``events.ndjson`` / ``heartbeat.ndjson``.
 
 This module owns nothing the dispatch path needs — it's pure consumer
-of the data persisted by ``_ssh_common`` so the CLI doesn't have to
+of the data persisted by ``ssh_common`` so the CLI doesn't have to
 remember run IDs or reconstruct ssh commands by hand (issue #57).
 """
 
@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from runplz.backends._ssh_common import (
+from runplz.backends.ssh_common import (
     REMOTE_META_DIRNAME,
     REMOTE_RUNS_DIR,
     _ssh_cmd_opts,

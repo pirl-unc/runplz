@@ -4,7 +4,7 @@ invocations. Issue #35.
 
 import pytest
 
-from runplz.backends import _ssh_common, brev
+from runplz.backends import brev, ssh_common
 
 
 def test_guard_blocks_real_brev_ls():
@@ -21,12 +21,12 @@ def test_guard_blocks_real_rsync_via_ssh_common():
     # The guard also covers the shared SSH plumbing — that's where every
     # real rsync/ssh call lives in the 3.5+ architecture.
     with pytest.raises(RuntimeError, match="tried to run `rsync`"):
-        _ssh_common.subprocess.run(["rsync", "-az", "src/", "box:dest/"], check=True)
+        ssh_common.subprocess.run(["rsync", "-az", "src/", "box:dest/"], check=True)
 
 
 def test_guard_blocks_real_ssh_via_ssh_common():
     with pytest.raises(RuntimeError, match="tried to run `ssh`"):
-        _ssh_common.subprocess.run(["ssh", "box", "echo hi"], check=True)
+        ssh_common.subprocess.run(["ssh", "box", "echo hi"], check=True)
 
 
 def test_guard_lets_unrelated_commands_through():

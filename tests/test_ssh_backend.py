@@ -141,24 +141,24 @@ def test_build_ssh_target_non_numeric_colon_suffix_kept_as_host():
 
 
 def test_ssh_cmd_opts_includes_dash_p_when_port_set():
-    from runplz.backends import _ssh_common
+    from runplz.backends import ssh_common
 
-    opts = _ssh_common._ssh_cmd_opts(port=2222)
+    opts = ssh_common._ssh_cmd_opts(port=2222)
     assert opts[-2:] == ["-p", "2222"]
     # Base opts are preserved.
     assert "ControlMaster=no" in opts
 
 
 def test_ssh_cmd_opts_omits_dash_p_when_port_none():
-    from runplz.backends import _ssh_common
+    from runplz.backends import ssh_common
 
-    assert "-p" not in _ssh_common._ssh_cmd_opts(port=None)
+    assert "-p" not in ssh_common._ssh_cmd_opts(port=None)
 
 
 def test_rsync_ssh_transport_includes_port():
-    from runplz.backends import _ssh_common
+    from runplz.backends import ssh_common
 
-    transport = _ssh_common._rsync_ssh_transport(port=2222)
+    transport = ssh_common._rsync_ssh_transport(port=2222)
     # -e string must survive shell parsing as ["ssh", ..., "-p", "2222"].
     import shlex as _shlex
 
@@ -169,11 +169,11 @@ def test_rsync_ssh_transport_includes_port():
 
 
 def test_rsync_up_threads_port_into_transport(tmp_path):
-    from runplz.backends import _ssh_common
+    from runplz.backends import ssh_common
 
     recorded = {}
-    with mock.patch("runplz.backends._ssh_common._sh", lambda c: recorded.setdefault("c", c)):
-        _ssh_common._rsync_up(tmp_path, "my-box", port=2222)
+    with mock.patch("runplz.backends.ssh_common._sh", lambda c: recorded.setdefault("c", c)):
+        ssh_common.rsync_up(tmp_path, "my-box", port=2222)
 
     cmd = recorded["c"]
     assert cmd[:2] == ["rsync", "-az"]
@@ -185,22 +185,22 @@ def test_rsync_up_threads_port_into_transport(tmp_path):
 
 
 def test_rsync_up_omits_transport_flag_when_no_port(tmp_path):
-    from runplz.backends import _ssh_common
+    from runplz.backends import ssh_common
 
     recorded = {}
-    with mock.patch("runplz.backends._ssh_common._sh", lambda c: recorded.setdefault("c", c)):
-        _ssh_common._rsync_up(tmp_path, "my-box", port=None)
+    with mock.patch("runplz.backends.ssh_common._sh", lambda c: recorded.setdefault("c", c)):
+        ssh_common.rsync_up(tmp_path, "my-box", port=None)
 
     # Without a port we don't set -e — rsync uses the system's default ssh.
     assert "-e" not in recorded["c"]
 
 
 def test_ssh_helper_threads_port(tmp_path):
-    from runplz.backends import _ssh_common
+    from runplz.backends import ssh_common
 
     recorded = {}
-    with mock.patch("runplz.backends._ssh_common._sh", lambda c: recorded.setdefault("c", c)):
-        _ssh_common._ssh("my-box", "echo hi", port=2222)
+    with mock.patch("runplz.backends.ssh_common._sh", lambda c: recorded.setdefault("c", c)):
+        ssh_common._ssh("my-box", "echo hi", port=2222)
 
     cmd = recorded["c"]
     assert cmd[0] == "ssh"
@@ -243,7 +243,7 @@ def test_ssh_run_end_to_end_passes_port_through_to_helpers(tmp_path):
         _warn_on_spec_mismatch=mock.DEFAULT,
         _prepare_remote_run=mock.DEFAULT,
         _ensure_remote_rsync=mock.DEFAULT,
-        _rsync_up=fake_rsync_up,
+        rsync_up=fake_rsync_up,
         _ensure_docker=mock.DEFAULT,
         _remote_has_nvidia=mock.Mock(return_value=False),
         _build_image=fake_build,
@@ -413,7 +413,7 @@ def test_ssh_run_vm_docker_happy_path(tmp_path):
         _warn_on_spec_mismatch=mock.DEFAULT,
         _prepare_remote_run=mock.DEFAULT,
         _ensure_remote_rsync=mock.DEFAULT,
-        _rsync_up=mock.DEFAULT,
+        rsync_up=mock.DEFAULT,
         _ensure_docker=mock.DEFAULT,
         _remote_has_nvidia=mock.Mock(return_value=True),
         _build_image=mock.DEFAULT,
@@ -436,7 +436,7 @@ def test_ssh_run_native_happy_path(tmp_path):
         _warn_on_spec_mismatch=mock.DEFAULT,
         _prepare_remote_run=mock.DEFAULT,
         _ensure_remote_rsync=mock.DEFAULT,
-        _rsync_up=mock.DEFAULT,
+        rsync_up=mock.DEFAULT,
         _remote_has_nvidia=mock.Mock(return_value=False),
         _run_native=mock.Mock(return_value=0),
         _rsync_down=mock.DEFAULT,
@@ -457,7 +457,7 @@ def test_ssh_run_nonzero_exit_raises_with_tail(tmp_path):
         _warn_on_spec_mismatch=mock.DEFAULT,
         _prepare_remote_run=mock.DEFAULT,
         _ensure_remote_rsync=mock.DEFAULT,
-        _rsync_up=mock.DEFAULT,
+        rsync_up=mock.DEFAULT,
         _ensure_docker=mock.DEFAULT,
         _remote_has_nvidia=mock.Mock(return_value=False),
         _build_image=mock.DEFAULT,
