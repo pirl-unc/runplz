@@ -328,8 +328,10 @@ def select_source_paths(repo: Path) -> Optional[tuple[str, ...]]:
 
     The selection is tracked files plus untracked files not matched by Git's
     normal ignore stack (repository, info/exclude, and global excludes).
-    Tracked paths deleted from the working tree are removed so rsync does not
-    fail trying to stage a file that intentionally no longer exists.
+    Tracked paths absent from the working tree (deleted or sparse) are removed
+    so rsync does not fail trying to stage them. Initialized submodules are
+    expanded through their own Git selections rather than copied as opaque
+    directories, preserving ignore behavior at every repository boundary.
 
     ``None`` means Git could not provide a selection; callers should fall back
     to their documented non-Git directory behavior. An empty tuple is a valid
@@ -345,22 +347,43 @@ def select_source_paths(repo: Path) -> Optional[tuple[str, ...]]:
         )
         if selected.returncode != 0:
             return None
-        deleted = subprocess.run(
-            [*base, "--deleted", "--", "."],
+        staged = subprocess.run(
+            [*base, "--stage", "--", "."],
             capture_output=True,
             timeout=30,
         )
-        if deleted.returncode != 0:
+        if staged.returncode != 0:
             return None
     except (OSError, subprocess.TimeoutExpired):
         return None
 
-    deleted_paths = {path for path in deleted.stdout.split(b"\0") if path}
-    paths = (
-        os.fsdecode(path)
-        for path in selected.stdout.split(b"\0")
-        if path and path not in deleted_paths
-    )
+    gitlinks = set()
+    for entry in staged.stdout.split(b"\0"):
+        metadata, separator, path = entry.partition(b"\t")
+        if separator and metadata.startswith(b"160000 ") and path:
+            gitlinks.add(path)
+
+    paths = []
+    for path in selected.stdout.split(b"\0"):
+        if not path or path in gitlinks:
+            continue
+        decoded = os.fsdecode(path)
+        if os.path.lexists(repo / decoded):
+            paths.append(decoded)
+
+    for gitlink in sorted(gitlinks):
+        prefix = os.fsdecode(gitlink)
+        submodule = repo / prefix
+        # An uninitialized submodule may exist as an empty directory. Requiring
+        # its own .git marker prevents Git from walking back up into the
+        # superproject and mistaking the gitlink for submodule contents.
+        if not os.path.lexists(submodule / ".git"):
+            continue
+        nested = select_source_paths(submodule)
+        if nested is None:
+            continue
+        paths.extend(f"{prefix}/{path}" for path in nested)
+
     return tuple(paths)
 
 
@@ -1243,6 +1266,38 @@ def build_detached_launcher(remote_run: RemoteRunContext, wrapped_command: str) 
     )
 
 
+def _detached_process_state_shell() -> str:
+    """Return shell that sets ``runplz_state`` for ``$runplz_pid``.
+
+    Brev container images can be minimal and need not include procps. Linux
+    ``/proc/<pid>/stat`` is available in the supported remote environments and
+    exposes zombie state directly. If procfs is unavailable, ``kill -0`` still
+    gives a conservative live/dead answer without making ``ps`` a dependency.
+    """
+
+    return (
+        'runplz_state="missing"; '
+        'if [ -n "$runplz_pid" ]; then '
+        '  if [ -r "/proc/$runplz_pid/stat" ]; then '
+        '    runplz_proc_stat=""; '
+        '    IFS= read -r runplz_proc_stat < "/proc/$runplz_pid/stat" || true; '
+        "    runplz_proc_tail=${runplz_proc_stat##*) }; "
+        "    runplz_proc_state=${runplz_proc_tail%% *}; "
+        '    case "$runplz_proc_state" in '
+        '      Z) runplz_state="zombie" ;; '
+        '      "") if kill -0 "$runplz_pid" 2>/dev/null; '
+        '          then runplz_state="running"; else runplz_state="dead"; fi ;; '
+        '      *) runplz_state="running" ;; '
+        "    esac; "
+        '  elif kill -0 "$runplz_pid" 2>/dev/null; then '
+        '    runplz_state="running"; '
+        "  else "
+        '    runplz_state="dead"; '
+        "  fi; "
+        "fi; "
+    )
+
+
 def build_detached_status_probe(pid_file: str, events_file: Optional[str] = None) -> str:
     """Build a remote probe that distinguishes running, dead, and zombie PIDs."""
 
@@ -1254,21 +1309,9 @@ def build_detached_status_probe(pid_file: str, events_file: Optional[str] = None
         )
     return (
         f"{started_probe}"
-        f'runplz_pid=$(cat "{pid_file}" 2>/dev/null || true); '
-        'runplz_state="missing"; '
-        'if [ -n "$runplz_pid" ]; then '
-        '  if ! kill -0 "$runplz_pid" 2>/dev/null; then '
-        '    runplz_state="dead"; '
-        "  else "
-        '    runplz_stat=$(ps -o stat= -p "$runplz_pid" 2>/dev/null '
-        "      | awk 'NR == 1 {print $1}'); "
-        '    case "$runplz_stat" in '
-        '      Z*) runplz_state="zombie" ;; '
-        '      "") runplz_state="unknown" ;; '
-        '      *) runplz_state="running" ;; '
-        "    esac; "
-        "  fi; "
-        "fi; "
+        'runplz_pid=""; '
+        f'if [ -r "{pid_file}" ]; then IFS= read -r runplz_pid < "{pid_file}" || true; fi; '
+        f"{_detached_process_state_shell()}"
         'printf \'%s %s %s\\n\' "$runplz_started" "$runplz_state" "$runplz_pid"'
     )
 
@@ -1361,12 +1404,12 @@ def detached_launch_diagnostics(
     pid_file = f"{meta}/bootstrap.pid"
     driver_log = f"{meta}/run_driver.log"
     command = (
-        f'runplz_pid=$(cat "{pid_file}" 2>/dev/null || true); '
+        'runplz_pid=""; '
+        f'if [ -r "{pid_file}" ]; then IFS= read -r runplz_pid < "{pid_file}" || true; fi; '
+        f"{_detached_process_state_shell()}"
         "printf '%s\\n' 'detached bootstrap diagnostics:'; "
         "printf 'pid: %s\\n' \"${runplz_pid:-missing}\"; "
-        'if [ -n "$runplz_pid" ]; then '
-        '  ps -o pid=,ppid=,stat=,etime=,command= -p "$runplz_pid" 2>/dev/null || true; '
-        "fi; "
+        "printf 'process state: %s\\n' \"$runplz_state\"; "
         "printf '%s\\n' 'recent events:'; "
         f'tail -n 10 "{remote_run.events_shell}" 2>/dev/null || true; '
         "printf '%s\\n' 'recent heartbeats:'; "
@@ -1382,7 +1425,8 @@ def build_detached_log_command(pid_file: str, log_file: str) -> str:
 
     return (
         "set -u; "
-        f'runplz_pid=$(cat "{pid_file}" 2>/dev/null || true); '
+        'runplz_pid=""; '
+        f'if [ -r "{pid_file}" ]; then IFS= read -r runplz_pid < "{pid_file}" || true; fi; '
         'if [ -z "$runplz_pid" ]; then exit 1; fi; '
         f'tail -n +1 -F "{log_file}" & '
         "runplz_tail_pid=$!; "
@@ -1392,10 +1436,8 @@ def build_detached_log_command(pid_file: str, log_file: str) -> str:
         "}; "
         "trap 'runplz_stop_tail' EXIT HUP INT TERM; "
         "while true; do "
-        '  if ! kill -0 "$runplz_pid" 2>/dev/null; then break; fi; '
-        '  runplz_stat=$(ps -o stat= -p "$runplz_pid" 2>/dev/null '
-        "    | awk 'NR == 1 {print $1}'); "
-        '  case "$runplz_stat" in Z*|"") break ;; esac; '
+        f"  {_detached_process_state_shell()}"
+        '  case "$runplz_state" in missing|dead|zombie) break ;; esac; '
         "  sleep 1; "
         "done; "
         # Give tail one final polling interval to flush lines written during
@@ -1464,7 +1506,12 @@ def launch_detached_and_wait(
         events_file,
         port=port,
     )
-    if not startup.started:
+    terminal_startup_failure = startup.process_state in {
+        DetachedProcessState.MISSING,
+        DetachedProcessState.DEAD,
+        DetachedProcessState.ZOMBIE,
+    }
+    if not startup.started and terminal_startup_failure:
         _record_remote_event(
             target,
             remote_run,
@@ -1480,6 +1527,12 @@ def launch_detached_and_wait(
             flush=True,
         )
         return 1
+    if not startup.started:
+        print(
+            f"+ detached bootstrap startup not yet confirmed on {target} "
+            f"(state={startup.process_state.value}); entering resilient monitoring",
+            flush=True,
+        )
 
     return tail_and_wait_for_detached(
         target=target,

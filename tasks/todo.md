@@ -29,6 +29,54 @@ Branch: `fix-ignored-staging-detached-bootstrap` (off `main` @ `9fd9a41`)
 - [x] Commit confirmed paths, push the branch, and open draft PR `#71` closing `#68`, `#69`,
   and `#70`
 
+### 2026-08-20 review-fix plan
+
+- [x] Keep `UNKNOWN` and live-but-not-started bootstrap states in detached reconnect monitoring;
+  fail startup only for explicit missing, dead, or zombie states
+- [x] Replace GNU `ps -o stat=` lifecycle checks with a shared `/proc/<pid>/stat` shell contract
+  that distinguishes zombies using only shell builtins and `kill -0`
+- [x] Exclude every selected Git path absent from the working tree, including sparse-checkout
+  skip-worktree entries, while preserving broken symlinks with `lexists`
+- [x] Parse superproject gitlinks and recursively prefix each initialized submodule's own
+  tracked-plus-nonignored-untracked selection; never pass an opaque gitlink directory to rsync
+- [x] Add regression tests for transient-SSH startup uncertainty, procps-free process probes,
+  sparse checkouts, initialized submodule ignores, and uninitialized submodules
+- [x] Run `./format.sh`, `./lint.sh`, and `./test.sh`
+- [x] Re-review the complete PR diff and repeat the fix/review cycle until no actionable findings
+  remain
+- [ ] Push fixes, wait for all PR CI jobs, mark PR #71 ready, merge it, update clean `main`, and run
+  `./deploy.sh` through PyPI upload plus tag push
+
+#### Review-fix design
+
+- Detached lifecycle:
+  - startup probing returns terminal failure only for `MISSING`, `DEAD`, or `ZOMBIE`; `RUNNING`
+    without an event and `UNKNOWN` both flow into `tail_and_wait_for_detached`
+  - generate one shared remote shell fragment that reads `/proc/$pid/stat`, extracts the state after
+    the final process-name parenthesis, and falls back to `kill -0` when `/proc` is unavailable
+  - the log follower stops only for explicit terminal state; an unavailable state source remains
+    conservative and the existing reconnect/runtime-cap logic stays authoritative
+
+- Git source selection:
+  - retain Git's cached-plus-nonignored-untracked selection, but require `os.path.lexists` before a
+    path reaches rsync so deleted and sparse-absent entries cannot produce stat failures
+  - query staged modes to identify `160000` gitlinks, remove those directory entries from the flat
+    selection, and recursively select initialized submodule contents with path prefixes
+  - omit uninitialized/absent submodules instead of recursively copying an opaque directory or
+    falling back to full-tree behavior that would bypass submodule ignores
+
+- Verification:
+  - build real temporary sparse worktrees and local submodules in public-contract tests
+  - assert generated lifecycle shell has `/proc` state parsing and no `ps` dependency
+  - prove unknown startup calls the reconnect monitor and never records launch failure
+
+#### Review-fix results
+
+- All four supplied review findings are addressed with regression coverage.
+- A second complete diff review found no additional actionable staging or lifecycle defects.
+- `./format.sh` and `./lint.sh` pass.
+- `./test.sh` passes (`451 passed`, 93% total coverage).
+
 ### Scope / design
 
 - Public SSH surface:
