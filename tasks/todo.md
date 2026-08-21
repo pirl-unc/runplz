@@ -26,7 +26,8 @@ Branch: `fix-ignored-staging-detached-bootstrap` (off `main` @ `9fd9a41`)
 - [x] Run `./lint.sh`
 - [x] Run `./test.sh`
 - [x] Review the final diff for minimal scope and compatibility
-- [ ] Commit confirmed paths, push the branch, and open a draft PR closing `#68` and `#69`
+- [x] Commit confirmed paths, push the branch, and open draft PR `#71` closing `#68`, `#69`,
+  and `#70`
 
 ### Scope / design
 
@@ -89,6 +90,7 @@ Branch: `fix-ignored-staging-detached-bootstrap` (off `main` @ `9fd9a41`)
   - `./test.sh` passed (`447 passed`, 93% total coverage)
   - targeted SSH/Brev/public-contract tests passed before the final full-suite cycle
   - final `git diff --check` passed
+  - draft PR opened: `pirl-unc/runplz#71`
 
 ## 2026-04-23 PR Plan — Remote Run Forensics + Brev Lifecycle Diagnostics
 
