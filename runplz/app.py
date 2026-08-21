@@ -87,7 +87,7 @@ class Function:
         # Preconditions: declarative remote-state requirements probed *after*
         # rsync_up but *before* bootstrap, so a misprovisioned box (small
         # /dev/shm, full disk, missing GPU) fails fast instead of wasting
-        # paid GPU minutes on a doomed run. See runplz/backends/_ssh_common.py
+        # paid GPU minutes on a doomed run. See runplz/backends/ssh_common.py
         # `_check_preconditions`. v1 keys: shm_gb, disk_free_gb, gpu_count,
         # gpu_memory_gb. Issue #56.
         self.preconditions = _normalize_preconditions(fn.__name__, preconditions)

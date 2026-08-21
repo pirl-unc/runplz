@@ -2,8 +2,8 @@
 
 Provides Brev CLI lifecycle (create / stop / delete / ls / refresh) +
 the instance-type picker. Everything else — rsync, ssh, docker build,
-stream-and-wait, failure-tail, runtime-cap — lives in
-`runplz/backends/_ssh_common.py` and is shared with the SSH backend.
+stream-and-wait, failure-tail, runtime-cap — lives in the public
+`runplz.backends.ssh_common` module and is shared with the SSH backend.
 
 Assumes `brev` CLI is installed and `brev login` has been run. Uses Brev's
 managed SSH config (`brev refresh` populates ~/.brev/ssh_config, which
@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from runplz._selector import Candidate
-from runplz.backends._ssh_common import (
+from runplz.backends.ssh_common import (
     FAILURE_TAIL_LINES,
     _build_image,
     _check_preconditions,
@@ -35,7 +35,6 @@ from runplz.backends._ssh_common import (
     _remote_has_nvidia,
     _render_ops_script,
     _rsync_down,
-    _rsync_up,
     _run_container_detached,
     _run_container_mode,
     _run_native,
@@ -47,6 +46,7 @@ from runplz.backends._ssh_common import (
     build_remote_run_manifest,
     make_container_name,
     make_remote_run_context,
+    rsync_up,
 )
 
 # Re-exports so older test patches and external code that patched these
@@ -269,10 +269,10 @@ def run(
                 # Pre-built container images (e.g. pytorch/pytorch) don't
                 # ship with rsync. Install it before the first rsync call.
                 _ensure_remote_rsync(instance)
-            _rsync_up(repo, instance, outputs_dir=outputs_dir, remote_run=remote_run)
+            rsync_up(repo, instance, outputs_dir=outputs_dir, remote_run=remote_run)
 
             # Probe declared remote preconditions (issue #56) before bootstrap.
-            # See _ssh_common._check_preconditions for the warn/fail rule.
+            # See ssh_common._check_preconditions for the warn/fail rule.
             _check_preconditions(instance, function.preconditions)
 
             rel_script = Path(function.module_file).resolve().relative_to(repo)

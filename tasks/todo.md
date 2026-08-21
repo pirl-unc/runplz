@@ -1,3 +1,95 @@
+## 2026-08-20 PR Plan — Git-Aware Staging + Reliable Detached Bootstrap (#68, #69)
+
+Branch: `fix-ignored-staging-detached-bootstrap` (off `main` @ `9fd9a41`)
+
+- [x] Move shared SSH behavior from private `_ssh_common` to public
+  `runplz.backends.ssh_common`, retaining a compatibility import for the old module path
+- [x] Add a public, Git-aware source-staging contract that selects tracked files plus intentional
+  untracked files while omitting ignored artifacts and deleted tracked paths
+- [x] Preserve the existing full-tree rsync behavior for directories that are not Git worktrees
+- [x] Report tracked dirtiness, intentional untracked inputs, and ignored artifacts separately in
+  remote run manifests
+- [x] Replace the non-portable `nohup setsid bash` launcher with a portable, PID-stable detached
+  `nohup bash` launcher whose stdin/stdout/stderr are fully redirected
+- [x] Add a bounded startup handshake that recognizes missing, dead, and zombie bootstrap PIDs
+  before entering log streaming
+- [x] Make detached log streaming terminate when the bootstrap exits or becomes a zombie, while
+  retaining SSH reconnect and runtime-cap behavior
+- [x] Include detached driver-log context in failure diagnostics and continue through normal output
+  download so the generated run directory is recoverable locally
+- [x] Add public-contract regression tests for ignored/untracked/tracked/deleted staging, manifest
+  state, portable launch construction, startup failure, zombie detection, and stream termination
+- [x] File the stale `test.sh` regression test discovered by the full suite as `#70` and update its
+  assertion to cover the configurable `PYTHON_BIN` module invocation
+- [x] Bump `runplz/version.py` for the PR
+- [x] Run `./format.sh`
+- [x] Run `./lint.sh`
+- [x] Run `./test.sh`
+- [x] Review the final diff for minimal scope and compatibility
+- [ ] Commit confirmed paths, push the branch, and open a draft PR closing `#68` and `#69`
+
+### Scope / design
+
+- Public SSH surface:
+  - make `runplz.backends.ssh_common` the canonical home of backend-agnostic SSH staging,
+    lifecycle, and transport behavior
+  - expose the new source-selection, repository-state, launcher-construction, and detached-state
+    contracts under public names so callers and tests do not need private imports
+  - leave a small `_ssh_common` compatibility module so existing imports do not break abruptly
+
+- Git-aware staging:
+  - ask Git for the union of cached/tracked paths and untracked, non-ignored paths
+  - subtract tracked paths deleted from the working tree, then pass the NUL-delimited selection to
+    rsync with `--files-from`, `--from0`, and explicit recursion
+  - keep the current noise, secret, and configured-output exclusions as defense in depth
+  - fall back to the current full-tree rsync command when the source is not a Git worktree or Git
+    cannot produce a selection
+  - parse porcelain Git status into separate `repo_dirty`, `repo_untracked`, and `repo_ignored`
+    manifest fields; `repo_dirty` will mean tracked modifications rather than ignored artifacts
+
+- Detached bootstrap:
+  - construct the launcher as `nohup bash <run.sh> </dev/null >>driver.log 2>&1 &`; `nohup` execs
+    bash without `setsid`'s fork/session-leader ambiguity, keeping `$!` tied to the bootstrap
+  - poll briefly for the first `remote_command_start` event; fail with process/event/driver-log
+    diagnostics if the PID is absent, dead, zombie, or never reaches the startup event
+  - make the remote log-tail command watch the PID state and stop its `tail -F` child when the job
+    is no longer live, so a dead launcher cannot block the client forever
+  - return a normal nonzero run status for launch failures so callers still rsync the per-run output
+    and metadata before applying Brev `on_finish`
+
+- Tests:
+  - initialize small temporary Git repositories to verify the exact public source-selection
+    semantics, including tracked files later covered by ignore rules
+  - exercise public launcher/process-state contracts with captured commands and representative
+    alive/dead/zombie/start-event responses
+  - retain backend orchestration tests for port propagation, rsync destinations, reconnect limits,
+    runtime caps, output download, and failure-tail behavior
+  - update the stale test-script assertion from issue `#70`; current `main` changed the runner to
+    `"$PYTHON_BIN" -m pytest` without updating the old hardcoded-string assertion
+
+### Review section
+
+- Implemented:
+  - public `runplz.backends.ssh_common` module with explicit supported exports and a compatibility
+    import at the former `_ssh_common` path
+  - Git-selected rsync input using tracked plus non-ignored untracked paths, minus working-tree
+    deletions; non-Git directories retain full-tree staging
+  - separate `repo_dirty`, `repo_untracked`, and `repo_ignored` manifest state
+  - portable `nohup bash` launcher without `setsid`, plus bounded startup-event verification
+  - zombie-aware process probes and a remote tail wrapper that stops when the bootstrap is no
+    longer live
+  - launch-failure diagnostics covering PID state, recent lifecycle events/heartbeats, driver log,
+    and bootstrap log while preserving the normal output download path
+  - user-facing staging documentation and version bump to `3.15.3`
+  - issue `#70` plus its narrow stale test-script assertion fix
+
+- Validation:
+  - `./format.sh` passed
+  - `./lint.sh` passed
+  - `./test.sh` passed (`447 passed`, 93% total coverage)
+  - targeted SSH/Brev/public-contract tests passed before the final full-suite cycle
+  - final `git diff --check` passed
+
 ## 2026-04-23 PR Plan — Remote Run Forensics + Brev Lifecycle Diagnostics
 
 - [x] Introduce a shared per-launch remote run context for SSH/Brev

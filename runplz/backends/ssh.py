@@ -10,8 +10,8 @@ endpoint — a bare hostname, a `user@host[:port]` URL, or an alias from
 your ~/.ssh/config. SshConfig.user / .port, when set, override the URL
 via ssh's -l / -p flags.
 
-This backend shares all the SSH plumbing with the brev backend via
-`runplz.backends._ssh_common`.
+This backend shares all the SSH plumbing with the brev backend via the
+public `runplz.backends.ssh_common` module.
 """
 
 import json
@@ -20,7 +20,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from runplz.backends._ssh_common import (
+from runplz.backends.ssh_common import (
     FAILURE_TAIL_LINES,
     _build_image,
     _check_preconditions,
@@ -31,7 +31,6 @@ from runplz.backends._ssh_common import (
     _prepare_remote_run,
     _remote_has_nvidia,
     _rsync_down,
-    _rsync_up,
     _run_container_detached,
     _run_native,
     _ssh_capture,
@@ -41,6 +40,7 @@ from runplz.backends._ssh_common import (
     build_remote_run_manifest,
     make_container_name,
     make_remote_run_context,
+    rsync_up,
 )
 
 __all__ = ["run", "list_jobs"]
@@ -77,7 +77,7 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
 
     # Make sure rsync is present before we try to upload.
     _ensure_remote_rsync(target, port=port)
-    _rsync_up(repo, target, outputs_dir=outputs_dir, remote_run=remote_run, port=port)
+    rsync_up(repo, target, outputs_dir=outputs_dir, remote_run=remote_run, port=port)
 
     # Probe declared remote preconditions (issue #56) before bootstrap so a
     # misprovisioned box (small /dev/shm, full disk, missing GPU) fails fast

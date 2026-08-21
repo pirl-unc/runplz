@@ -294,7 +294,15 @@ overcommit, etc.).
 
 ### What runplz does NOT ship to the remote
 
-To keep local secrets local, runplz excludes these patterns by default from every host → remote transfer (Brev's and SSH's `rsync_up`, plus Modal's image build context):
+For Brev and SSH launches from a Git worktree, runplz stages the files Git knows about plus
+untracked files that are not ignored. Repository, `.git/info/exclude`, and global Git ignore rules
+are honored, so ignored run artifacts and sibling output directories are not copied to the remote
+source snapshot. Directories outside a Git worktree retain full-tree staging with the exclusions
+below.
+
+To keep local secrets local, runplz also excludes these patterns by default from every host →
+remote transfer (Brev's and SSH's `rsync_up`, plus Modal's image build context), even if Git would
+otherwise select them:
 
 `.env`, `.env.local`, `.env.*.local`, `.env.production`, `.env.development`, `*.pem`, `*.key`, `id_rsa`, `id_rsa.*`, `id_ed25519`, `id_ed25519.*`, `credentials.json`, `.aws`, `.ssh`, `.netrc`, `.git-credentials`
 
