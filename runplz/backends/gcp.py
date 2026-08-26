@@ -21,6 +21,7 @@ from runplz.backends.provisioning import (
     apply_teardown,
     gpu_count,
     make_instance_name,
+    pick_shape,
     resolve_gpu_label,
     run_cli,
 )
@@ -41,6 +42,8 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
         flush=True,
     )
 
+    created = {"ok": False}
+
     def provision():
         run_cli(
             build_create_command(
@@ -54,10 +57,20 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
             timeout=900,
             dry_run=cfg.dry_run,
         )
+        created["ok"] = True
         _config_ssh(cfg)
         return (ssh_alias(cfg, name), None)
 
     def teardown():
+        # run_on_provisioned_vm always calls teardown, including when
+        # provision() died before the create landed. Deleting a name that
+        # was never created would warn about a phantom billing leak.
+        if not created["ok"]:
+            print(
+                f"+ on_finish={cfg.on_finish}: {name} was never created; nothing to tear down.",
+                flush=True,
+            )
+            return
         apply_on_finish(cfg, name)
 
     if cfg.dry_run:
@@ -104,23 +117,39 @@ def resolve_shape(cfg, function) -> tuple:
 
     if cfg.machine_type:
         accelerator = cfg.accelerator
-        if accelerator is None and label and not _has_builtin_gpus(cfg.machine_type):
-            accelerator, _family, _vram = GCP_GPUS[label]
+        if _has_builtin_gpus(cfg.machine_type):
+            # a2/a3/g2 ship their accelerators attached. Passing
+            # --accelerator on top is rejected by GCE, so drop it even when
+            # the user set one explicitly — which is what the config says
+            # happens ("ignored when the machine type has GPUs built in").
+            if accelerator:
+                print(
+                    f"+ gcp: ignoring accelerator={accelerator!r} — "
+                    f"{cfg.machine_type} already includes its GPUs",
+                    flush=True,
+                )
+            return (cfg.machine_type, None)
+        if accelerator is None and label:
+            accelerator = GCP_GPUS[label].accelerator
         return (cfg.machine_type, _accelerator_value(accelerator, count))
 
     if label is None:
-        # CPU-only run. n2-standard scales cleanly with min_cpu.
+        # CPU-only run. n2-standard scales cleanly with cpu/memory asks.
         return (f"n2-standard-{_cpu_size(function)}", None)
 
-    accel, family, _vram = GCP_GPUS[label]
-    if family in ("a2-highgpu", "a2-ultragpu", "a3-highgpu"):
-        # A2/A3 shapes ship their accelerators attached; asking for
-        # --accelerator on top of them is an error, not a no-op.
-        return (f"{family}-{count}g", None)
-    if family == "g2-standard":
-        # L4 shapes bundle the GPU too; vCPUs scale with GPU count.
-        return (f"g2-standard-{4 * count}", None)
-    return (f"{family}-{max(8, 4 * count)}", _accelerator_value(cfg.accelerator or accel, count))
+    entry = GCP_GPUS[label]
+    if entry.shapes is not None:
+        # Bundled-GPU family: the machine type carries the count, and
+        # --accelerator must not be sent alongside it.
+        return (pick_shape(label, count, GCP_GPUS, cloud="GCE"), None)
+    # Attachable accelerator (T4/V100 on n1). vCPUs are independent of GPU
+    # count here, so size them from the function's cpu/memory request.
+    # 8 vCPUs is the long-standing floor for these boxes; cpu/memory asks
+    # and GPU count can only push it up.
+    return (
+        f"{entry.family}-{max(8, 4 * count, _cpu_size(function))}",
+        _accelerator_value(cfg.accelerator or entry.accelerator, count),
+    )
 
 
 def _has_builtin_gpus(machine_type: str) -> bool:
@@ -134,10 +163,16 @@ def _accelerator_value(accelerator: Optional[str], count: int) -> Optional[str]:
 
 
 def _cpu_size(function) -> int:
-    """Round a min_cpu request up to a valid n2-standard size."""
-    want = int(getattr(function, "min_cpu", None) or 2)
+    """Round the cpu/memory request up to a valid n2-standard size.
+
+    n2-standard-N gives N vCPUs and 4N GB of RAM, so `min_memory` constrains
+    the size just as `min_cpu` does — the configs document both as inputs.
+    """
+    want_cpu = float(getattr(function, "min_cpu", None) or 0) or 2
+    want_mem = float(getattr(function, "min_memory", None) or 0)
+    need = max(want_cpu, want_mem / 4.0)
     for size in (2, 4, 8, 16, 32, 48, 64, 80, 96, 128):
-        if size >= want:
+        if size >= need:
             return size
     return 128
 

@@ -44,7 +44,10 @@ def test_backends_reach_the_shared_layer_by_its_public_names():
     from pathlib import Path
 
     offenders = []
-    backends = Path("runplz/backends")
+    # Anchored on this file, not the CWD: a CWD-relative glob finds nothing
+    # when pytest runs from anywhere else and the check passes vacuously.
+    backends = Path(__file__).resolve().parents[1] / "runplz" / "backends"
+    assert backends.is_dir(), backends
     for path in sorted(backends.glob("*.py")):
         if path.name in ("ssh_common.py", "_ssh_common.py"):
             continue  # ssh_common's own internals; the shim delegates wholesale

@@ -35,10 +35,6 @@ META_FILENAME = "run.json"
 # from 0 (stopped) and from ssh / protocol failures.
 KILL_SURVIVED_RC = 3
 
-# Run ids are generated as <ts>-<slug>-<slug>-<hex>, but --run-id is user
-# input and lands inside a remote shell command, so pin it to a charset that
-# cannot break out of the path it is interpolated into.
-
 
 class ManifestNotFound(RuntimeError):
     """Raised when no local run manifest can be located."""

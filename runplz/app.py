@@ -204,11 +204,13 @@ class App:
         host: Optional[str] = None,
         outputs_dir: str = "out",
         build: bool = True,
+        repo_root: Optional[Path] = None,
     ) -> "App":
         """Attach a backend to this App from pure Python, no CLI needed.
 
         Args:
-          backend: "local", "brev", "ssh", or "modal".
+          backend: one of `runplz.backends.registry.names()` — currently
+            local, brev, modal, ssh, gcp, aws.
           instance: required for `backend="brev"`; rejected for others.
           host: required for `backend="ssh"`; rejected for others. The
             ssh endpoint (hostname, user@host, or an ssh config alias).
@@ -216,6 +218,10 @@ class App:
           build: local-only. `False` skips `docker build` and reuses the last
             tagged image. Rejected for non-local backends (Brev rebuilds on
             the remote; Modal manages its own layer cache).
+          repo_root: skip the git lookup and use this. The CLI knows the
+            script being run, which is more authoritative than the module a
+            function happens to be defined in — and it saves a second
+            `git rev-parse`.
 
         Use from a `if __name__ == "__main__":` guard in your script:
 
@@ -262,8 +268,11 @@ class App:
                 "App.bind() needs at least one @app.function() declared so we "
                 "can locate the script's repo root."
             )
-        any_fn = next(iter(self.functions.values()))
-        self._repo_root = _repo_root_for(Path(any_fn.module_file))
+        if repo_root is not None:
+            self._repo_root = repo_root
+        else:
+            any_fn = next(iter(self.functions.values()))
+            self._repo_root = _repo_root_for(Path(any_fn.module_file))
         self._backend = backend
         self._backend_kwargs = {"outputs_dir": outputs_dir}
         # Which selector each backend takes comes from the registry too, so

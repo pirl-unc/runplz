@@ -32,3 +32,6 @@ htmlcov/
 # Claude Code
 .claude/
 artifacts/
+
+# Stray file a test used to drop here (see tests/test_cloud_backends.py).
+/job.py

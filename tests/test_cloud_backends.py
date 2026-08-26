@@ -129,11 +129,14 @@ def test_gcp_machine_type_derived_from_gpu(tmp_path, spec, expect_machine):
     assert machine == expect_machine
 
 
-def test_gcp_bundled_gpu_shapes_do_not_also_request_an_accelerator():
+def test_gcp_bundled_gpu_shapes_do_not_also_request_an_accelerator(tmp_path):
     """a2/a3/g2 ship their GPUs attached; --accelerator on top is an error."""
-    for spec in ({"gpu": "A100-80GB", "min_gpus": 8}, {"gpu": "H100"}, {"gpu": "L4"}):
-        app = App("x", gcp_config=_gcp())
-        app._repo_root = Path(".")
+    for spec in (
+        {"gpu": "A100-80GB", "min_gpus": 8},
+        {"gpu": "H100", "min_gpus": 8},
+        {"gpu": "L4"},
+    ):
+        app = _app(tmp_path, gcp_config=_gcp())
         fn = _function(app, **spec)
         _machine, accel = gcp.resolve_shape(app.gcp_config, fn)
         assert accel is None, spec
@@ -200,7 +203,7 @@ def test_aws_instance_type_derived_from_gpu(tmp_path, spec, expect):
 def test_aws_rejects_an_impossible_gpu_count_before_ec2_does(tmp_path):
     app = _app(tmp_path, aws_config=_aws())
     fn = _function(app, gpu="H100", min_gpus=2)
-    with pytest.raises(provisioning.CloudCliError, match="only exists as an 8-GPU shape"):
+    with pytest.raises(provisioning.CloudCliError, match=r"sells H100 in \[8\] GPU counts"):
         aws.resolve_instance_type(app.aws_config, fn)
 
 
@@ -513,3 +516,167 @@ def test_brev_and_cloud_backends_share_one_naming_contract():
 
     assert brev._make_ephemeral_name is provisioning.make_instance_name
     assert brev._split_ephemeral_name is provisioning.split_instance_name
+
+
+# ---------------------------------------------------------------------------
+# machine types are real, and carry the GPU count that was asked for
+#
+# The first cut derived them arithmetically, which invented p3.xlarge and
+# g4dn.24xlarge (neither exists) and — worse, because it launches — mapped
+# min_gpus=8 onto g5.24xlarge and g2-standard-32, which carry 4 and 1 GPUs.
+
+
+@pytest.mark.parametrize(
+    "gpu,count,expect",
+    [
+        ("V100", 1, "p3.2xlarge"),
+        ("V100", 4, "p3.8xlarge"),
+        ("V100", 8, "p3.16xlarge"),
+        ("T4", 1, "g4dn.xlarge"),
+        ("T4", 4, "g4dn.12xlarge"),
+        ("A10G", 8, "g5.48xlarge"),
+        ("L40S", 4, "g6e.12xlarge"),
+        ("H100", 8, "p5.48xlarge"),
+    ],
+)
+def test_aws_instance_types_exist_and_carry_the_requested_gpus(tmp_path, gpu, count, expect):
+    app = _app(tmp_path, aws_config=_aws())
+    fn = _function(app, gpu=gpu, min_gpus=count)
+    assert aws.resolve_instance_type(app.aws_config, fn) == expect
+
+
+@pytest.mark.parametrize(
+    "gpu,count,expect",
+    [
+        ("H100", 8, "a3-highgpu-8g"),
+        ("A100-40GB", 2, "a2-highgpu-2g"),
+        ("A100-80GB", 8, "a2-ultragpu-8g"),
+        ("L4", 1, "g2-standard-4"),
+        ("L4", 2, "g2-standard-24"),
+        ("L4", 4, "g2-standard-48"),
+        ("L4", 8, "g2-standard-96"),
+    ],
+)
+def test_gcp_machine_types_exist_and_carry_the_requested_gpus(tmp_path, gpu, count, expect):
+    app = _app(tmp_path, gcp_config=_gcp())
+    fn = _function(app, gpu=gpu, min_gpus=count)
+    machine, _accel = gcp.resolve_shape(app.gcp_config, fn)
+    assert machine == expect
+
+
+@pytest.mark.parametrize(
+    "gpu,count",
+    [("H100", 1), ("H100", 2), ("A100-40GB", 3), ("L4", 3), ("T4", 2)],
+)
+def test_gcp_refuses_a_gpu_count_the_family_does_not_sell(tmp_path, gpu, count):
+    """Better than a fabricated name that gcloud rejects — or worse, accepts."""
+    app = _app(tmp_path, gcp_config=_gcp())
+    fn = _function(app, gpu=gpu, min_gpus=count)
+    entry = provisioning.GCP_GPUS[gpu]
+    if entry.shapes is None or count in entry.shapes:
+        pytest.skip("this count is sold")
+    with pytest.raises(provisioning.CloudCliError, match="GPU counts"):
+        gcp.resolve_shape(app.gcp_config, fn)
+
+
+@pytest.mark.parametrize("gpu,count", [("H100", 2), ("A100-40GB", 4), ("T4", 3)])
+def test_aws_refuses_a_gpu_count_the_family_does_not_sell(tmp_path, gpu, count):
+    app = _app(tmp_path, aws_config=_aws())
+    fn = _function(app, gpu=gpu, min_gpus=count)
+    if count in provisioning.AWS_GPUS[gpu].shapes:
+        pytest.skip("this count is sold")
+    with pytest.raises(provisioning.CloudCliError, match="GPU counts"):
+        aws.resolve_instance_type(app.aws_config, fn)
+
+
+def test_min_memory_sizes_the_box_on_both_clouds(tmp_path):
+    """Both configs document min_memory as an input; it used to be ignored."""
+    gapp = _app(tmp_path, gcp_config=_gcp())
+    gfn = _function(gapp, min_memory=256)
+    machine, _ = gcp.resolve_shape(gapp.gcp_config, gfn)
+    assert machine == "n2-standard-64", "n2-standard gives 4GB per vCPU"
+
+    aapp = App("x", aws_config=_aws())
+    aapp._repo_root = tmp_path
+
+    @aapp.function(image=Image.from_registry("ubuntu:22.04"), min_memory=128)
+    def big():
+        pass
+
+    big.module_file = str(tmp_job(tmp_path))
+    assert aws.resolve_instance_type(aapp.aws_config, big) == "m6i.8xlarge"
+
+
+def test_explicit_accelerator_is_dropped_on_a_bundled_gpu_shape(tmp_path, capsys):
+    """GCE rejects --accelerator on a2/a3/g2; the config says it is ignored."""
+    cfg = _gcp(machine_type="a2-highgpu-1g", accelerator="nvidia-tesla-a100")
+    app = _app(tmp_path, gcp_config=cfg)
+    fn = _function(app, gpu="A100-40GB")
+    machine, accel = gcp.resolve_shape(cfg, fn)
+    assert machine == "a2-highgpu-1g"
+    assert accel is None
+    assert "already includes its GPUs" in capsys.readouterr().out
+
+
+def test_pinned_gpu_instance_type_still_gets_the_gpu_ami(tmp_path):
+    """Without gpu=, an explicit g5 shape used to get a driverless AMI."""
+    cfg = _aws(instance_type="g5.12xlarge")
+    app = _app(tmp_path, aws_config=cfg)
+    fn = _function(app)  # no gpu= at all
+    with mock.patch.object(provisioning.subprocess, "run") as run_mock:
+        run_mock.return_value = mock.Mock(returncode=0, stdout="ami-gpu\n", stderr="")
+        aws.resolve_ami(cfg, fn)
+    assert "deeplearning" in " ".join(run_mock.call_args.args[0])
+
+
+def test_user_supplied_ami_gets_no_block_device_mapping(tmp_path, capsys):
+    """Naming the wrong root device attaches a stray second volume."""
+    cfg = _aws(ami="ami-custom")
+    app = _app(tmp_path, aws_config=cfg)
+    fn = _function(app, min_disk=500)
+    cmd = aws.build_run_instances_command(
+        cfg, fn, name="b", instance_type="m6i.large", ami="ami-custom", root_device=None
+    )
+    assert "--block-device-mappings" not in cmd
+    assert "cannot tell the root device name" in capsys.readouterr().out
+
+
+def test_resolved_ami_still_pins_delete_on_termination(tmp_path):
+    cfg = _aws()
+    app = _app(tmp_path, aws_config=cfg)
+    fn = _function(app, min_disk=200)
+    cmd = aws.build_run_instances_command(
+        cfg,
+        fn,
+        name="b",
+        instance_type="m6i.large",
+        ami="ami-1",
+        root_device=aws.DEFAULT_ROOT_DEVICE,
+    )
+    mapping = json.loads(cmd[cmd.index("--block-device-mappings") + 1])
+    assert mapping[0]["DeviceName"] == aws.DEFAULT_ROOT_DEVICE
+    assert mapping[0]["Ebs"]["DeleteOnTermination"] is True
+
+
+def test_gcp_teardown_skips_a_vm_that_was_never_created(tmp_path, capsys):
+    """Teardown is unconditional now; it must not delete a phantom."""
+    cfg = _gcp()
+    app = _app(tmp_path, gcp_config=cfg)
+    fn = _function(app, gpu="T4")
+
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(list(cmd))
+        if "create" in cmd:
+            return mock.Mock(returncode=1, stdout="", stderr="QUOTA_EXCEEDED")
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch.object(provisioning.subprocess, "run", fake_run):
+        with pytest.raises(provisioning.CloudCliError):
+            gcp.run(app, fn, [], {})
+
+    assert not any("delete" in c for c in calls), "deleted a VM that never existed"
+    out = capsys.readouterr().out
+    assert "was never created" in out
+    assert "still be billing" not in out, "phantom billing-leak warning"

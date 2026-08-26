@@ -18,7 +18,7 @@ import re
 import shlex
 import subprocess
 import uuid
-from typing import Optional
+from typing import NamedTuple, Optional
 
 __all__ = [
     "CloudCliError",
@@ -30,10 +30,12 @@ __all__ = [
     "run_cli",
     "render_command",
     # Choosing a machine for a function's resource request.
+    "GpuShapes",
     "GCP_GPUS",
     "AWS_GPUS",
     "resolve_gpu_label",
     "gpu_count",
+    "pick_shape",
     # Giving the machine back.
     "apply_teardown",
 ]
@@ -162,27 +164,77 @@ def run_cli(
 # explicitly defers the cost-minimising selector. Users who want an exact
 # shape pass machine_type / instance_type and skip all of this.
 
-# Function.gpu label -> (gcp accelerator, gcp machine family, vram GB)
+
+class GpuShapes(NamedTuple):
+    """What one GPU model looks like on one provider."""
+
+    # GCP needs an accelerator name for shapes that don't bundle a GPU.
+    # AWS has no equivalent, so it is None there.
+    accelerator: Optional[str]
+    family: str
+    vram_gb: int
+    # GPU count -> the exact machine type that sells it. None means the
+    # family takes a separately-attached accelerator instead.
+    shapes: Optional[dict]
+
+
+# Machine types are enumerated, never derived. Arithmetic gets this wrong in
+# two different ways: `f"{family}.xlarge"` invents p3.xlarge and
+# g4dn.24xlarge, which do not exist, and g2-standard's numeric suffix is
+# vCPUs rather than GPUs, so `4 * count` names a real machine that quietly
+# carries one GPU instead of the eight that were asked for.
 GCP_GPUS = {
-    "T4": ("nvidia-tesla-t4", "n1-standard", 16),
-    "V100": ("nvidia-tesla-v100", "n1-standard", 16),
-    "L4": ("nvidia-l4", "g2-standard", 24),
-    "A100-40GB": ("nvidia-tesla-a100", "a2-highgpu", 40),
-    "A100-80GB": ("nvidia-a100-80gb", "a2-ultragpu", 80),
-    "H100": ("nvidia-h100-80gb", "a3-highgpu", 80),
+    "T4": GpuShapes("nvidia-tesla-t4", "n1-standard", 16, None),
+    "V100": GpuShapes("nvidia-tesla-v100", "n1-standard", 16, None),
+    "L4": GpuShapes(
+        "nvidia-l4",
+        "g2-standard",
+        24,
+        {1: "g2-standard-4", 2: "g2-standard-24", 4: "g2-standard-48", 8: "g2-standard-96"},
+    ),
+    "A100-40GB": GpuShapes(
+        "nvidia-tesla-a100",
+        "a2-highgpu",
+        40,
+        {1: "a2-highgpu-1g", 2: "a2-highgpu-2g", 4: "a2-highgpu-4g", 8: "a2-highgpu-8g"},
+    ),
+    "A100-80GB": GpuShapes(
+        "nvidia-a100-80gb",
+        "a2-ultragpu",
+        80,
+        {1: "a2-ultragpu-1g", 2: "a2-ultragpu-2g", 4: "a2-ultragpu-4g", 8: "a2-ultragpu-8g"},
+    ),
+    "H100": GpuShapes("nvidia-h100-80gb", "a3-highgpu", 80, {8: "a3-highgpu-8g"}),
 }
 
-# Function.gpu label -> (aws instance family, vram GB)
 AWS_GPUS = {
-    "T4": ("g4dn", 16),
-    "V100": ("p3", 16),
-    "A10G": ("g5", 24),
-    "L4": ("g6", 24),
-    "L40S": ("g6e", 48),
-    "A100-40GB": ("p4d", 40),
-    "A100-80GB": ("p4de", 80),
-    "H100": ("p5", 80),
+    "T4": GpuShapes(None, "g4dn", 16, {1: "g4dn.xlarge", 4: "g4dn.12xlarge", 8: "g4dn.metal"}),
+    "V100": GpuShapes(None, "p3", 16, {1: "p3.2xlarge", 4: "p3.8xlarge", 8: "p3.16xlarge"}),
+    "A10G": GpuShapes(None, "g5", 24, {1: "g5.xlarge", 4: "g5.12xlarge", 8: "g5.48xlarge"}),
+    "L4": GpuShapes(None, "g6", 24, {1: "g6.xlarge", 4: "g6.12xlarge", 8: "g6.48xlarge"}),
+    "L40S": GpuShapes(None, "g6e", 48, {1: "g6e.xlarge", 4: "g6e.12xlarge", 8: "g6e.48xlarge"}),
+    "A100-40GB": GpuShapes(None, "p4d", 40, {8: "p4d.24xlarge"}),
+    "A100-80GB": GpuShapes(None, "p4de", 80, {8: "p4de.24xlarge"}),
+    "H100": GpuShapes(None, "p5", 80, {8: "p5.48xlarge"}),
 }
+
+
+def pick_shape(label: str, count: int, table: dict, *, cloud: str) -> str:
+    """Return the machine type selling exactly `count` of `label`'s GPU.
+
+    Refuses a count the family does not offer rather than fabricating a name:
+    a wrong-but-plausible type either fails deep inside the provider CLI or,
+    worse, launches a box with fewer GPUs than the job asked for.
+    """
+    shapes = table[label].shapes
+    if shapes is None:
+        raise KeyError(label)
+    if count not in shapes:
+        raise CloudCliError(
+            f"{cloud} sells {label} in {sorted(shapes)} GPU counts, not {count}. "
+            f"Pass an explicit machine type to use a shape runplz doesn't know."
+        )
+    return shapes[count]
 
 
 def resolve_gpu_label(function, table: dict) -> Optional[str]:
@@ -208,11 +260,13 @@ def resolve_gpu_label(function, table: dict) -> Optional[str]:
     need_vram = getattr(function, "min_gpu_memory", None)
     if not need_vram:
         return None
-    fitting = sorted((vram, name) for name, (*_rest, vram) in table.items() if vram >= need_vram)
+    fitting = sorted(
+        (entry.vram_gb, name) for name, entry in table.items() if entry.vram_gb >= need_vram
+    )
     if not fitting:
         raise CloudCliError(
             f"min_gpu_memory={need_vram} GB exceeds every GPU runplz knows "
-            f"for this cloud (largest: {max(v for *_r, v in table.values())} GB)."
+            f"for this cloud (largest: {max(e.vram_gb for e in table.values())} GB)."
         )
     return fitting[0][1]
 

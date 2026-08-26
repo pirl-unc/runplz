@@ -20,6 +20,7 @@ from runplz.backends.provisioning import (
     apply_teardown,
     gpu_count,
     make_instance_name,
+    pick_shape,
     resolve_gpu_label,
     run_cli,
 )
@@ -33,6 +34,8 @@ _DLAMI_SSM_PARAM = (
     "/aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id"
 )
 # CPU-only runs don't need the (large, GPU-driver-laden) DLAMI.
+# Both AMIs runplz resolves are Ubuntu-based and root on /dev/sda1.
+DEFAULT_ROOT_DEVICE = "/dev/sda1"
 _UBUNTU_SSM_PARAM = (
     "/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id"
 )
@@ -68,7 +71,13 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
         ami = cfg.ami or resolve_ami(cfg, function)
         created = run_cli(
             build_run_instances_command(
-                cfg, function, name=name, instance_type=instance_type, ami=ami
+                cfg,
+                function,
+                name=name,
+                instance_type=instance_type,
+                ami=ami,
+                # Known only for the AMIs runplz resolves itself.
+                root_device=None if cfg.ami else DEFAULT_ROOT_DEVICE,
             ),
             label=f"aws ec2 run-instances ({name})",
             timeout=900,
@@ -115,40 +124,48 @@ def resolve_instance_type(cfg, function) -> str:
         return cfg.instance_type
 
     label = resolve_gpu_label(function, AWS_GPUS)
-    count = gpu_count(function)
     if label is None:
         return f"m6i.{_cpu_size_name(function)}"
-
-    family, _vram = AWS_GPUS[label]
-    # The big multi-GPU shapes come in exactly one size each; asking for a
-    # count they don't offer is better rejected here than by EC2.
-    fixed = {"p4d": "p4d.24xlarge", "p4de": "p4de.24xlarge", "p5": "p5.48xlarge"}
-    if family in fixed:
-        if count not in (1, 8):
-            raise CloudCliError(
-                f"{family} only exists as an 8-GPU shape ({fixed[family]}); "
-                f"min_gpus={count} cannot be satisfied. Pass an explicit "
-                f"instance_type to override."
-            )
-        return fixed[family]
-    if count == 1:
-        return f"{family}.xlarge"
-    if count <= 4:
-        return f"{family}.12xlarge"
-    return f"{family}.24xlarge"
+    return pick_shape(label, gpu_count(function), AWS_GPUS, cloud="EC2")
 
 
 def _cpu_size_name(function) -> str:
-    want = int(getattr(function, "min_cpu", None) or 2)
-    for size, name in ((2, "large"), (4, "xlarge"), (8, "2xlarge"), (16, "4xlarge")):
-        if size >= want:
+    """Round the cpu/memory request up to an m6i size.
+
+    m6i.<size> gives 4 GB of RAM per vCPU, so `min_memory` constrains the
+    size just as `min_cpu` does — the config documents both as inputs.
+    """
+    want_cpu = float(getattr(function, "min_cpu", None) or 0) or 2
+    want_mem = float(getattr(function, "min_memory", None) or 0)
+    need = max(want_cpu, want_mem / 4.0)
+    for vcpus, name in (
+        (2, "large"),
+        (4, "xlarge"),
+        (8, "2xlarge"),
+        (16, "4xlarge"),
+        (32, "8xlarge"),
+        (48, "12xlarge"),
+        (64, "16xlarge"),
+    ):
+        if vcpus >= need:
             return name
-    return "8xlarge"
+    return "32xlarge"
+
+
+def instance_type_has_gpu(instance_type: str) -> bool:
+    """True when an EC2 instance type is a GPU shape."""
+    family = (instance_type or "").split(".", 1)[0]
+    return any(family == entry.family for entry in AWS_GPUS.values())
 
 
 def resolve_ami(cfg, function) -> str:
     """Resolve the current Deep Learning (or plain Ubuntu) AMI via SSM."""
+    # Follow the instance type we are actually launching, not just the
+    # function's gpu= field: an explicitly pinned GPU instance_type with no
+    # gpu= would otherwise get a driverless Ubuntu AMI and run on CPU.
     wants_gpu = bool(getattr(function, "gpu", None) or getattr(function, "min_gpu_memory", None))
+    if not wants_gpu:
+        wants_gpu = instance_type_has_gpu(resolve_instance_type(cfg, function))
     param = _DLAMI_SSM_PARAM if wants_gpu else _UBUNTU_SSM_PARAM
     result = run_cli(
         [
@@ -180,7 +197,9 @@ def resolve_ami(cfg, function) -> str:
     return ami
 
 
-def build_run_instances_command(cfg, function, *, name, instance_type, ami) -> list:
+def build_run_instances_command(
+    cfg, function, *, name, instance_type, ami, root_device=None
+) -> list:
     """Assemble the `aws ec2 run-instances` argv."""
     cmd = [
         "aws",
@@ -211,20 +230,35 @@ def build_run_instances_command(cfg, function, *, name, instance_type, ami) -> l
         cmd += ["--iam-instance-profile", f"Name={cfg.iam_instance_profile}"]
 
     volume_gb = cfg.volume_gb or getattr(function, "min_disk", None)
-    # Always send an explicit mapping, even at the AMI's default size: it is
-    # what pins DeleteOnTermination, which is what makes on_finish="delete"
-    # actually take the disk with it instead of leaving a billed EBS volume.
-    cmd += [
-        "--block-device-mappings",
-        (
-            "[{"
-            '"DeviceName":"/dev/sda1",'
-            '"Ebs":{'
-            + (f'"VolumeSize":{int(volume_gb)},' if volume_gb else "")
-            + '"DeleteOnTermination":true,"VolumeType":"gp3"'
-            "}}]"
-        ),
-    ]
+    # The mapping is what pins DeleteOnTermination, so on_finish="delete"
+    # takes the disk rather than leaving a billed EBS volume behind.
+    #
+    # It only works when DeviceName matches the AMI's actual root device:
+    # naming the wrong one attaches a *second* volume and leaves the real
+    # root on the AMI's own settings. We know the device for the Deep
+    # Learning / Ubuntu AMIs runplz resolves; for a user-supplied `ami=` we
+    # don't, so send nothing rather than silently attaching a stray disk.
+    if cfg.ami and root_device is None:
+        if volume_gb:
+            print(
+                f"+ warning: ignoring disk size {int(volume_gb)}GB — runplz "
+                f"cannot tell the root device name of a user-supplied AMI "
+                f"({cfg.ami}). Bake the size into the AMI, or drop ami= to "
+                f"let runplz resolve one.",
+                flush=True,
+            )
+    else:
+        cmd += [
+            "--block-device-mappings",
+            (
+                "[{"
+                f'"DeviceName":"{root_device or DEFAULT_ROOT_DEVICE}",'
+                '"Ebs":{'
+                + (f'"VolumeSize":{int(volume_gb)},' if volume_gb else "")
+                + '"DeleteOnTermination":true,"VolumeType":"gp3"'
+                "}}]"
+            ),
+        ]
     if cfg.spot:
         cmd += [
             "--instance-market-options",

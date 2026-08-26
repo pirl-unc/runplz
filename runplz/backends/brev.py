@@ -64,18 +64,6 @@ from runplz.backends.ssh_common import (  # noqa: F401
     wait_until_ssh_reachable,
 )
 
-# Re-exports so older test patches and external code that patched these
-# keep working without a hard rename. 3.8's _brev_capture / _brev_sh
-# replaced `run_local` for brev CLI calls, but tests still patch `brev.run_local`
-# in a few places — the re-export keeps the test surface stable.
-_ = (  # noqa: F841 — held for test-mocking compatibility
-    container_running,
-    raise_for_runtime_cap,
-    render_image_ops_script,
-    run_local,
-    ssh_exec,
-)
-
 __all__ = ["run"]
 
 

@@ -948,14 +948,21 @@ def wait_until_ssh_reachable(
                 refresh_callback()
             except BaseException as exc:
                 # If the callback raised on purpose (e.g. the instance
-                # entered a terminal FAILURE state and we should bail
-                # early instead of probing a dead box), let it through.
-                # Only swallow plain exceptions from general-purpose
-                # refresh logic (auth blip, etc.) — those are best-
-                # effort. Signal exceptions (_OrchestratorKilled,
-                # KeyboardInterrupt) propagate regardless.
-                name = type(exc).__name__
-                if name in ("_OrchestratorKilled", "BrevInstanceFailed"):
+                # entered a terminal FAILURE state and we should bail early
+                # instead of probing a dead box), let it through. Only
+                # swallow plain exceptions from general-purpose refresh
+                # logic (auth blip, etc.) — those are best-effort.
+                #
+                # Matched by class, not by name: this guard is what carries
+                # a SIGTERM out of the ssh wait so teardown can run, and a
+                # string comparison silently disarmed it once when the
+                # exception was renamed — leaking the billed box that
+                # issue #38 exists to prevent.
+                if isinstance(exc, (OrchestratorKilled, KeyboardInterrupt, SystemExit)):
+                    raise
+                # BrevInstanceFailed lives in the brev backend, which cannot
+                # be imported here without a cycle, so it stays a name match.
+                if type(exc).__name__ == "BrevInstanceFailed":
                     raise
                 print(f"+ refresh callback raised: {exc}", flush=True)
         time.sleep(probe_interval_s)
@@ -1344,8 +1351,7 @@ _KILL_SIGNALS = ("TERM", "INT", "HUP", "QUIT", "KILL")
 
 def _run_id_env_assignment(run_id: str) -> str:
     """Shell prefix that puts the run id in a command's exec environment."""
-    if not _SAFE_RUN_ID_RE.match(run_id or ""):
-        raise ValueError(f"unsafe run id for remote shell: {run_id!r}")
+    validate_run_id(run_id)
     if not run_id:
         return ""
     return f"{RUN_ID_ENV_VAR}={run_id} "
@@ -1430,8 +1436,7 @@ def build_kill_command(
 
     meta = validate_remote_path(meta, what="meta path")
     proc_root = validate_remote_path(proc_root, what="proc root").rstrip("/")
-    if not _SAFE_RUN_ID_RE.match(run_id or ""):
-        raise ValueError(f"unsafe run id for remote shell: {run_id!r}")
+    validate_run_id(run_id)
     if first_signal not in _KILL_SIGNALS:
         raise ValueError(f"unsupported signal {first_signal!r}; expected one of {_KILL_SIGNALS}")
     timeout_s = int(timeout_s)
@@ -2291,7 +2296,13 @@ def orchestrator_signal_cleanup(label: str):
 
 @dataclass
 class DispatchResult:
-    """What a dispatch produced, for callers that must clean up after it."""
+    """A record of what one dispatch did.
+
+    Not a cleanup handle — `dispatch_to_target` removes its own container and
+    captures its own failure tail before returning, because both have to
+    happen before a provisioning caller tears the box down. This is for
+    callers that want to report on the run.
+    """
 
     exit_code: Optional[int]
     container_name: Optional[str]

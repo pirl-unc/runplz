@@ -122,14 +122,13 @@ def main(argv=None):
             host=args.host,
             outputs_dir=args.outputs_dir,
             build=not args.no_build,
+            # The CLI knows the script being run, which beats the module a
+            # function happens to be defined in — and hands bind() the answer
+            # rather than making it shell out to git a second time.
+            repo_root=_repo_root_for(script_path),
         )
     except (ValueError, RuntimeError) as exc:
         p.error(str(exc))
-
-    # bind() infers the repo root from a function's defining module, which is
-    # the best it can do from Python. The CLI knows the actual script, and
-    # that is authoritative when functions are imported from elsewhere.
-    app._repo_root = _repo_root_for(script_path)
 
     entrypoint_kwargs = _parse_entrypoint_args(app._entrypoint, entrypoint_argv, p.error)
 
