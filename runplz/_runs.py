@@ -12,19 +12,27 @@ remember run IDs or reconstruct ssh commands by hand (issue #57).
 
 import json
 import re
-import shlex
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from runplz.backends.ssh_common import (
+    DEFAULT_KILL_TIMEOUT_S,
+    KILL_SETTLE_S,
     REMOTE_META_DIRNAME,
     REMOTE_RUNS_DIR,
     _ssh_cmd_opts,
+    build_kill_command,
 )
 
 META_FILENAME = "run.json"
+
+# Run ids are generated as <ts>-<slug>-<slug>-<hex>, but --run-id is user
+# input and lands inside a remote shell command, so pin it to a charset that
+# cannot break out of the path it is interpolated into.
+_SAFE_RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 class ManifestNotFound(RuntimeError):
@@ -69,6 +77,11 @@ def resolve_target_and_meta(
     if run_id_override:
         if not host_override:
             raise RuntimeError("--run-id requires --host (no manifest lookup possible)")
+        if not _SAFE_RUN_ID_RE.match(run_id_override):
+            raise RuntimeError(
+                f"--run-id {run_id_override!r} is not a valid run id "
+                f"(letters, digits, dot, dash, underscore only)"
+            )
         meta = f"~/{REMOTE_RUNS_DIR}/{run_id_override}/out/{REMOTE_META_DIRNAME}"
         return (host_override, meta, {})
     manifest = read_manifest(outputs_dir)
@@ -82,6 +95,20 @@ def resolve_target_and_meta(
             raise RuntimeError("manifest is missing both remote_paths.meta and run_id")
         meta = f"~/{REMOTE_RUNS_DIR}/{run_id}/out/{REMOTE_META_DIRNAME}"
     return (target, meta, manifest)
+
+
+def remote_shell_path(path: str) -> str:
+    """Make a manifest path usable inside a remote shell command.
+
+    The manifest records display paths like ``~/runplz-runs/<id>/out/.runplz``.
+    Tilde expansion happens before any quoting, so a ``~/`` path is literal in
+    both ``'...'`` and ``"..."`` — the file is simply never found. ``$HOME``
+    does expand inside double quotes, so callers can interpolate the result
+    into ``"..."`` and get the directory they meant.
+    """
+    if path.startswith("~/"):
+        return f"$HOME/{path[2:]}"
+    return path
 
 
 def tail(
@@ -99,9 +126,9 @@ def tail(
         host_override=host_override,
         run_id_override=run_id_override,
     )
-    log_path = f"{meta}/last.log"
+    log_path = remote_shell_path(f"{meta}/last.log")
     flags = "-F" if follow else f"-n {int(lines)}"
-    remote_cmd = f"tail {flags} {shlex.quote(log_path)}"
+    remote_cmd = f'tail {flags} "{log_path}"'
     cmd = ["ssh", *_ssh_cmd_opts(port), target, remote_cmd]
     return subprocess.run(cmd).returncode
 
@@ -121,10 +148,8 @@ def status(
     )
     # One ssh round-trip pulls last events line, last heartbeat line, and
     # an event count so we don't pay 3x ssh latency for a status check.
-    events_path = f"{meta}/events.ndjson"
-    heartbeat_path = f"{meta}/heartbeat.ndjson"
-    ev_q = shlex.quote(events_path)
-    hb_q = shlex.quote(heartbeat_path)
+    ev_q = f'"{remote_shell_path(f"{meta}/events.ndjson")}"'
+    hb_q = f'"{remote_shell_path(f"{meta}/heartbeat.ndjson")}"'
     remote_cmd = (
         f"echo '---LAST_EVENT---'; tail -n 1 {ev_q} 2>/dev/null || true; "
         f"echo '---LAST_HEARTBEAT---'; tail -n 1 {hb_q} 2>/dev/null || true; "
@@ -141,6 +166,126 @@ def status(
     sections = _parse_status_sections(r.stdout)
     print(_format_status(target=target, manifest=manifest, sections=sections))
     return 0
+
+
+def kill(
+    *,
+    outputs_dir: Path,
+    host_override: Optional[str],
+    run_id_override: Optional[str],
+    timeout_s: int = DEFAULT_KILL_TIMEOUT_S,
+    escalate: bool = True,
+    first_signal: str = "TERM",
+    port: Optional[int] = None,
+) -> int:
+    """Stop a detached run and report what happened to it.
+
+    Idempotent by design (issue #67): killing a run that already exited is a
+    normal outcome of "make sure nothing is still burning GPU hours", not an
+    error, so an already-dead run prints its state and returns 0.
+    """
+    target, meta, manifest = resolve_target_and_meta(
+        outputs_dir=outputs_dir,
+        host_override=host_override,
+        run_id_override=run_id_override,
+    )
+    run_id = manifest.get("run_id") or run_id_override or ""
+    # The manifest is a file on disk; don't let a hand-edited run_id reach the
+    # remote shell. It is only used to label the killed_by_user event.
+    if not _SAFE_RUN_ID_RE.match(run_id or ""):
+        run_id = ""
+    remote_cmd = build_kill_command(
+        remote_shell_path(meta),
+        run_id=run_id,
+        timeout_s=timeout_s,
+        escalate=escalate,
+        first_signal=first_signal,
+    )
+    cmd = ["ssh", *_ssh_cmd_opts(port), target, remote_cmd]
+    # The remote side owns the signal/poll/escalate clock; give ssh enough
+    # headroom to outlive the worst case rather than cutting it off mid-dance.
+    ssh_timeout = timeout_s + KILL_SETTLE_S + 60
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=ssh_timeout)
+    except subprocess.TimeoutExpired:
+        print(f"ssh to {target} timed out after {ssh_timeout}s", file=sys.stderr)
+        return 2
+    if r.returncode != 0:
+        print(f"ssh to {target} failed (rc={r.returncode})", file=sys.stderr)
+        if r.stderr:
+            print(r.stderr.strip(), file=sys.stderr)
+        return r.returncode
+    sections = _parse_status_sections(r.stdout)
+    fields = _parse_kv_block(sections.get("SUMMARY", ""))
+    print(_format_kill(target=target, run_id=run_id, fields=fields, sections=sections))
+    return 0
+
+
+def _parse_kv_block(block: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for line in block.splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            out[key.strip()] = value.strip()
+    return out
+
+
+def _format_kill(
+    *, target: str, run_id: str, fields: dict[str, str], sections: dict[str, str]
+) -> str:
+    initial = fields.get("initial", "unknown")
+    final = fields.get("final", "unknown")
+    signalled = fields.get("signalled") == "1"
+    escalated = fields.get("escalated") == "1"
+    container = fields.get("container", "")
+    container_state = fields.get("container_state", "none")
+
+    lines = [f"target:     {target}"]
+    if run_id:
+        lines.append(f"run:        {run_id}")
+    pid = fields.get("pid") or "-"
+    pgid = fields.get("pgid") or "-"
+    lines.append(f"bootstrap:  pid={pid} pgid={pgid}")
+    if container:
+        lines.append(f"container:  {container} ({container_state})")
+
+    if not signalled:
+        lines.append(f"action:     nothing to kill — process was already {initial}")
+    elif final in {"dead", "missing", "zombie"} and container_state != "running":
+        how = "SIGTERM, escalated to SIGKILL" if escalated else "SIGTERM"
+        lines.append(f"action:     stopped with {how}")
+    else:
+        lines.append(
+            f"action:     signalled, but the run still reports {final!r} — inspect manually"
+        )
+    lines.append(f"state:      {initial} -> {final}")
+
+    gpu = fields.get("gpu_mem_used", "")
+    if gpu:
+        used = [g for g in gpu.split(",") if g]
+        pretty = ", ".join(f"gpu{i}={m}MiB" for i, m in enumerate(used))
+        lines.append(f"gpu memory: {pretty}")
+
+    heartbeat = (sections.get("HEARTBEAT") or "").strip()
+    if heartbeat:
+        lines.append(f"heartbeat:  {_heartbeat_age(heartbeat)}")
+
+    logtail = (sections.get("LOGTAIL") or "").strip()
+    if logtail:
+        lines.append("last log:")
+        lines.extend(f"  {line}" for line in logtail.splitlines())
+    return "\n".join(lines)
+
+
+def _heartbeat_age(line: str) -> str:
+    """Render the last heartbeat as ``<ts> (<age> ago)``, matching `status`."""
+    try:
+        ts = json.loads(line).get("ts", "")
+    except (json.JSONDecodeError, AttributeError):
+        return line[:200]
+    if not ts:
+        return line[:200]
+    return f"{ts}{_age_str(ts)}"
 
 
 def _parse_status_sections(stdout: str) -> dict[str, str]:

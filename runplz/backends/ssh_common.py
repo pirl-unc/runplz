@@ -62,6 +62,15 @@ REMOTE_LATEST_LINK = "runplz-latest"
 REMOTE_META_DIRNAME = ".runplz"
 REMOTE_IMAGE_TAG = "runplz-train:remote"
 
+# Per-run control files inside the meta dir. The pid is what every probe
+# keys off; the pgid is the handle `runplz kill` needs to reach an orphaned
+# worker tree after the bash supervisor dies (issue #67); the container file
+# names the docker container in VM+docker mode, which lives outside the
+# bootstrap's process group and has to be signalled separately.
+BOOTSTRAP_PID_FILENAME = "bootstrap.pid"
+BOOTSTRAP_PGID_FILENAME = "bootstrap.pgid"
+CONTAINER_FILENAME = "container"
+
 # container-mode / native paths tee the bootstrap's combined stdout+stderr
 # into this file so we can `tail` it for failure context (issue #17). Lives
 # under $HOME so no sudo needed and survives across ssh reconnects.
@@ -72,6 +81,12 @@ FAILURE_TAIL_LINES = 50
 HEARTBEAT_INTERVAL_S = 30
 DETACHED_START_TIMEOUT_S = 15
 DETACHED_START_POLL_INTERVAL_S = 1
+
+# `runplz kill` sends SIGTERM, gives the job this long to unwind (flush
+# checkpoints, close writers), then escalates to SIGKILL and allows a
+# short settle window for the kernel to reap the tree.
+DEFAULT_KILL_TIMEOUT_S = 10
+KILL_SETTLE_S = 5
 
 # Directories that are noise on every upload and exclusions we apply on
 # top of DEFAULT_TRANSFER_EXCLUDES (which only covers secrets). The
@@ -1208,6 +1223,12 @@ def _run_container_detached(
     monitor = ""
     if remote_run is not None:
         monitor = (
+            # Name the container so `runplz kill` can signal it. It is a child
+            # of dockerd, not of the bootstrap, so it sits outside the process
+            # group every other stop path relies on.
+            f'mkdir -p "{remote_run.meta_shell}"; '
+            f"printf '%s\\n' {shlex.quote(container_name)} "
+            f'> "{remote_run.meta_shell}/{CONTAINER_FILENAME}"; '
             f"{_remote_logging_shell(remote_run)}"
             f"runplz_event remote_command_start; "
             f"runplz_event container_started; "
@@ -1253,7 +1274,8 @@ def build_detached_launcher(remote_run: RemoteRunContext, wrapped_command: str) 
     """
 
     meta = remote_run.meta_shell
-    pid_file = f"{meta}/bootstrap.pid"
+    pid_file = f"{meta}/{BOOTSTRAP_PID_FILENAME}"
+    pgid_file = f"{meta}/{BOOTSTRAP_PGID_FILENAME}"
     run_script = f"{meta}/run.sh"
     driver_log = f"{meta}/run_driver.log"
     delim = f"__RUNPLZ_CMD_{uuid.uuid4().hex}__"
@@ -1268,7 +1290,178 @@ def build_detached_launcher(remote_run: RemoteRunContext, wrapped_command: str) 
         f'chmod +x "{run_script}"\n'
         f'nohup bash "{run_script}" </dev/null >> "{driver_log}" 2>&1 &\n'
         f'echo $! > "{pid_file}"\n'
+        f"{_capture_bootstrap_pgid_shell(pgid_file)}"
     )
+
+
+def _capture_bootstrap_pgid_shell(pgid_file: str) -> str:
+    """Record the freshly spawned bootstrap's process group id, best effort.
+
+    ``runplz kill`` signals the whole process group rather than walking a
+    parent/child tree, because the case that actually hurts is the one where
+    the bash supervisor is already gone and only orphaned workers survive,
+    reparented to init (issue #67). Those keep their original pgid, so the
+    group stays a valid handle long after ``pkill -P`` has nothing to match.
+
+    The pgid is only readable from procfs, which the supported remote
+    environments have but a developer's macOS box (running this launcher in
+    tests) does not. Everything here is guarded so a missing ``/proc`` simply
+    leaves no pgid file behind and ``kill`` falls back to the live-process
+    lookup.
+    """
+
+    return (
+        'runplz_pgid=""\n'
+        'if [ -r "/proc/$!/stat" ]; then\n'
+        '  runplz_stat=""\n'
+        '  IFS= read -r runplz_stat < "/proc/$!/stat" || true\n'
+        # /proc/<pid>/stat is "pid (comm) state ppid pgrp ...". comm can hold
+        # spaces and parens, so cut past the last ") " before splitting.
+        "  runplz_rest=${runplz_stat##*) }\n"
+        "  runplz_rest=${runplz_rest#* }\n"
+        "  runplz_rest=${runplz_rest#* }\n"
+        "  runplz_pgid=${runplz_rest%% *}\n"
+        "fi\n"
+        f'if [ -n "$runplz_pgid" ]; then printf \'%s\\n\' "$runplz_pgid" > "{pgid_file}"; fi\n'
+    )
+
+
+def build_kill_command(
+    meta: str,
+    *,
+    run_id: str = "",
+    timeout_s: int = DEFAULT_KILL_TIMEOUT_S,
+    escalate: bool = True,
+    first_signal: str = "TERM",
+) -> str:
+    """Build the remote shell that stops one detached run in a single hop.
+
+    Does the whole signal/poll/escalate dance remotely so the escalation
+    timeout is measured against the job rather than against ssh latency, and
+    so a flaky link can't strand the run half-signalled.
+
+    Three things get signalled, because a run can outlive any one of them:
+    the process group (catches orphaned workers and forked DataLoader
+    children), the bootstrap pid itself (in case the pgid is unknown), and
+    the docker container in VM+docker mode (it is a child of dockerd, not of
+    the bootstrap, so no signal to our group ever reaches it).
+    """
+
+    pid_file = f"{meta}/{BOOTSTRAP_PID_FILENAME}"
+    pgid_file = f"{meta}/{BOOTSTRAP_PGID_FILENAME}"
+    container_file = f"{meta}/{CONTAINER_FILENAME}"
+    events_file = f"{meta}/events.ndjson"
+    heartbeat_file = f"{meta}/heartbeat.ndjson"
+    log_file = f"{meta}/last.log"
+    settle_s = KILL_SETTLE_S
+    return f"""\
+runplz_pid=""
+runplz_pgid=""
+runplz_container=""
+if [ -r "{pid_file}" ]; then IFS= read -r runplz_pid < "{pid_file}" || true; fi
+if [ -r "{pgid_file}" ]; then IFS= read -r runplz_pgid < "{pgid_file}" || true; fi
+if [ -r "{container_file}" ]; then IFS= read -r runplz_container < "{container_file}" || true; fi
+
+# Runs launched before the pgid file existed still have a recoverable group
+# for as long as the bootstrap itself is alive.
+if [ -z "$runplz_pgid" ] && [ -n "$runplz_pid" ] && [ -r "/proc/$runplz_pid/stat" ]; then
+  runplz_stat=""
+  IFS= read -r runplz_stat < "/proc/$runplz_pid/stat" || true
+  runplz_rest=${{runplz_stat##*) }}
+  runplz_rest=${{runplz_rest#* }}
+  runplz_rest=${{runplz_rest#* }}
+  runplz_pgid=${{runplz_rest%% *}}
+fi
+
+# Reject anything non-numeric, and refuse pgid 0/1 outright: `kill -TERM -1`
+# signals every process the user owns, which on a shared box is a very
+# expensive typo.
+case "$runplz_pid" in ''|*[!0-9]*) runplz_pid="" ;; esac
+case "$runplz_pgid" in ''|*[!0-9]*|0|1) runplz_pgid="" ;; esac
+
+runplz_pid_state() {{
+  {_detached_process_state_shell()}printf '%s' "$runplz_state"
+}}
+
+runplz_container_running() {{
+  [ -n "$runplz_container" ] || return 1
+  sudo docker inspect --format '{{{{.State.Running}}}}' "$runplz_container" 2>/dev/null \
+    | grep -qx true
+}}
+
+runplz_alive() {{
+  case "$(runplz_pid_state)" in running) return 0 ;; esac
+  if [ -n "$runplz_pgid" ] && kill -0 "-$runplz_pgid" 2>/dev/null; then return 0; fi
+  runplz_container_running
+}}
+
+runplz_signal() {{
+  if [ -n "$runplz_pgid" ]; then kill -"$1" "-$runplz_pgid" 2>/dev/null || true; fi
+  if [ -n "$runplz_pid" ]; then kill -"$1" "$runplz_pid" 2>/dev/null || true; fi
+  if [ -n "$runplz_container" ]; then
+    sudo docker kill --signal="$1" "$runplz_container" >/dev/null 2>&1 || true
+  fi
+}}
+
+runplz_wait_until_dead() {{
+  runplz_waited=0
+  while [ "$runplz_waited" -lt "$1" ]; do
+    runplz_alive || return 0
+    sleep 1
+    runplz_waited=$((runplz_waited + 1))
+  done
+  runplz_alive && return 1
+  return 0
+}}
+
+runplz_initial="$(runplz_pid_state)"
+runplz_escalated=0
+runplz_signalled=0
+if runplz_alive; then
+  runplz_signalled=1
+  runplz_signal "{first_signal}"
+  if ! runplz_wait_until_dead {timeout_s}; then
+    if [ "{1 if escalate else 0}" = "1" ]; then
+      runplz_escalated=1
+      runplz_signal KILL
+      runplz_wait_until_dead {settle_s} || true
+    fi
+  fi
+fi
+runplz_final="$(runplz_pid_state)"
+if runplz_container_running; then runplz_container_state=running; \
+elif [ -n "$runplz_container" ]; then runplz_container_state=stopped; \
+else runplz_container_state=none; fi
+
+if [ "$runplz_signalled" = "1" ]; then
+  mkdir -p "{meta}" 2>/dev/null || true
+  printf '{{"ts":"%s","run_id":"%s","event":"killed_by_user","escalated":%s}}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "{run_id}" "$runplz_escalated" \
+    >> "{events_file}" 2>/dev/null || true
+fi
+
+runplz_gpu=""
+if command -v nvidia-smi >/dev/null 2>&1; then
+  runplz_gpu="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
+    | tr '\n' ',' | sed 's/,$//')"
+fi
+
+printf '%s\n' '---SUMMARY---'
+printf 'pid=%s\n' "${{runplz_pid:-}}"
+printf 'pgid=%s\n' "${{runplz_pgid:-}}"
+printf 'container=%s\n' "${{runplz_container:-}}"
+printf 'container_state=%s\n' "$runplz_container_state"
+printf 'initial=%s\n' "$runplz_initial"
+printf 'final=%s\n' "$runplz_final"
+printf 'signalled=%s\n' "$runplz_signalled"
+printf 'escalated=%s\n' "$runplz_escalated"
+printf 'gpu_mem_used=%s\n' "${{runplz_gpu:-}}"
+printf '%s\n' '---HEARTBEAT---'
+tail -n 1 "{heartbeat_file}" 2>/dev/null || true
+printf '%s\n' '---LOGTAIL---'
+tail -n 10 "{log_file}" 2>/dev/null || true
+printf '%s\n' '---END---'
+"""
 
 
 def _detached_process_state_shell() -> str:

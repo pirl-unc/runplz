@@ -1,3 +1,66 @@
+## 2026-08-26 PR Plan — Sweep of #75 / #72 / #67 (kill + packaging)
+
+Branch: `feat/runplz-kill-and-packaging-fixes` (off `main` @ `102cc11`)
+
+### Sweep verdict
+
+| Issue | Status before this PR | Evidence |
+|---|---|---|
+| #75 deploy.sh PEP 668 | Still broken | `deploy.sh:10` still ran `python3 -m pip install --upgrade build twine`, and only *after* `./lint.sh` + `./test.sh` |
+| #72 SPDX license | Still broken | `pyproject.toml:10` still used the `license = {file = ...}` table; `requires = ["setuptools>=61.0"]` predates PEP 639 |
+| #67 `runplz kill` | Partially landed | `runplz ps` / `tail` / `status` shipped in 3.15.x — those were the issue's *bonus* asks. The core `kill` did not exist; its plumbing (run manifest, pid probe, zombie-aware process state) now does. |
+
+Nothing was already fully fixed; #67 had shrunk to just the kill itself.
+
+- [x] #75 — provision an isolated build venv in `deploy.sh` *before* lint/test, so it both
+  stops mutating an externally managed interpreter and fails fast; gitignore `.deploy-venv/`
+- [x] #72 — `license = "Apache-2.0"` + `license-files = ["LICENSE"]`, `setuptools>=77.0.3`;
+  verified `License-Expression` / `License-File` in both wheel and sdist metadata
+- [x] #67 — `runplz kill` / `runplz cancel`
+- [x] #76 (found en route) — manifest paths are `~/`-prefixed and tilde expands before
+  quoting, so `tail`/`status`/`kill` were all reading a path the remote shell cannot resolve;
+  rewrite the leading `~/` to `$HOME/` and validate `--run-id` before it enters a shell command
+- [x] Bump `runplz/version.py` to 3.16.0
+- [x] Run `./format.sh`, `./lint.sh`, and `./test.sh`
+- [ ] Review the final diff, push, open a PR closing #75/#72/#67, wait for green CI, merge,
+  and deploy 3.16.0 to PyPI
+
+### Scope / design
+
+- **Kill by process group, not by process tree.** The painful case in #67 is the one where the
+  bash supervisor is already dead and only orphaned workers survive, reparented to init —
+  `pkill -P` has nothing left to match, but those workers keep their original pgid. So the
+  launcher now persists `bootstrap.pgid` alongside `bootstrap.pid` (best-effort, procfs-only,
+  a documented no-op on a macOS dev box) and kill signals the group.
+- Runs launched before the pgid file existed still work: kill re-derives the group from
+  `/proc/<pid>/stat` whenever the bootstrap is alive.
+- VM+docker mode records the container name in `<meta>/container`. The container is a child of
+  dockerd, outside the bootstrap's process group, so no group signal would ever reach it.
+- The whole signal → poll → escalate dance runs remotely in one ssh hop, so the escalation
+  clock measures the job rather than ssh latency and a flaky link can't strand a half-signalled
+  run.
+- Guards: non-numeric pid/pgid are discarded, and pgid 0/1 is refused outright — `kill -TERM -1`
+  would signal every process the user owns.
+- Idempotent by design: killing an already-finished run prints `nothing to kill` and exits 0,
+  so it is safe in a relaunch script.
+- Reused `_add_run_lookup_args` and `_parse_status_sections` rather than inventing a second run
+  lookup or output format.
+
+### Review section
+
+- Verified the generated kill shell by executing it, not just by string-matching: it takes down
+  an orphaned bootstrap + 2 workers in a real process group, is a clean no-op on a run that never
+  existed, and refuses pgid 1. Parses under both `sh -n` and `bash -n`.
+- Also fixed two latent problems found on the way:
+  - **#76**: `runplz status` was silently reporting `(none recorded)` for healthy runs because
+    the tilde path never resolved and its errors are swallowed by `2>/dev/null || true`. `kill`
+    would have shipped with the same bug, so this had to be fixed here rather than deferred.
+  - `runplz._runs` shells out to `ssh` but was missing from `conftest._MODULES_TO_GUARD`, so a
+    test that forgot to mock could have hit real infra — exactly what that guard exists to
+    prevent.
+- `./format.sh` and `./lint.sh` pass. `./test.sh` passes (`487 passed`, 93% total coverage),
+  with the 35 new tests clean under `-W error::DeprecationWarning` across 5 consecutive runs.
+
 ## 2026-08-26 PR Plan — HUP-Safe Detached Bootstrap (#73)
 
 Branch: `fix-detached-bootstrap-hup` (off `main` @ `dc5cd38`)

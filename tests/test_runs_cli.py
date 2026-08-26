@@ -220,3 +220,52 @@ def test_cli_status_run_id_without_host_errors(tmp_path, capsys):
     rc = _cli.main(["status", "--outputs-dir", str(tmp_path), "--run-id", "xyz"])
     assert rc == 2
     assert "--run-id requires --host" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# remote path expansion
+
+
+def test_remote_shell_path_rewrites_tilde_to_home():
+    """`~` expands before quoting, so a `~/` path is literal in the remote shell."""
+    assert _runs.remote_shell_path("~/runplz-runs/r1/out") == "$HOME/runplz-runs/r1/out"
+    assert _runs.remote_shell_path("/abs/path") == "/abs/path"
+    assert _runs.remote_shell_path("$HOME/already") == "$HOME/already"
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda d: _runs.tail(
+            outputs_dir=d, host_override=None, run_id_override=None, lines=5, follow=False
+        ),
+        lambda d: _runs.status(outputs_dir=d, host_override=None, run_id_override=None),
+        lambda d: _runs.kill(outputs_dir=d, host_override=None, run_id_override=None),
+    ],
+    ids=["tail", "status", "kill"],
+)
+def test_remote_commands_never_ship_an_unexpandable_tilde(tmp_path, call):
+    _write_manifest(tmp_path, _manifest())
+    fake = mock.Mock(returncode=0, stdout="---SUMMARY---\n---END---\n", stderr="")
+    with mock.patch("runplz._runs.subprocess.run", return_value=fake) as run_mock:
+        call(tmp_path)
+    remote_cmd = run_mock.call_args.args[0][-1]
+    assert "~/" not in remote_cmd
+    assert "$HOME/runplz-runs/" in remote_cmd
+
+
+def test_resolve_rejects_a_run_id_that_could_escape_the_path():
+    with pytest.raises(RuntimeError, match="not a valid run id"):
+        _runs.resolve_target_and_meta(
+            outputs_dir=Path("."),
+            host_override="box",
+            run_id_override='x"; rm -rf ~; echo "',
+        )
+
+
+def test_kill_drops_a_tampered_run_id_from_the_remote_command(tmp_path):
+    _write_manifest(tmp_path, _manifest(run_id='evil"; touch /tmp/pwned; echo "'))
+    fake = mock.Mock(returncode=0, stdout="---SUMMARY---\n---END---\n", stderr="")
+    with mock.patch("runplz._runs.subprocess.run", return_value=fake) as run_mock:
+        _runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
+    assert "pwned" not in run_mock.call_args.args[0][-1]

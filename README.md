@@ -205,10 +205,10 @@ kwargs must be JSON-serializable.
 All four have `app.bind(...)` equivalents (`instance=`, `host=`,
 `build=False`, `outputs_dir=`) for the pure-Python invocation path.
 
-### Operations CLI: `ps`, `tail`, `status`
+### Operations CLI: `ps`, `tail`, `status`, `kill`
 
-Three subcommands let you check on jobs without retyping ssh aliases or
-remembering remote run IDs:
+Four subcommands let you check on — and stop — jobs without retyping ssh
+aliases or remembering remote run IDs:
 
 ```bash
 runplz ps                          # list runplz jobs across all backends
@@ -220,13 +220,37 @@ runplz tail -n 500                 # last N lines (default 120)
 runplz tail -f                     # stream new lines as they arrive
 
 runplz status                      # one-screen summary: target, last event, last heartbeat, event count
+
+runplz kill                        # stop the most recent run (SIGTERM, then SIGKILL)
+runplz kill --timeout 60           # give it longer to checkpoint before SIGKILL
+runplz kill --no-escalate          # SIGTERM only; report whatever survives
+runplz cancel                      # alias for kill
 ```
 
-`tail` and `status` default to "most recent run in `./out/`" by reading
-the local `out/.runplz/run.json` manifest the dispatch path writes. Pass
-`--outputs-dir <path>` to point at a different one, or `--host <h>
---run-id <id>` to inspect a specific run by ID. SSH has no host registry,
-so `runplz ps` skips it unless you pass `--host`.
+`tail`, `status` and `kill` default to "most recent run in `./out/`" by
+reading the local `out/.runplz/run.json` manifest the dispatch path
+writes. Pass `--outputs-dir <path>` to point at a different one, or
+`--host <h> --run-id <id>` to target a specific run by ID. SSH has no
+host registry, so `runplz ps` skips it unless you pass `--host`.
+
+#### What `kill` actually stops
+
+A remote run is a tree, not a process: a bash supervisor, the bootstrap,
+the worker(s) it spawns, and any DataLoader children those fork. `kill`
+signals the bootstrap's **process group**, so orphaned workers still die
+even when the supervisor is already gone — the case where `pkill -P` has
+nothing left to match. In VM+docker mode it also signals the container,
+which is a child of dockerd and outside that group.
+
+It sends `SIGTERM` first so the job can flush checkpoints and close
+writers, waits `--timeout` seconds (default 10), then escalates to
+`SIGKILL` unless you passed `--no-escalate`. On exit it prints the
+before/after process state, per-GPU memory still in use (when
+`nvidia-smi` is present), the last heartbeat, and a short log tail, and
+appends `event=killed_by_user` to the run's `events.ndjson`.
+
+Killing a run that already finished is not an error — it reports
+`nothing to kill` and exits 0, so it is safe in a relaunch script.
 
 ## Backend config
 

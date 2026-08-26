@@ -54,6 +54,8 @@ def main(argv=None):
         return _tail_main(argv_list[1:])
     if argv_list and argv_list[0] == "status":
         return _status_main(argv_list[1:])
+    if argv_list and argv_list[0] in ("kill", "cancel"):
+        return _kill_main(argv_list[1:], prog=argv_list[0])
 
     p = argparse.ArgumentParser(
         prog="runplz", description="Run a Python @app.function on a chosen backend."
@@ -465,6 +467,62 @@ def _status_main(argv):
             outputs_dir=Path(args.outputs_dir).resolve(),
             host_override=args.host,
             run_id_override=args.run_id,
+        )
+    except _runs.ManifestNotFound as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+
+def _kill_main(argv, *, prog="kill"):
+    from runplz import _runs
+    from runplz.backends.ssh_common import DEFAULT_KILL_TIMEOUT_S
+
+    p = argparse.ArgumentParser(
+        prog=f"runplz {prog}",
+        description=(
+            "Stop a running detached job: signals the bootstrap's process "
+            "group (workers and forked children included) plus the docker "
+            "container in VM+docker mode, then records killed_by_user."
+        ),
+    )
+    _add_run_lookup_args(p)
+    p.add_argument(
+        "--signal",
+        default="TERM",
+        choices=["TERM", "INT", "KILL"],
+        help=(
+            "First signal to send (default: TERM). TERM lets the job unwind — "
+            "flush checkpoints, close writers — before the SIGKILL escalation."
+        ),
+    )
+    p.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_KILL_TIMEOUT_S,
+        help=(
+            f"Seconds to wait for a clean exit before escalating to SIGKILL "
+            f"(default: {DEFAULT_KILL_TIMEOUT_S})."
+        ),
+    )
+    p.add_argument(
+        "--no-escalate",
+        action="store_true",
+        help="Never send SIGKILL — report what survived the first signal instead.",
+    )
+    args = p.parse_args(argv)
+    if args.timeout < 0:
+        p.error("--timeout must be >= 0")
+    try:
+        return _runs.kill(
+            outputs_dir=Path(args.outputs_dir).resolve(),
+            host_override=args.host,
+            run_id_override=args.run_id,
+            timeout_s=args.timeout,
+            escalate=not args.no_escalate,
+            first_signal=args.signal,
         )
     except _runs.ManifestNotFound as exc:
         print(str(exc), file=sys.stderr)
