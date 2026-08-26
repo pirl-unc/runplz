@@ -163,6 +163,30 @@ Either way, `.remote()` serializes a minimal dispatch (env vars + a
 path to your script) and runs on the selected backend. Args and
 kwargs must be JSON-serializable.
 
+#### What a backend actually is
+
+Very little. Everything a run does on a remote box — staging the repo,
+probing preconditions, building/running the container, streaming output,
+collecting outputs, capturing a failure tail, removing the container — is
+one shared path in `ssh_common.dispatch_to_target`. Provisioning backends
+wrap it in `run_on_provisioned_vm`, which handles the signal traps and the
+always-runs teardown that stop a killed orchestrator from leaking a billed
+box.
+
+So a backend is only its own provider vocabulary:
+
+| shared | per-backend |
+|---|---|
+| dispatch, streaming, outputs, failure tails (`ssh_common`) | how to create a machine |
+| container labels and `docker ps` parsing (`_docker`) | how to reach it over ssh |
+| instance naming, GPU-shape lookup, teardown contract (`_cloud`) | how to tear it down |
+| config field validation (`config`) | which shapes that provider sells |
+| what backends exist and what each accepts (`_registry`) | |
+
+That is why `gcp.py` and `aws.py` are a couple of hundred lines each, and
+why adding another provider is mostly a table of machine types plus three
+functions.
+
 ### Decorators you'll use
 
 - **`@app.function(image=..., gpu=..., ...)`** — marks a function as

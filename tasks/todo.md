@@ -49,6 +49,42 @@ proving the guard covers `runplz.backends._cloud`.
   `run_on_provisioned_vm` skipped teardown when provision() raised, which is exactly
   the billing leak #29 fixed. Teardown is now unconditional.
 
+### Unification pass
+
+After brev moved onto the shared core, kept going through the rest of the
+per-backend duplication:
+
+- **`_docker.py`** — container labels were string literals in four files (written in
+  `local.py` + `ssh_common.py`, read back in `local.py` + `ssh.py`), so a rename would
+  have silently broken `runplz ps` rather than failing anything. Producer and consumer
+  now share constants; the two near-identical `docker ps` row parsers and the
+  verbatim-duplicated label parser collapse into one.
+- **`config.py`** — one `_validate_remote_common` backs all four remote configs instead
+  of three copies of the same three checks.
+- **`_cloud.py`** — owns instance naming for every provisioning backend, both halves.
+  `make_instance_name` / `split_instance_name` are inverses that must agree (ps reads
+  app/function back out of a name) and were 200 lines apart in a brev-only file.
+- **`apply_teardown()`** — brev, gcp and aws each restated the same billing-safety
+  contract (leave = nothing; never raise, it runs in a finally; never fail quietly,
+  a silent teardown is a box that bills). One implementation owns the rules; each
+  backend supplies only its provider's command. brev keeps its retries and
+  post-action verification inside its own action callable.
+- **`_registry.py`** — adding a backend meant editing five places that had to agree
+  (bind validator, argparse choices, `_dispatch` if-chain, ps tuple, ps if-chain).
+  Now one entry.
+
+Net: ssh/gcp/aws are 7-9 functions each. brev's remaining 30 are all genuinely
+`brev`-CLI vocabulary — ls/create/start/refresh, search-row parsing, onboarding,
+terminal states, instance-type picking.
+
+**Stopped short of** merging `brev._brev_capture` into `_cloud.run_cli`. The retry
+*loop* is common but the *classification* is not — brev's transient/non-retriable
+patterns are Brev-API-specific (issue #62's org/config gaps), and GCP quota errors
+and AWS throttling look nothing like them. The contracts differ too: `_brev_capture`
+returns a CompletedProcess for the caller to inspect, `run_cli` raises. Extracting
+just the loop would be a thin win wrapped around the most heavily-tested code path in
+the repo. Filed as a follow-up rather than forced.
+
 ### Review section
 
 - All flags were validated offline against the installed CLIs (`gcloud compute
