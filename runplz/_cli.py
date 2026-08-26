@@ -34,6 +34,7 @@ import typing
 from pathlib import Path
 
 from runplz.app import _VALID_BACKENDS, _repo_root_for
+from runplz.backends import _registry
 
 
 def main(argv=None):
@@ -325,7 +326,9 @@ def _load_app(script_path: Path):
     return apps[0]
 
 
-_PS_BACKENDS = ("local", "brev", "modal")
+# Which backends `runplz ps` can enumerate is a property of each backend,
+# declared once in runplz.backends._registry.
+_PS_BACKENDS = _registry.ps_names()
 
 
 def _ps_main(argv):
@@ -384,19 +387,7 @@ def _ps_main(argv):
 
 
 def _collect_backend_jobs(backend: str) -> list[dict]:
-    if backend == "local":
-        from runplz.backends import local as local_backend
-
-        return local_backend.list_jobs()
-    if backend == "brev":
-        from runplz.backends import brev as brev_backend
-
-        return brev_backend.list_jobs()
-    if backend == "modal":
-        from runplz.backends import modal as modal_backend
-
-        return modal_backend.list_jobs()
-    raise ValueError(f"unknown backend: {backend}")
+    return _registry.load(backend).list_jobs()
 
 
 def _print_ps_table(rows: list[dict]) -> None:

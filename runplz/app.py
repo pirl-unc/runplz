@@ -14,13 +14,14 @@ import json
 from pathlib import Path
 from typing import Callable, Optional
 
+from runplz.backends import _registry
 from runplz.config import AwsConfig, BrevConfig, GcpConfig, ModalConfig, SshConfig
 from runplz.image import Image
 
-_VALID_BACKENDS = ("local", "brev", "modal", "ssh", "gcp", "aws")
-# Backends that create the box themselves, so they take neither an
-# --instance (brev) nor a --host (ssh): there is nothing to point at yet.
-_CLOUD_BACKENDS = ("gcp", "aws")
+# What backends exist, and what each accepts, is described once in
+# runplz.backends._registry. Kept as a module-level name because the CLI
+# imports it for argparse `choices`.
+_VALID_BACKENDS = _registry.names()
 
 
 class Function:
@@ -227,29 +228,24 @@ class App:
         The CLI is preferred for CI/shared scripts; this is for notebooks
         and one-off runs where you already have `app` in scope.
         """
-        if backend not in _VALID_BACKENDS:
-            raise ValueError(f"backend must be one of {_VALID_BACKENDS}; got {backend!r}")
-        # brev accepts instance=None → ephemeral mode (runplz auto-creates
-        # a box sized to the function and deletes it on exit).
-        if backend in _CLOUD_BACKENDS:
-            cfg = getattr(self, f"{backend}_config")
-            if cfg is None:
-                raise ValueError(
-                    f"backend={backend!r} needs App(..., {backend}_config=...). "
-                    f"It provisions a box for you, so it needs to know where: "
-                    f"project/zone for gcp, region/key_name for aws."
-                )
-        if backend != "brev" and instance is not None:
+        spec = _registry.get(backend)
+        if spec.required_config_attr and getattr(self, spec.required_config_attr) is None:
+            raise ValueError(
+                f"backend={backend!r} needs App(..., {spec.required_config_attr}=...). "
+                f"It provisions a box for you, so it needs to know where: "
+                f"project/zone for gcp, region/key_name for aws."
+            )
+        if instance is not None and not spec.accepts_instance:
             raise ValueError(
                 f"instance={instance!r} only applies to backend='brev'; got backend={backend!r}."
             )
-        if backend == "ssh" and not host:
+        if spec.accepts_host and not host:
             raise ValueError("host=... is required when backend='ssh'")
-        if backend != "ssh" and host is not None:
+        if host is not None and not spec.accepts_host:
             raise ValueError(
                 f"host={host!r} only applies to backend='ssh'; got backend={backend!r}."
             )
-        if backend != "local" and not build:
+        if not build and not spec.accepts_no_build:
             raise ValueError(
                 f"build=False only applies to backend='local' (it skips `docker "
                 f"build`). On backend={backend!r} it would be silently ignored."
@@ -283,32 +279,8 @@ class App:
                 f"(For in-process execution without a backend, use "
                 f"{function.name}.local(...) instead.)"
             )
-        backend = self._backend
-        if backend == "local":
-            from runplz.backends import local
-
-            return local.run(self, function, args, kwargs, **self._backend_kwargs)
-        if backend == "brev":
-            from runplz.backends import brev
-
-            return brev.run(self, function, args, kwargs, **self._backend_kwargs)
-        if backend == "modal":
-            from runplz.backends import modal
-
-            return modal.run(self, function, args, kwargs, **self._backend_kwargs)
-        if backend == "ssh":
-            from runplz.backends import ssh
-
-            return ssh.run(self, function, args, kwargs, **self._backend_kwargs)
-        if backend == "gcp":
-            from runplz.backends import gcp
-
-            return gcp.run(self, function, args, kwargs, **self._backend_kwargs)
-        if backend == "aws":
-            from runplz.backends import aws
-
-            return aws.run(self, function, args, kwargs, **self._backend_kwargs)
-        raise ValueError(f"Unknown backend: {backend!r}")
+        module = _registry.load(self._backend)
+        return module.run(self, function, args, kwargs, **self._backend_kwargs)
 
 
 def _ensure_json_safe(args, kwargs):
