@@ -1244,9 +1244,12 @@ def _run_container_detached(
 def build_detached_launcher(remote_run: RemoteRunContext, wrapped_command: str) -> str:
     """Build the portable remote shell used to launch one detached run.
 
-    ``nohup`` execs bash in place, so the PID captured by ``$!`` remains the
-    bootstrap PID. In contrast, ``setsid`` may fork when invoked by a process
-    group leader, leaving callers monitoring the short-lived wrapper process.
+    The parent ignores SIGHUP before spawning so SSH teardown cannot win the
+    fork-to-``nohup`` exec race. The child script repeats the ignore as defense
+    in depth. ``nohup`` execs bash in place, so the PID captured by ``$!``
+    remains the bootstrap PID. In contrast, ``setsid`` may fork when invoked by
+    a process group leader, leaving callers monitoring the short-lived wrapper
+    process.
     """
 
     meta = remote_run.meta_shell
@@ -1256,8 +1259,10 @@ def build_detached_launcher(remote_run: RemoteRunContext, wrapped_command: str) 
     delim = f"__RUNPLZ_CMD_{uuid.uuid4().hex}__"
     return (
         "set -euo pipefail\n"
+        "trap '' HUP\n"
         f'mkdir -p "{meta}"\n'
         f"cat > \"{run_script}\" << '{delim}'\n"
+        "trap '' HUP\n"
         f"{wrapped_command}\n"
         f"{delim}\n"
         f'chmod +x "{run_script}"\n'
@@ -1464,9 +1469,11 @@ def launch_detached_and_wait(
     cascaded SIGPIPE / BrokenPipeError back through the whole pipeline,
     killing training.
 
-    ``nohup`` makes SIGHUP ignored, stdin comes from ``/dev/null``, and
-    stdout/stderr go only to a per-run driver log. Avoiding ``setsid`` keeps
-    ``$!`` tied to bash on implementations that fork for process-group leaders.
+    The launching shell ignores SIGHUP before it forks, closing the race before
+    ``nohup`` can install the same disposition. The child wrapper retains that
+    ignore, stdin comes from ``/dev/null``, and stdout/stderr go only to a
+    per-run driver log. Avoiding ``setsid`` keeps ``$!`` tied to bash on
+    implementations that fork for process-group leaders.
 
     Backend-agnostic: ``wrapped_command`` is arbitrary bash — typically
     the output of ``_wrap_remote_command_for_logging`` so events.ndjson

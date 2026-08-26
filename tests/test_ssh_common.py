@@ -1,7 +1,10 @@
 """Public-contract tests for shared SSH staging and detached lifecycle."""
 
 import os
+import shlex
+import signal
 import subprocess
+import time
 from unittest import mock
 
 from runplz.backends import ssh_common
@@ -231,6 +234,35 @@ def test_wait_for_detached_start_returns_promptly_for_zombie():
             )
     assert status is zombie
     sleep.assert_not_called()
+
+
+def test_detached_launcher_ignores_hup_before_spawn_and_in_child(tmp_path):
+    remote_run = ssh_common.make_remote_run_context(
+        backend="brev",
+        target="box",
+        function_name="train",
+    )
+    marker = tmp_path / "survived-hup"
+    launcher = ssh_common.build_detached_launcher(
+        remote_run,
+        f"sleep 1; printf survived > {shlex.quote(str(marker))}",
+    )
+
+    nohup_offset = launcher.index("nohup bash")
+    assert launcher.count("trap '' HUP") == 2
+    assert launcher.index("trap '' HUP") < nohup_offset
+    assert launcher.rindex("trap '' HUP") < nohup_offset
+
+    env = dict(os.environ, HOME=str(tmp_path))
+    subprocess.run(["bash", "-c", launcher], check=True, env=env)
+    pid_file = tmp_path / "runplz-runs" / remote_run.run_id / "out" / ".runplz" / "bootstrap.pid"
+    pid = int(pid_file.read_text().strip())
+    os.kill(pid, signal.SIGHUP)
+
+    deadline = time.monotonic() + 5
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert marker.read_text() == "survived"
 
 
 def test_launch_detached_failure_returns_nonzero_with_diagnostics(capsys):
