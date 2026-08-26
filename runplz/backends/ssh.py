@@ -47,7 +47,7 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
         target=target,
         backend="ssh",
         outputs_dir=outputs_dir,
-        use_docker=cfg.use_docker,
+        mode="docker" if cfg.use_docker else "native",
         max_runtime_seconds=cfg.max_runtime_seconds,
         port=port,
     )

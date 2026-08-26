@@ -79,7 +79,7 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
         provision=provision,
         teardown=teardown,
         outputs_dir=outputs_dir,
-        use_docker=cfg.use_docker,
+        mode="docker" if cfg.use_docker else "native",
         max_runtime_seconds=cfg.max_runtime_seconds,
         ssh_ready_wait_seconds=cfg.ssh_ready_wait_seconds,
         # Re-run config-ssh while waiting: the alias only resolves once the

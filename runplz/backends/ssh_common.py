@@ -2241,15 +2241,25 @@ def dispatch_to_target(
     target: str,
     backend: str,
     outputs_dir: str = "out",
-    use_docker: bool = True,
+    mode: str = "docker",
     max_runtime_seconds: Optional[int] = None,
     port: Optional[int] = None,
 ) -> DispatchResult:
     """Run one function on an already-reachable box, start to finish.
 
-    Stages the repo, probes preconditions, runs the job (docker or native),
-    streams its output and brings the outputs back. Raises ``RuntimeError``
-    with a log tail if the remote command exited non-zero.
+    Stages the repo, probes preconditions, runs the job, streams its output
+    and brings the outputs back. Raises ``RuntimeError`` with a log tail if
+    the remote command exited non-zero.
+
+    ``mode`` picks the runner:
+
+    - ``"docker"``   build/pull an image on the box and run the bootstrap in
+      a container. The default, and what ssh/gcp/aws use.
+    - ``"native"``   install a python venv on the box and run the bootstrap
+      directly. No docker involved.
+    - ``"container"`` the box *is* the user's image already (brev's
+      container mode), so the Image DSL ops are applied inline over ssh and
+      the bootstrap is invoked without docker-in-docker.
 
     Owns its own container cleanup and failure-tail capture, because both have
     to happen before a caller tears the box down — afterwards the logs are
@@ -2289,11 +2299,25 @@ def dispatch_to_target(
 
     rel_script = Path(function.module_file).resolve().relative_to(repo)
 
+    if mode not in ("docker", "native", "container"):
+        raise ValueError(f"mode must be 'docker', 'native' or 'container'; got {mode!r}")
+
     container_name: Optional[str] = None
     exit_code: Optional[int] = None
     failure_tail = ""
     try:
-        if use_docker:
+        if mode == "container":
+            exit_code = _run_container_mode(
+                target=target,
+                function=function,
+                rel_script=str(rel_script),
+                args=args,
+                kwargs=kwargs,
+                remote_run=remote_run,
+                max_runtime_seconds=max_runtime_seconds,
+                port=port,
+            )
+        elif mode == "docker":
             _ensure_docker(target, port=port)
             gpu_flag = "--gpus all" if _remote_has_nvidia(target, port=port) else ""
             container_name = make_container_name(function.name)
@@ -2385,7 +2409,7 @@ def run_on_provisioned_vm(
     provision: Callable[[], tuple],
     teardown: Callable[[], None],
     outputs_dir: str = "out",
-    use_docker: bool = True,
+    mode: str = "docker",
     max_runtime_seconds: Optional[int] = None,
     ssh_ready_wait_seconds: int = 1800,
     refresh_callback: Optional[Callable[[], None]] = None,
@@ -2398,13 +2422,12 @@ def run_on_provisioned_vm(
 
     Anything that raises after ``provision`` has been called leaks a paid box
     unless teardown runs, which is why the try block opens *before* provision
-    rather than after it (issue #29).
+    rather than after it, and why teardown runs even when provision itself
+    failed (issue #29).
     """
     with orchestrator_signal_cleanup(label):
-        provisioned = False
         try:
             target, port = provision()
-            provisioned = True
             _wait_until_ssh_reachable(
                 target,
                 port=port,
@@ -2419,13 +2442,14 @@ def run_on_provisioned_vm(
                 target=target,
                 backend=backend,
                 outputs_dir=outputs_dir,
-                use_docker=use_docker,
+                mode=mode,
                 max_runtime_seconds=max_runtime_seconds,
                 port=port,
             )
         finally:
-            # Only tear down what we actually created. If provision() itself
-            # raised before allocating anything there is nothing to clean up,
-            # and calling teardown would emit a confusing failure.
-            if provisioned:
-                teardown()
+            # Unconditional, including when provision() itself raised
+            # partway. A create that failed *after* allocating the box is
+            # precisely the leak issue #29 was about, and only teardown can
+            # tell the difference — so it always runs and is responsible for
+            # handling "there was nothing to clean up" quietly.
+            teardown()
