@@ -1,3 +1,37 @@
+## 2026-08-26 PR Plan — HUP-Safe Detached Bootstrap (#73)
+
+Branch: `fix-detached-bootstrap-hup` (off `main` @ `dc5cd38`)
+
+- [x] Ignore SIGHUP in the remote launcher shell before spawning `nohup`, closing the pre-exec
+  race where SSH teardown can kill the child before `nohup` installs its signal disposition
+- [x] Retain SIGHUP ignore inside the generated `run.sh` wrapper as defense in depth
+- [x] Add regression coverage for launcher ordering and a real detached child surviving SIGHUP
+- [x] Bump `runplz/version.py` to 3.15.4
+- [x] Run `./format.sh`, `./lint.sh`, and `./test.sh`
+- [ ] Review the final diff, commit, push, open a PR closing #73, wait for green CI, merge, and
+  deploy 3.15.4 to PyPI
+
+### Scope / design
+
+- Keep the existing PID-stable `nohup bash` launcher, lifecycle events, startup handshake, and
+  reconnect monitor unchanged.
+- Install the ignored HUP disposition in the parent shell before `nohup` is forked so the child
+  inherits safety during the fork-to-exec window; install the same disposition at the top of the
+  generated child script so later shell behavior cannot reintroduce the hazard.
+- Lock both properties with a structural ordering assertion plus an executable signal test that
+  sends HUP to the recorded detached PID and observes successful completion.
+
+### Review section
+
+- The launcher now installs the ignored HUP disposition before any child can be forked and repeats
+  it as the first line of `run.sh`; PID tracking, event semantics, diagnostics, and reconnect logic
+  are unchanged.
+- The regression test executes the generated launcher, signals the recorded child PID, and proves
+  the payload survives and completes.
+- Focused SSH/Brev tests pass (`144 passed`).
+- `./format.sh` and `./lint.sh` pass.
+- `./test.sh` passes (`452 passed`, 93% total coverage).
+
 ## 2026-08-20 PR Plan — Git-Aware Staging + Reliable Detached Bootstrap (#68, #69)
 
 Branch: `fix-ignored-staging-detached-bootstrap` (off `main` @ `9fd9a41`)
