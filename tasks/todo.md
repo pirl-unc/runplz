@@ -1,3 +1,62 @@
+## 2026-08-26 PR Plan — Direct GCP / AWS provisioning backends (#25)
+
+Branch: `feat/gcp-aws-backends` (off `main` @ `27fd9c5`)
+
+- [x] Commit 1 — extract the shared VM dispatch + lifecycle core into `ssh_common`
+- [x] Commit 2/3 — `gcp.py` + `GcpConfig`, `aws.py` + `AwsConfig`, both CLI-based
+- [x] Bump `runplz/version.py` to 3.17.0
+- [x] Run `./format.sh`, `./lint.sh`, `./test.sh`
+- [ ] Review the final diff, push, open a PR closing #25, merge, deploy 3.17.0
+
+### The "is there a library for this" question
+
+No third-party one worth taking. Apache Libcloud adds a dependency to a repo whose
+stated scope is stdlib-only, and its GCE accelerator support is weak. SkyPilot/dstack
+sit at runplz's own layer and would subsume it rather than serve it. The abstraction
+worth having was *internal* and already half-present: `ssh.py::run()` and
+`brev.py::run()` duplicated the dispatch core almost line for line. Extracting it once
+means a new cloud is ~150 lines of provision → hand over a target → tear down.
+
+### CLI, not SDK
+
+The issue text suggested `boto3 ec2.run_instances`. Went the other way, because
+`tests/conftest.py` already lists `gcloud` and `aws` in `_BILLED_COMMANDS` behind
+`live_gcp`/`live_aws` markers — an SDK call is invisible to that guard, so a test that
+forgot to mock could launch a real p5.48xlarge. CLI keeps the new code inside the
+existing safety net and the core dependency-free. Added `test_conftest_guard` cases
+proving the guard covers `runplz.backends._cloud`.
+
+### Scope / design
+
+- `dispatch_to_target()` owns its own container cleanup and failure-tail capture,
+  because both must happen before a provisioning caller deletes the box — afterwards
+  the logs are gone.
+- `run_on_provisioned_vm()` opens its try *before* provision so a mid-provision failure
+  still reaches teardown (issue #29), and only tears down if something was allocated.
+- `orchestrator_signal_cleanup` moved up from brev so every provisioning backend gets
+  the SIGTERM/SIGHUP billing-leak protection from #38, not just brev.
+- GCP SSH rides on `gcloud compute config-ssh` — a direct analogue of `brev refresh`,
+  so it plugs into the existing `_wait_until_ssh_reachable` refresh callback with no
+  new ssh plumbing.
+- AWS always sends an explicit block-device-mapping even at the AMI's default size:
+  that is what pins `DeleteOnTermination`, without which `on_finish="delete"` leaves a
+  billed EBS volume and fails the issue's own "deletes VM + disks" criterion.
+- brev.py deliberately NOT migrated onto the shared core — 1200 lines behind 2800 lines
+  of tests, wrong risk trade in a PR adding two backends. Filed as #78.
+
+### Review section
+
+- All flags were validated offline against the installed CLIs (`gcloud compute
+  instances create --help`, `aws ec2 run-instances help`) before being emitted —
+  caught `--subnet` vs `--subnetwork` without touching either cloud account.
+- Running `dry_run=True` end to end caught a real bug: gcp's teardown was missing the
+  flag and **actually invoked `gcloud compute instances delete`** during a dry run. It
+  failed only because the local auth token happened to be stale. Fixed, plus a test per
+  backend asserting `subprocess.run` is never called in dry-run.
+- `./format.sh` and `./lint.sh` pass. `./test.sh` passes (`577 passed`, 93% coverage),
+  55 of them new.
+- No live cloud calls at any point. Nothing was provisioned and nothing was billed.
+
 ## 2026-08-26 PR Plan — Sweep of #75 / #72 / #67 (kill + packaging)
 
 Branch: `feat/runplz-kill-and-packaging-fixes` (off `main` @ `102cc11`)

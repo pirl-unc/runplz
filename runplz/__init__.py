@@ -23,6 +23,8 @@ Run it from the CLI:
     runplz brev  jobs/train.py                       # ephemeral GPU box
     runplz brev  --instance my-box jobs/train.py     # attach to existing brev box
     runplz ssh   --host gpu.example.com jobs/train.py
+    runplz gcp   jobs/train.py                       # ephemeral GCE VM
+    runplz aws   jobs/train.py                       # ephemeral EC2 instance
     runplz modal jobs/train.py
 
 Multi-step driver? Add an explicit ``@app.local_entrypoint()`` and call
