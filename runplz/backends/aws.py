@@ -14,7 +14,7 @@ inbound TCP 22 from wherever runplz is running, or the run will sit in the
 ssh wait until it times out.
 """
 
-from runplz.backends._cloud import (
+from runplz.backends.provisioning import (
     AWS_GPUS,
     CloudCliError,
     apply_teardown,

@@ -85,6 +85,37 @@ returns a CompletedProcess for the caller to inspect, `run_cli` raises. Extracti
 just the loop would be a thin win wrapped around the most heavily-tested code path in
 the repo. Filed as a follow-up rather than forced.
 
+### Making the shared layer public
+
+The unified modules were private (`_cloud`, `_docker`, `_registry`) and much of the
+shared contract sat behind underscores, which was the wrong signal: a backend is
+*expected* to be written against this layer.
+
+- Modules renamed with semantic names: `_docker` -> `backends.docker`,
+  `_cloud` -> `backends.provisioning` (brev provisions too, so "cloud" was wrong),
+  `_registry` -> `backends.registry`.
+- Promoted the 13 ssh_common names other modules actually call:
+  `wait_until_ssh_reachable`, `ssh_exec`, `ssh_capture`, `ssh_cmd_opts`, `run_local`,
+  `rsync_down`, `rsync_ssh_transport`, `parse_probe_sections`, `container_running`,
+  `raise_for_runtime_cap`, `render_image_ops_script`, `CLEANUP_SIGNALS`,
+  `validate_remote_path`. No compat aliases — every reference was updated.
+- `remote_shell_path` moved from `_runs` into `ssh_common` alongside
+  `validate_remote_path` / `validate_run_id` / `is_safe_run_id`. `_runs` was reaching
+  across a module line for two regexes; now it calls functions.
+- Every shared module declares an explicit `__all__` grouped by purpose.
+
+**What stayed private, deliberately.** The staging/streaming helpers
+(`_prepare_remote_run`, `_build_image`, `_run_container_detached`, `_stream_and_wait`,
+`_run_native`, `_check_preconditions`, ...) are internals of `dispatch_to_target`.
+`dispatch_to_target` *is* the contract; a backend should never need to reach past it.
+`tests/test_public_api.py` pins both halves: nothing exported may be private, and
+those internals may not appear in `__all__`.
+
+One behavior change fell out: rejecting a tampered manifest path now raises
+`ValueError` (the accurate type) rather than `RuntimeError`, so the three CLI
+handlers catch both. The message got better in the process — it names where the bad
+value came from.
+
 ### Review section
 
 - All flags were validated offline against the installed CLIs (`gcloud compute

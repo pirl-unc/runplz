@@ -19,60 +19,61 @@ from pathlib import Path
 from typing import Optional
 
 from runplz._selector import Candidate
-from runplz.backends._cloud import (
+from runplz.backends.provisioning import (
     CloudCliError,
     apply_teardown,
     make_instance_name,
     split_instance_name,
 )
 from runplz.backends.ssh_common import (
-    _CLEANUP_SIGNALS as ssh_common_CLEANUP_SIGNALS,
+    CLEANUP_SIGNALS as ssh_common_CLEANUP_SIGNALS,
 )
 
-# brev's dispatch now runs through ssh_common.run_on_provisioned_vm, so
-# several of these are no longer called from this module. They stay
-# imported because `runplz.backends.brev.<helper>` has been part of this
-# module's surface since 3.5 and the test suite reaches them that way.
+# brev's dispatch runs through ssh_common.run_on_provisioned_vm, so the
+# staging/run helpers below are no longer called from this module — they are
+# internals of dispatch_to_target now. They stay imported because
+# `runplz.backends.brev.<helper>` has been part of this module's surface
+# since 3.5 and the test suite patches them here.
 from runplz.backends.ssh_common import (  # noqa: F401
     FAILURE_TAIL_LINES,
     OrchestratorKilled,
     _build_image,
     _check_preconditions,
-    _container_running,
     _ensure_docker,
     _ensure_remote_rsync,
     _fetch_failure_tail,
     _prepare_remote_run,
-    _raise_for_runtime_cap,
     _remote_has_nvidia,
-    _render_ops_script,
-    _rsync_down,
     _run_container_detached,
     _run_container_mode,
     _run_native,
-    _sh,
-    _ssh,
-    _ssh_capture,
     _stream_and_wait,
-    _wait_until_ssh_reachable,
     build_remote_run_manifest,
+    container_running,
     make_container_name,
     make_remote_run_context,
     orchestrator_signal_cleanup,
+    raise_for_runtime_cap,
+    render_image_ops_script,
+    rsync_down,
     rsync_up,
+    run_local,
     run_on_provisioned_vm,
+    ssh_capture,
+    ssh_exec,
+    wait_until_ssh_reachable,
 )
 
 # Re-exports so older test patches and external code that patched these
 # keep working without a hard rename. 3.8's _brev_capture / _brev_sh
-# replaced `_sh` for brev CLI calls, but tests still patch `brev._sh`
+# replaced `run_local` for brev CLI calls, but tests still patch `brev.run_local`
 # in a few places — the re-export keeps the test surface stable.
 _ = (  # noqa: F841 — held for test-mocking compatibility
-    _container_running,
-    _raise_for_runtime_cap,
-    _render_ops_script,
-    _sh,
-    _ssh,
+    container_running,
+    raise_for_runtime_cap,
+    render_image_ops_script,
+    run_local,
+    ssh_exec,
 )
 
 __all__ = ["run"]
@@ -82,7 +83,7 @@ __all__ = ["run"]
 # Some providers cap names around 30-40 chars; keep the generated part short
 # enough that typical app/function names fit comfortably.
 # Instance naming is the shared provisioning contract — see
-# runplz.backends._cloud. Kept as module-level aliases because both have
+# runplz.backends.provisioning. Kept as module-level aliases because both have
 # been part of brev's surface since 3.9 and the tests reach them here.
 _make_ephemeral_name = make_instance_name
 _split_ephemeral_name = split_instance_name
@@ -107,7 +108,7 @@ _BREV_ONBOARDING_DONE = {
 # Signal-driven cleanup lives in ssh_common now, shared with every
 # provisioning backend. These names are kept so existing callers and tests
 # keep working.
-_CLEANUP_SIGNALS = ssh_common_CLEANUP_SIGNALS
+CLEANUP_SIGNALS = ssh_common_CLEANUP_SIGNALS
 _OrchestratorKilled = OrchestratorKilled
 _orchestrator_signal_cleanup = orchestrator_signal_cleanup
 
@@ -465,7 +466,7 @@ class BrevInstanceFailed(RuntimeError):
 def _check_terminal_state(name: str) -> None:
     """Raise BrevInstanceFailed if `brev ls` reports a terminal failure
     state for this instance. Called periodically during
-    _wait_until_ssh_reachable so we stop probing dead boxes early.
+    wait_until_ssh_reachable so we stop probing dead boxes early.
 
     Silent no-op if status isn't recognizable — the reachability loop
     handles ambiguous cases by timing out normally.
@@ -488,7 +489,7 @@ def _start_instance_if_stopped(name: str) -> None:
 
     The 3.2 default of `on_finish="stop"` means every previous runplz run
     leaves the box powered off — without this, the next run silently hangs
-    in `_wait_until_ssh_reachable` until the 20-minute deadline. Best-
+    in `wait_until_ssh_reachable` until the 20-minute deadline. Best-
     effort: if Brev's schema doesn't expose a status we can recognize, we
     skip and let the SSH reachability loop figure it out (or time out).
     """
@@ -843,7 +844,7 @@ def _brev_sh(
     retry_waits: tuple = _BREV_DEFAULT_RETRIES,
     label: Optional[str] = None,
 ):
-    """Analogue of `_sh` for brev CLI calls: runs with retries, prints the
+    """Analogue of `run_local` for brev CLI calls: runs with retries, prints the
     command, and raises on final non-zero exit."""
     import shlex as _shlex
 
@@ -874,7 +875,7 @@ def _apply_on_finish(*, instance: str, cfg) -> None:
     """Stop / delete / leave the Brev box per `cfg.on_finish`.
 
     Runs under the shared teardown contract (see
-    :func:`runplz.backends._cloud.apply_teardown`): never raises, never fails
+    :func:`runplz.backends.provisioning.apply_teardown`): never raises, never fails
     quietly. Brev adds two things the other providers don't have — retries on
     transient API errors via :func:`_brev_capture`, so a single flaky call
     doesn't leak a billed box, and a post-action state check that confirms the

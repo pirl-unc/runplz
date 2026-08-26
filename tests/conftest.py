@@ -85,7 +85,7 @@ class _GuardedSubprocessModule:
 # reference wrapped for the duration of each test.
 _MODULES_TO_GUARD = (
     "runplz.backends.brev",
-    "runplz.backends._cloud",
+    "runplz.backends.provisioning",
     "runplz._runs",
     "runplz.backends.ssh_common",
     "runplz.backends.ssh",

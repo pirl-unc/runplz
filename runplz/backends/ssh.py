@@ -18,13 +18,13 @@ import re
 import subprocess
 from typing import Optional
 
-from runplz.backends import _docker
+from runplz.backends import docker
 from runplz.backends.ssh_common import (
-    _parse_probe_sections,
-    _ssh_capture,
-    _ssh_cmd_opts,
-    _wait_until_ssh_reachable,
     dispatch_to_target,
+    parse_probe_sections,
+    ssh_capture,
+    ssh_cmd_opts,
+    wait_until_ssh_reachable,
 )
 
 __all__ = ["run", "list_jobs"]
@@ -34,7 +34,7 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
     cfg = app.ssh_config
     target, port = _build_ssh_target(host, user=cfg.user, port=cfg.port)
 
-    _wait_until_ssh_reachable(target, port=port, max_wait_s=cfg.ssh_ready_wait_seconds)
+    wait_until_ssh_reachable(target, port=port, max_wait_s=cfg.ssh_ready_wait_seconds)
     _warn_on_spec_mismatch(target, function, port=port)
 
     # No teardown: the user owns this box's lifecycle, which is the whole
@@ -62,10 +62,10 @@ def list_jobs(*, host: str, user: Optional[str] = None, port: Optional[int] = No
     target, resolved_port = _build_ssh_target(host, user=user, port=port)
     cmd = [
         "ssh",
-        *_ssh_cmd_opts(resolved_port),
+        *ssh_cmd_opts(resolved_port),
         target,
-        f"sudo docker ps --filter {_docker.PS_FILTER} "
-        f"--format '{_docker.PS_FORMAT}' 2>/dev/null || true",
+        f"sudo docker ps --filter {docker.PS_FILTER} "
+        f"--format '{docker.PS_FORMAT}' 2>/dev/null || true",
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
@@ -73,7 +73,7 @@ def list_jobs(*, host: str, user: Optional[str] = None, port: Optional[int] = No
             f"ssh to {target!r} failed (rc={r.returncode}). "
             f"stderr: {(r.stderr or '').strip()[:300]}"
         )
-    return _docker.parse_ps_rows(r.stdout, backend="ssh", name_prefix=f"{target}:")
+    return docker.parse_ps_rows(r.stdout, backend="ssh", name_prefix=f"{target}:")
 
 
 def _build_ssh_target(
@@ -125,7 +125,7 @@ def _warn_on_spec_mismatch(target: str, function, *, port: Optional[int] = None)
     add latency for every dimension.
     """
     try:
-        probe = _ssh_capture(
+        probe = ssh_capture(
             target,
             "echo '---NPROC---'; nproc; "
             "echo '---MEMINFO---'; cat /proc/meminfo 2>/dev/null | head -1; "
@@ -141,7 +141,7 @@ def _warn_on_spec_mismatch(target: str, function, *, port: Optional[int] = None)
         )
         return
 
-    sections = _parse_probe_sections(probe)
+    sections = parse_probe_sections(probe)
     warnings = []
     warnings.extend(_check_cpu(sections.get("NPROC", ""), function))
     warnings.extend(_check_memory(sections.get("MEMINFO", ""), function))

@@ -13,7 +13,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from runplz.backends import _docker
+from runplz.backends import docker
 
 IMAGE_TAG_DEFAULT = "runplz-local"
 
@@ -52,7 +52,7 @@ def run(
         "--rm",
         "--name",
         f"runplz-{app.name}-{function.name}",
-        *_docker.label_args(app.name, function.name),
+        *docker.label_args(app.name, function.name),
         "-v",
         f"{host_out}:/out",
         "-w",
@@ -133,7 +133,7 @@ def list_jobs() -> list[dict]:
     """
     try:
         r = subprocess.run(
-            ["docker", *_docker.ps_args()],
+            ["docker", *docker.ps_args()],
             capture_output=True,
             text=True,
         )
@@ -142,12 +142,12 @@ def list_jobs() -> list[dict]:
         # are no local runplz containers because there's no docker at all.
         return []
     if r.returncode != 0:
-        if _docker.looks_like_daemon_down((r.stderr or "") + (r.stdout or "")):
+        if docker.looks_like_daemon_down((r.stderr or "") + (r.stdout or "")):
             return []
         raise RuntimeError(
             f"`docker ps` failed (rc={r.returncode}). stderr: {(r.stderr or '').strip()[:300]}"
         )
-    return _docker.parse_ps_rows(r.stdout, backend="local")
+    return docker.parse_ps_rows(r.stdout, backend="local")
 
 
 def _print_reused_image(tag: str) -> None:

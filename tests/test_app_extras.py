@@ -97,35 +97,35 @@ def test_registry_backs_every_parallel_backend_list():
     """These used to be three hand-maintained tuples that had to agree."""
     from runplz import _cli
     from runplz.app import _VALID_BACKENDS
-    from runplz.backends import _registry
+    from runplz.backends import registry
 
-    assert _VALID_BACKENDS == _registry.names()
-    assert _cli._PS_BACKENDS == _registry.ps_names()
-    assert set(_registry.ps_names()) <= set(_registry.names())
-    assert set(_registry.provisioning_names()) <= set(_registry.names())
+    assert _VALID_BACKENDS == registry.names()
+    assert _cli._PS_BACKENDS == registry.ps_names()
+    assert set(registry.ps_names()) <= set(registry.names())
+    assert set(registry.provisioning_names()) <= set(registry.names())
 
 
 def test_every_registered_backend_is_importable_and_runnable():
-    from runplz.backends import _registry
+    from runplz.backends import registry
 
-    for name in _registry.names():
+    for name in registry.names():
         if name == "modal":
             continue  # optional extra; may not be installed
-        module = _registry.load(name)
+        module = registry.load(name)
         assert callable(module.run), name
 
 
 def test_every_ps_backend_exposes_list_jobs():
-    from runplz.backends import _registry
+    from runplz.backends import registry
 
-    for name in _registry.ps_names():
+    for name in registry.ps_names():
         if name == "modal":
             continue
-        assert callable(_registry.load(name).list_jobs), name
+        assert callable(registry.load(name).list_jobs), name
 
 
 def test_registry_rejects_an_unknown_backend():
-    from runplz.backends import _registry
+    from runplz.backends import registry
 
     with pytest.raises(ValueError, match="backend must be one of"):
-        _registry.get("k8s")
+        registry.get("k8s")

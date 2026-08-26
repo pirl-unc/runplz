@@ -34,7 +34,7 @@ import typing
 from pathlib import Path
 
 from runplz.app import _VALID_BACKENDS, _repo_root_for
-from runplz.backends import _registry
+from runplz.backends import registry
 
 
 def main(argv=None):
@@ -327,8 +327,8 @@ def _load_app(script_path: Path):
 
 
 # Which backends `runplz ps` can enumerate is a property of each backend,
-# declared once in runplz.backends._registry.
-_PS_BACKENDS = _registry.ps_names()
+# declared once in runplz.backends.registry.
+_PS_BACKENDS = registry.ps_names()
 
 
 def _ps_main(argv):
@@ -387,7 +387,7 @@ def _ps_main(argv):
 
 
 def _collect_backend_jobs(backend: str) -> list[dict]:
-    return _registry.load(backend).list_jobs()
+    return registry.load(backend).list_jobs()
 
 
 def _print_ps_table(rows: list[dict]) -> None:
@@ -439,7 +439,7 @@ def _tail_main(argv):
     except _runs.ManifestNotFound as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
@@ -462,7 +462,7 @@ def _status_main(argv):
     except _runs.ManifestNotFound as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
@@ -518,7 +518,7 @@ def _kill_main(argv, *, prog="kill"):
     except _runs.ManifestNotFound as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 

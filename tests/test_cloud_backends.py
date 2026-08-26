@@ -12,7 +12,7 @@ from unittest import mock
 import pytest
 
 from runplz import App, AwsConfig, GcpConfig, Image
-from runplz.backends import _cloud, aws, gcp
+from runplz.backends import aws, gcp, provisioning
 
 
 def _app(tmp_path, **configs) -> App:
@@ -95,8 +95,8 @@ def test_cloud_backends_reject_instance_and_host(tmp_path):
 
 
 def test_instance_names_are_dns_safe_prefixed_and_unique():
-    a = _cloud.make_instance_name("My App!", "Train_Model")
-    b = _cloud.make_instance_name("My App!", "Train_Model")
+    a = provisioning.make_instance_name("My App!", "Train_Model")
+    b = provisioning.make_instance_name("My App!", "Train_Model")
     assert a.startswith("runplz-")
     assert a != b, "two concurrent runs would collide on the name"
     assert all(c.islower() or c.isdigit() or c == "-" for c in a), a
@@ -104,7 +104,7 @@ def test_instance_names_are_dns_safe_prefixed_and_unique():
 
 
 def test_instance_name_survives_an_all_punctuation_input():
-    name = _cloud.make_instance_name("!!!", "???")
+    name = provisioning.make_instance_name("!!!", "???")
     assert name.startswith("runplz-x-x-")
 
 
@@ -156,21 +156,21 @@ def test_explicit_machine_type_wins(tmp_path):
 def test_min_gpu_memory_picks_the_smallest_gpu_that_fits(tmp_path):
     app = _app(tmp_path, gcp_config=_gcp())
     fn = _function(app, min_gpu_memory=40)
-    assert _cloud.resolve_gpu_label(fn, _cloud.GCP_GPUS) == "A100-40GB"
+    assert provisioning.resolve_gpu_label(fn, provisioning.GCP_GPUS) == "A100-40GB"
 
 
 def test_min_gpu_memory_beyond_every_known_gpu_is_an_error(tmp_path):
     app = _app(tmp_path, gcp_config=_gcp())
     fn = _function(app, min_gpu_memory=500)
-    with pytest.raises(_cloud.CloudCliError, match="exceeds every GPU"):
-        _cloud.resolve_gpu_label(fn, _cloud.GCP_GPUS)
+    with pytest.raises(provisioning.CloudCliError, match="exceeds every GPU"):
+        provisioning.resolve_gpu_label(fn, provisioning.GCP_GPUS)
 
 
 def test_unknown_gpu_label_names_the_alternatives(tmp_path):
     app = _app(tmp_path, gcp_config=_gcp())
     fn = _function(app, gpu="A10G")  # valid on AWS, absent from the GCP table
-    with pytest.raises(_cloud.CloudCliError, match="no mapping for this cloud"):
-        _cloud.resolve_gpu_label(fn, _cloud.GCP_GPUS)
+    with pytest.raises(provisioning.CloudCliError, match="no mapping for this cloud"):
+        provisioning.resolve_gpu_label(fn, provisioning.GCP_GPUS)
 
 
 def test_no_gpu_request_yields_a_cpu_shape(tmp_path):
@@ -200,7 +200,7 @@ def test_aws_instance_type_derived_from_gpu(tmp_path, spec, expect):
 def test_aws_rejects_an_impossible_gpu_count_before_ec2_does(tmp_path):
     app = _app(tmp_path, aws_config=_aws())
     fn = _function(app, gpu="H100", min_gpus=2)
-    with pytest.raises(_cloud.CloudCliError, match="only exists as an 8-GPU shape"):
+    with pytest.raises(provisioning.CloudCliError, match="only exists as an 8-GPU shape"):
         aws.resolve_instance_type(app.aws_config, fn)
 
 
@@ -283,7 +283,7 @@ def test_aws_gpu_run_resolves_the_deep_learning_ami(tmp_path):
     cfg = _aws()
     app = _app(tmp_path, aws_config=cfg)
     fn = _function(app, gpu="T4")
-    with mock.patch.object(_cloud.subprocess, "run") as run_mock:
+    with mock.patch.object(provisioning.subprocess, "run") as run_mock:
         run_mock.return_value = mock.Mock(returncode=0, stdout="ami-abc123\n", stderr="")
         assert aws.resolve_ami(cfg, fn) == "ami-abc123"
     sent = run_mock.call_args.args[0]
@@ -294,7 +294,7 @@ def test_aws_cpu_run_does_not_pull_the_gpu_ami(tmp_path):
     cfg = _aws()
     app = _app(tmp_path, aws_config=cfg)
     fn = _function(app, min_cpu=2)
-    with mock.patch.object(_cloud.subprocess, "run") as run_mock:
+    with mock.patch.object(provisioning.subprocess, "run") as run_mock:
         run_mock.return_value = mock.Mock(returncode=0, stdout="ami-plain\n", stderr="")
         aws.resolve_ami(cfg, fn)
     sent = " ".join(run_mock.call_args.args[0])
@@ -306,9 +306,9 @@ def test_aws_rejects_ssm_output_that_is_not_an_ami(tmp_path):
     cfg = _aws()
     app = _app(tmp_path, aws_config=cfg)
     fn = _function(app, gpu="T4")
-    with mock.patch.object(_cloud.subprocess, "run") as run_mock:
+    with mock.patch.object(provisioning.subprocess, "run") as run_mock:
         run_mock.return_value = mock.Mock(returncode=0, stdout="None\n", stderr="")
-        with pytest.raises(_cloud.CloudCliError, match="Could not resolve an AMI"):
+        with pytest.raises(provisioning.CloudCliError, match="Could not resolve an AMI"):
             aws.resolve_ami(cfg, fn)
 
 
@@ -321,9 +321,9 @@ def test_aws_requires_a_key_name(tmp_path):
 
 def test_aws_missing_public_ip_is_a_clear_error(tmp_path):
     cfg = _aws()
-    with mock.patch.object(_cloud.subprocess, "run") as run_mock:
+    with mock.patch.object(provisioning.subprocess, "run") as run_mock:
         run_mock.return_value = mock.Mock(returncode=0, stdout="None\n", stderr="")
-        with pytest.raises(_cloud.CloudCliError, match="no public IP"):
+        with pytest.raises(provisioning.CloudCliError, match="no public IP"):
             aws._public_ip(cfg, "i-123")
 
 
@@ -337,7 +337,7 @@ def test_aws_missing_public_ip_is_a_clear_error(tmp_path):
 )
 def test_gcp_on_finish_runs_the_right_verb(on_finish, expect_verb):
     cfg = _gcp(on_finish=on_finish)
-    with mock.patch.object(_cloud.subprocess, "run") as run_mock:
+    with mock.patch.object(provisioning.subprocess, "run") as run_mock:
         run_mock.return_value = mock.Mock(returncode=0, stdout="", stderr="")
         gcp.apply_on_finish(cfg, "box-1")
     sent = run_mock.call_args.args[0]
@@ -347,14 +347,14 @@ def test_gcp_on_finish_runs_the_right_verb(on_finish, expect_verb):
 
 
 def test_gcp_on_finish_leave_touches_nothing():
-    with mock.patch.object(_cloud.subprocess, "run") as run_mock:
+    with mock.patch.object(provisioning.subprocess, "run") as run_mock:
         gcp.apply_on_finish(_gcp(on_finish="leave"), "box-1")
     run_mock.assert_not_called()
 
 
 def test_gcp_teardown_failure_warns_loudly_but_does_not_raise(capsys):
     """A raise here would mask the real error from the run itself."""
-    with mock.patch.object(_cloud.subprocess, "run") as run_mock:
+    with mock.patch.object(provisioning.subprocess, "run") as run_mock:
         run_mock.return_value = mock.Mock(returncode=1, stdout="", stderr="quota exceeded")
         gcp.apply_on_finish(_gcp(), "box-1")
     out = capsys.readouterr().out
@@ -368,7 +368,7 @@ def test_gcp_teardown_failure_warns_loudly_but_does_not_raise(capsys):
 )
 def test_aws_on_finish_runs_the_right_action(on_finish, expect):
     cfg = _aws(on_finish=on_finish)
-    with mock.patch.object(_cloud.subprocess, "run") as run_mock:
+    with mock.patch.object(provisioning.subprocess, "run") as run_mock:
         run_mock.return_value = mock.Mock(returncode=0, stdout="{}", stderr="")
         aws.apply_on_finish(cfg, "i-123", name="box-1")
     assert run_mock.call_args.args[0][2] == expect
@@ -376,14 +376,14 @@ def test_aws_on_finish_runs_the_right_action(on_finish, expect):
 
 def test_aws_teardown_without_an_instance_id_says_so(capsys):
     """Silence here would read as 'cleaned up' when nothing was checked."""
-    with mock.patch.object(_cloud.subprocess, "run") as run_mock:
+    with mock.patch.object(provisioning.subprocess, "run") as run_mock:
         aws.apply_on_finish(_aws(), None, name="box-1")
     run_mock.assert_not_called()
     assert "nothing to tear down" in capsys.readouterr().out
 
 
 def test_aws_teardown_failure_warns_loudly_but_does_not_raise(capsys):
-    with mock.patch.object(_cloud.subprocess, "run") as run_mock:
+    with mock.patch.object(provisioning.subprocess, "run") as run_mock:
         run_mock.return_value = mock.Mock(returncode=1, stdout="", stderr="boom")
         aws.apply_on_finish(_aws(), "i-123", name="box-1")
     assert "still be billing" in capsys.readouterr().out
@@ -405,7 +405,7 @@ def test_dry_run_executes_absolutely_nothing(tmp_path, backend, capsys):
     fn = _function(app, gpu="T4", min_disk=100)
     app.bind(backend)
 
-    with mock.patch.object(_cloud.subprocess, "run") as run_mock:
+    with mock.patch.object(provisioning.subprocess, "run") as run_mock:
         fn.remote()
     run_mock.assert_not_called()
 
@@ -422,31 +422,31 @@ def test_dry_run_executes_absolutely_nothing(tmp_path, backend, capsys):
 
 
 def test_run_cli_surfaces_stderr_on_failure():
-    with mock.patch.object(_cloud.subprocess, "run") as run_mock:
+    with mock.patch.object(provisioning.subprocess, "run") as run_mock:
         run_mock.return_value = mock.Mock(
             returncode=1, stdout="", stderr="ZONE_RESOURCE_POOL_EXHAUSTED"
         )
-        with pytest.raises(_cloud.CloudCliError, match="ZONE_RESOURCE_POOL_EXHAUSTED"):
-            _cloud.run_cli(["gcloud", "x"], label="gcloud x")
+        with pytest.raises(provisioning.CloudCliError, match="ZONE_RESOURCE_POOL_EXHAUSTED"):
+            provisioning.run_cli(["gcloud", "x"], label="gcloud x")
 
 
 def test_run_cli_explains_a_missing_cli():
-    with mock.patch.object(_cloud.subprocess, "run", side_effect=FileNotFoundError()):
-        with pytest.raises(_cloud.CloudCliError, match="not found on PATH"):
-            _cloud.run_cli(["gcloud", "x"], label="gcloud x")
+    with mock.patch.object(provisioning.subprocess, "run", side_effect=FileNotFoundError()):
+        with pytest.raises(provisioning.CloudCliError, match="not found on PATH"):
+            provisioning.run_cli(["gcloud", "x"], label="gcloud x")
 
 
 def test_run_cli_check_false_tolerates_failure():
-    with mock.patch.object(_cloud.subprocess, "run") as run_mock:
+    with mock.patch.object(provisioning.subprocess, "run") as run_mock:
         run_mock.return_value = mock.Mock(returncode=1, stdout="", stderr="transient")
-        assert _cloud.run_cli(["gcloud", "x"], label="x", check=False) is not None
+        assert provisioning.run_cli(["gcloud", "x"], label="x", check=False) is not None
 
 
 def test_run_cli_rejects_non_json_when_json_expected():
-    with mock.patch.object(_cloud.subprocess, "run") as run_mock:
+    with mock.patch.object(provisioning.subprocess, "run") as run_mock:
         run_mock.return_value = mock.Mock(returncode=0, stdout="not json", stderr="")
-        with pytest.raises(_cloud.CloudCliError, match="not JSON"):
-            _cloud.run_cli(["aws", "x"], label="x", parse_json=True)
+        with pytest.raises(provisioning.CloudCliError, match="not JSON"):
+            provisioning.run_cli(["aws", "x"], label="x", parse_json=True)
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +455,7 @@ def test_run_cli_rejects_non_json_when_json_expected():
 
 def test_teardown_leave_announces_and_does_nothing(capsys):
     calls = []
-    _cloud.apply_teardown(
+    provisioning.apply_teardown(
         on_finish="leave",
         target="box-1",
         run_action=calls.append,
@@ -472,7 +472,7 @@ def test_teardown_never_raises_but_always_shouts(capsys):
     def boom(_on_finish):
         raise RuntimeError("provider said no")
 
-    _cloud.apply_teardown(
+    provisioning.apply_teardown(
         on_finish="delete",
         target="box-1",
         run_action=boom,
@@ -487,7 +487,9 @@ def test_teardown_never_raises_but_always_shouts(capsys):
 
 def test_teardown_passes_the_on_finish_value_through():
     seen = []
-    _cloud.apply_teardown(on_finish="stop", target="b", run_action=seen.append, check_hint="x")
+    provisioning.apply_teardown(
+        on_finish="stop", target="b", run_action=seen.append, check_hint="x"
+    )
     assert seen == ["stop"]
 
 
@@ -496,18 +498,18 @@ def test_teardown_passes_the_on_finish_value_through():
 
 
 def test_instance_name_round_trips_through_split():
-    name = _cloud.make_instance_name("vision-train", "train")
-    assert _cloud.split_instance_name(name) == ("vision-train", "train")
+    name = provisioning.make_instance_name("vision-train", "train")
+    assert provisioning.split_instance_name(name) == ("vision-train", "train")
 
 
 def test_split_rejects_names_that_are_not_ours():
     for name in ("my-own-box", "runplz", "runplz-x", ""):
-        assert _cloud.split_instance_name(name) == ("", "")
+        assert provisioning.split_instance_name(name) == ("", "")
 
 
 def test_brev_and_cloud_backends_share_one_naming_contract():
     """A drift here would make `runplz ps` stop recognising its own boxes."""
     from runplz.backends import brev
 
-    assert brev._make_ephemeral_name is _cloud.make_instance_name
-    assert brev._split_ephemeral_name is _cloud.split_instance_name
+    assert brev._make_ephemeral_name is provisioning.make_instance_name
+    assert brev._split_ephemeral_name is provisioning.split_instance_name

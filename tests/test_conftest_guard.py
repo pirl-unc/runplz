@@ -4,7 +4,7 @@ invocations. Issue #35.
 
 import pytest
 
-from runplz.backends import _cloud, brev, ssh_common
+from runplz.backends import brev, provisioning, ssh_common
 
 
 def test_guard_blocks_real_brev_ls():
@@ -30,16 +30,18 @@ def test_guard_blocks_real_ssh_via_ssh_common():
 
 
 def test_guard_blocks_real_gcloud_via_cloud_helper():
-    # The GCP/AWS drivers shell out through _cloud.run_cli — using the
+    # The GCP/AWS drivers shell out through provisioning.run_cli — using the
     # vendor CLIs rather than an SDK is precisely what keeps them inside
     # this guard. An SDK call would be invisible to it.
     with pytest.raises(RuntimeError, match="tried to run `gcloud`"):
-        _cloud.subprocess.run(["gcloud", "compute", "instances", "create", "box"])
+        provisioning.subprocess.run(["gcloud", "compute", "instances", "create", "box"])
 
 
 def test_guard_blocks_real_aws_via_cloud_helper():
     with pytest.raises(RuntimeError, match="tried to run `aws`"):
-        _cloud.subprocess.run(["aws", "ec2", "run-instances", "--instance-type", "p5.48xlarge"])
+        provisioning.subprocess.run(
+            ["aws", "ec2", "run-instances", "--instance-type", "p5.48xlarge"]
+        )
 
 
 def test_guard_lets_unrelated_commands_through():

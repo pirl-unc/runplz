@@ -20,6 +20,24 @@ import subprocess
 import uuid
 from typing import Optional
 
+__all__ = [
+    "CloudCliError",
+    # Naming: two halves of one contract, they must agree.
+    "INSTANCE_PREFIX",
+    "make_instance_name",
+    "split_instance_name",
+    # Talking to a vendor CLI.
+    "run_cli",
+    "render_command",
+    # Choosing a machine for a function's resource request.
+    "GCP_GPUS",
+    "AWS_GPUS",
+    "resolve_gpu_label",
+    "gpu_count",
+    # Giving the machine back.
+    "apply_teardown",
+]
+
 # Instance names have to be DNS-ish on both clouds: lowercase alphanumerics
 # and dashes, starting with a letter.
 _NAME_SAFE_RE = re.compile(r"[^a-z0-9-]+")

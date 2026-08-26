@@ -6,7 +6,7 @@ Shells out to `gcloud`. Auth is whatever the CLI already has — ADC or
 SSH access rides on `gcloud compute config-ssh`, which writes a
 `NAME.ZONE.PROJECT` alias per instance into `~/.ssh/config`. That is the
 direct analogue of `brev refresh`, so it plugs into the existing
-`_wait_until_ssh_reachable` refresh callback and no new ssh plumbing is
+`wait_until_ssh_reachable` refresh callback and no new ssh plumbing is
 needed — plain `ssh` and `rsync` work against the alias.
 
 Networking is pinned, never created. Pass an existing `network`/`subnet`
@@ -16,7 +16,7 @@ you, and a VPC with no inbound 22 will simply hang the ssh wait.
 
 from typing import Optional
 
-from runplz.backends._cloud import (
+from runplz.backends.provisioning import (
     GCP_GPUS,
     apply_teardown,
     gpu_count,

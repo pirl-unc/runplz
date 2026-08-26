@@ -129,7 +129,7 @@ def test_rsync_up_passes_git_selection_as_nul_delimited_stdin(tmp_path):
     def fake_sh(cmd, *, stdin=None):
         captured.update(cmd=cmd, stdin=stdin)
 
-    with mock.patch("runplz.backends.ssh_common._sh", fake_sh):
+    with mock.patch("runplz.backends.ssh_common.run_local", fake_sh):
         ssh_common.rsync_up(repo, "box")
 
     assert "--from0" in captured["cmd"]
@@ -276,7 +276,7 @@ def test_launch_detached_failure_returns_nonzero_with_diagnostics(capsys):
         False,
         4321,
     )
-    with mock.patch("runplz.backends.ssh_common._ssh"):
+    with mock.patch("runplz.backends.ssh_common.ssh_exec"):
         with mock.patch("runplz.backends.ssh_common.wait_for_detached_start", return_value=zombie):
             with mock.patch("runplz.backends.ssh_common._record_remote_event") as record:
                 with mock.patch(
@@ -305,7 +305,7 @@ def test_launch_detached_unknown_startup_enters_resilient_monitoring(capsys):
         ssh_common.DetachedProcessState.UNKNOWN,
         False,
     )
-    with mock.patch("runplz.backends.ssh_common._ssh"):
+    with mock.patch("runplz.backends.ssh_common.ssh_exec"):
         with mock.patch("runplz.backends.ssh_common.wait_for_detached_start", return_value=unknown):
             with mock.patch(
                 "runplz.backends.ssh_common.tail_and_wait_for_detached",

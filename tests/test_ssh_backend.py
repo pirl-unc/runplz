@@ -143,7 +143,7 @@ def test_build_ssh_target_non_numeric_colon_suffix_kept_as_host():
 def test_ssh_cmd_opts_includes_dash_p_when_port_set():
     from runplz.backends import ssh_common
 
-    opts = ssh_common._ssh_cmd_opts(port=2222)
+    opts = ssh_common.ssh_cmd_opts(port=2222)
     assert opts[-2:] == ["-p", "2222"]
     # Base opts are preserved.
     assert "ControlMaster=no" in opts
@@ -152,13 +152,13 @@ def test_ssh_cmd_opts_includes_dash_p_when_port_set():
 def test_ssh_cmd_opts_omits_dash_p_when_port_none():
     from runplz.backends import ssh_common
 
-    assert "-p" not in ssh_common._ssh_cmd_opts(port=None)
+    assert "-p" not in ssh_common.ssh_cmd_opts(port=None)
 
 
 def test_rsync_ssh_transport_includes_port():
     from runplz.backends import ssh_common
 
-    transport = ssh_common._rsync_ssh_transport(port=2222)
+    transport = ssh_common.rsync_ssh_transport(port=2222)
     # -e string must survive shell parsing as ["ssh", ..., "-p", "2222"].
     import shlex as _shlex
 
@@ -172,7 +172,7 @@ def test_rsync_up_threads_port_into_transport(tmp_path):
     from runplz.backends import ssh_common
 
     recorded = {}
-    with mock.patch("runplz.backends.ssh_common._sh", lambda c: recorded.setdefault("c", c)):
+    with mock.patch("runplz.backends.ssh_common.run_local", lambda c: recorded.setdefault("c", c)):
         ssh_common.rsync_up(tmp_path, "my-box", port=2222)
 
     cmd = recorded["c"]
@@ -188,7 +188,7 @@ def test_rsync_up_omits_transport_flag_when_no_port(tmp_path):
     from runplz.backends import ssh_common
 
     recorded = {}
-    with mock.patch("runplz.backends.ssh_common._sh", lambda c: recorded.setdefault("c", c)):
+    with mock.patch("runplz.backends.ssh_common.run_local", lambda c: recorded.setdefault("c", c)):
         ssh_common.rsync_up(tmp_path, "my-box", port=None)
 
     # Without a port we don't set -e — rsync uses the system's default ssh.
@@ -199,8 +199,8 @@ def test_ssh_helper_threads_port(tmp_path):
     from runplz.backends import ssh_common
 
     recorded = {}
-    with mock.patch("runplz.backends.ssh_common._sh", lambda c: recorded.setdefault("c", c)):
-        ssh_common._ssh("my-box", "echo hi", port=2222)
+    with mock.patch("runplz.backends.ssh_common.run_local", lambda c: recorded.setdefault("c", c)):
+        ssh_common.ssh_exec("my-box", "echo hi", port=2222)
 
     cmd = recorded["c"]
     assert cmd[0] == "ssh"
@@ -240,7 +240,7 @@ def test_ssh_run_end_to_end_passes_port_through_to_helpers(tmp_path):
     with (
         mock.patch.multiple(
             "runplz.backends.ssh",
-            _wait_until_ssh_reachable=fake_wait,
+            wait_until_ssh_reachable=fake_wait,
             _warn_on_spec_mismatch=mock.DEFAULT,
         ),
         mock.patch.multiple(
@@ -253,8 +253,8 @@ def test_ssh_run_end_to_end_passes_port_through_to_helpers(tmp_path):
             _build_image=fake_build,
             _run_container_detached=mock.DEFAULT,
             _stream_and_wait=fake_stream,
-            _ssh_capture=mock.DEFAULT,
-            _rsync_down=mock.DEFAULT,
+            ssh_capture=mock.DEFAULT,
+            rsync_down=mock.DEFAULT,
             _fetch_failure_tail=mock.DEFAULT,
         ),
     ):
@@ -299,7 +299,7 @@ def test_app_bind_ssh_threads_host_into_backend_kwargs(tmp_path):
 
 
 def _probe_output(nproc=None, mem_kb=None, gpus=None):
-    """Build a fake _ssh_capture return mimicking the real probe payload."""
+    """Build a fake ssh_capture return mimicking the real probe payload."""
     lines = ["---NPROC---"]
     if nproc is not None:
         lines.append(str(nproc))
@@ -325,7 +325,7 @@ def _fn(min_cpu=None, min_memory=None, gpu=None, min_gpu_memory=None, num_gpus=1
 
 def test_spec_probe_warns_on_low_cpu(capsys):
     probe = _probe_output(nproc=2, mem_kb=64 * 1024 * 1024, gpus=[])
-    with mock.patch("runplz.backends.ssh._ssh_capture", return_value=probe):
+    with mock.patch("runplz.backends.ssh.ssh_capture", return_value=probe):
         ssh._warn_on_spec_mismatch("box", _fn(min_cpu=8))
     out = capsys.readouterr().out
     assert "spec-mismatch warning" in out
@@ -335,7 +335,7 @@ def test_spec_probe_warns_on_low_cpu(capsys):
 
 def test_spec_probe_warns_on_low_memory(capsys):
     probe = _probe_output(nproc=16, mem_kb=8 * 1024 * 1024, gpus=[])  # 8GB
-    with mock.patch("runplz.backends.ssh._ssh_capture", return_value=probe):
+    with mock.patch("runplz.backends.ssh.ssh_capture", return_value=probe):
         ssh._warn_on_spec_mismatch("box", _fn(min_memory=32))
     out = capsys.readouterr().out
     assert "min_memory=32" in out
@@ -344,7 +344,7 @@ def test_spec_probe_warns_on_low_memory(capsys):
 
 def test_spec_probe_warns_when_function_wants_gpu_but_none_found(capsys):
     probe = _probe_output(nproc=16, mem_kb=64 * 1024 * 1024, gpus=[])
-    with mock.patch("runplz.backends.ssh._ssh_capture", return_value=probe):
+    with mock.patch("runplz.backends.ssh.ssh_capture", return_value=probe):
         ssh._warn_on_spec_mismatch("box", _fn(gpu="A100"))
     out = capsys.readouterr().out
     assert "A100" in out
@@ -353,7 +353,7 @@ def test_spec_probe_warns_when_function_wants_gpu_but_none_found(capsys):
 
 def test_spec_probe_warns_on_wrong_gpu_model(capsys):
     probe = _probe_output(nproc=16, mem_kb=64 * 1024 * 1024, gpus=[("Tesla T4", 16384)])
-    with mock.patch("runplz.backends.ssh._ssh_capture", return_value=probe):
+    with mock.patch("runplz.backends.ssh.ssh_capture", return_value=probe):
         ssh._warn_on_spec_mismatch("box", _fn(gpu="A100"))
     out = capsys.readouterr().out
     assert "A100" in out
@@ -363,7 +363,7 @@ def test_spec_probe_warns_on_wrong_gpu_model(capsys):
 def test_spec_probe_warns_on_insufficient_vram(capsys):
     # Remote has a T4 (16GB); function wants 40GB of VRAM.
     probe = _probe_output(nproc=16, mem_kb=64 * 1024 * 1024, gpus=[("Tesla T4", 16384)])
-    with mock.patch("runplz.backends.ssh._ssh_capture", return_value=probe):
+    with mock.patch("runplz.backends.ssh.ssh_capture", return_value=probe):
         ssh._warn_on_spec_mismatch("box", _fn(gpu="T4", min_gpu_memory=40))
     out = capsys.readouterr().out
     assert "min_gpu_memory=40" in out
@@ -373,7 +373,7 @@ def test_spec_probe_warns_on_insufficient_vram(capsys):
 def test_spec_probe_warns_when_num_gpus_exceeds_available(capsys):
     """3.6: num_gpus=4 on a box with 1 GPU → warn."""
     probe = _probe_output(nproc=16, mem_kb=128 * 1024 * 1024, gpus=[("NVIDIA A100 80GB", 81920)])
-    with mock.patch("runplz.backends.ssh._ssh_capture", return_value=probe):
+    with mock.patch("runplz.backends.ssh.ssh_capture", return_value=probe):
         ssh._warn_on_spec_mismatch("box", _fn(gpu="A100", num_gpus=4))
     out = capsys.readouterr().out
     assert "num_gpus=4" in out
@@ -382,7 +382,7 @@ def test_spec_probe_warns_when_num_gpus_exceeds_available(capsys):
 
 def test_spec_probe_silent_when_everything_matches(capsys):
     probe = _probe_output(nproc=16, mem_kb=128 * 1024 * 1024, gpus=[("NVIDIA A100 80GB", 81920)])
-    with mock.patch("runplz.backends.ssh._ssh_capture", return_value=probe):
+    with mock.patch("runplz.backends.ssh.ssh_capture", return_value=probe):
         ssh._warn_on_spec_mismatch(
             "box", _fn(min_cpu=8, min_memory=64, gpu="A100", min_gpu_memory=40)
         )
@@ -393,7 +393,7 @@ def test_spec_probe_never_raises_on_ssh_failure(capsys):
     def boom(*a, **kw):
         raise RuntimeError("ssh went away")
 
-    with mock.patch("runplz.backends.ssh._ssh_capture", boom):
+    with mock.patch("runplz.backends.ssh.ssh_capture", boom):
         ssh._warn_on_spec_mismatch("box", _fn(min_cpu=8))
     out = capsys.readouterr().out
     # Helper prints a soft warning and moves on — no exception escapes.
@@ -415,7 +415,7 @@ def test_ssh_run_vm_docker_happy_path(tmp_path):
     with (
         mock.patch.multiple(
             "runplz.backends.ssh",
-            _wait_until_ssh_reachable=mock.DEFAULT,
+            wait_until_ssh_reachable=mock.DEFAULT,
             _warn_on_spec_mismatch=mock.DEFAULT,
         ),
         mock.patch.multiple(
@@ -428,8 +428,8 @@ def test_ssh_run_vm_docker_happy_path(tmp_path):
             _build_image=mock.DEFAULT,
             _run_container_detached=mock.DEFAULT,
             _stream_and_wait=mock.Mock(return_value=0),
-            _ssh_capture=mock.DEFAULT,
-            _rsync_down=mock.DEFAULT,
+            ssh_capture=mock.DEFAULT,
+            rsync_down=mock.DEFAULT,
         ),
     ):
         ssh.run(app, fn, [], {}, host="gpu.example.com")
@@ -443,7 +443,7 @@ def test_ssh_run_native_happy_path(tmp_path):
     with (
         mock.patch.multiple(
             "runplz.backends.ssh",
-            _wait_until_ssh_reachable=mock.DEFAULT,
+            wait_until_ssh_reachable=mock.DEFAULT,
             _warn_on_spec_mismatch=mock.DEFAULT,
         ),
         mock.patch.multiple(
@@ -453,7 +453,7 @@ def test_ssh_run_native_happy_path(tmp_path):
             rsync_up=mock.DEFAULT,
             _remote_has_nvidia=mock.Mock(return_value=False),
             _run_native=mock.Mock(return_value=0),
-            _rsync_down=mock.DEFAULT,
+            rsync_down=mock.DEFAULT,
         ),
     ):
         ssh.run(app, fn, [], {}, host="user@gpu.example.com")
@@ -469,7 +469,7 @@ def test_ssh_run_nonzero_exit_raises_with_tail(tmp_path):
     with (
         mock.patch.multiple(
             "runplz.backends.ssh",
-            _wait_until_ssh_reachable=mock.DEFAULT,
+            wait_until_ssh_reachable=mock.DEFAULT,
             _warn_on_spec_mismatch=mock.DEFAULT,
         ),
         mock.patch.multiple(
@@ -482,8 +482,8 @@ def test_ssh_run_nonzero_exit_raises_with_tail(tmp_path):
             _build_image=mock.DEFAULT,
             _run_container_detached=mock.DEFAULT,
             _stream_and_wait=mock.Mock(return_value=42),
-            _ssh_capture=mock.DEFAULT,
-            _rsync_down=mock.DEFAULT,
+            ssh_capture=mock.DEFAULT,
+            rsync_down=mock.DEFAULT,
             _fetch_failure_tail=mock.Mock(return_value="KeyError: missing-key"),
         ),
     ):

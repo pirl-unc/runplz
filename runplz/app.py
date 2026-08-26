@@ -14,14 +14,14 @@ import json
 from pathlib import Path
 from typing import Callable, Optional
 
-from runplz.backends import _registry
+from runplz.backends import registry
 from runplz.config import AwsConfig, BrevConfig, GcpConfig, ModalConfig, SshConfig
 from runplz.image import Image
 
 # What backends exist, and what each accepts, is described once in
-# runplz.backends._registry. Kept as a module-level name because the CLI
+# runplz.backends.registry. Kept as a module-level name because the CLI
 # imports it for argparse `choices`.
-_VALID_BACKENDS = _registry.names()
+_VALID_BACKENDS = registry.names()
 
 
 class Function:
@@ -228,7 +228,7 @@ class App:
         The CLI is preferred for CI/shared scripts; this is for notebooks
         and one-off runs where you already have `app` in scope.
         """
-        spec = _registry.get(backend)
+        spec = registry.get(backend)
         if spec.required_config_attr and getattr(self, spec.required_config_attr) is None:
             raise ValueError(
                 f"backend={backend!r} needs App(..., {spec.required_config_attr}=...). "
@@ -279,7 +279,7 @@ class App:
                 f"(For in-process execution without a backend, use "
                 f"{function.name}.local(...) instead.)"
             )
-        module = _registry.load(self._backend)
+        module = registry.load(self._backend)
         return module.run(self, function, args, kwargs, **self._backend_kwargs)
 
 

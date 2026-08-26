@@ -367,10 +367,10 @@ def test_ps_cli_back_compat_ssh_flag_still_works():
 
 def test_local_and_remote_label_flags_agree():
     """`runplz ps` finds containers by these labels; a drift breaks it."""
-    from runplz.backends import _docker
+    from runplz.backends import docker
 
-    argv = _docker.label_args("myapp", "train")
-    flags = _docker.label_flags("myapp", "train")
+    argv = docker.label_args("myapp", "train")
+    flags = docker.label_flags("myapp", "train")
     assert argv == [
         "--label",
         "runplz=1",
@@ -384,27 +384,27 @@ def test_local_and_remote_label_flags_agree():
 
 
 def test_ps_filter_matches_the_label_that_gets_stamped():
-    from runplz.backends import _docker
+    from runplz.backends import docker
 
-    assert _docker.PS_FILTER == f"label={_docker.RUNPLZ_LABEL}"
-    assert _docker.RUNPLZ_LABEL in " ".join(_docker.label_args("a", "b"))
+    assert docker.PS_FILTER == f"label={docker.RUNPLZ_LABEL}"
+    assert docker.RUNPLZ_LABEL in " ".join(docker.label_args("a", "b"))
 
 
 def test_label_args_omit_app_when_unknown():
-    from runplz.backends import _docker
+    from runplz.backends import docker
 
-    assert "runplz-app=" not in " ".join(_docker.label_args(None, "train"))
+    assert "runplz-app=" not in " ".join(docker.label_args(None, "train"))
 
 
 def test_ps_row_parsing_is_shared_by_local_and_ssh():
-    from runplz.backends import _docker
+    from runplz.backends import docker
 
     line = (
         '{"Names":"runplz-app-train","Labels":"runplz=1,runplz-app=myapp,'
         'runplz-function=train","Status":"Up 2 minutes","CreatedAt":"2026-08-26"}'
     )
-    local_rows = _docker.parse_ps_rows(line, backend="local")
-    ssh_rows = _docker.parse_ps_rows(line, backend="ssh", name_prefix="gpu.box:")
+    local_rows = docker.parse_ps_rows(line, backend="local")
+    ssh_rows = docker.parse_ps_rows(line, backend="ssh", name_prefix="gpu.box:")
     assert local_rows[0]["app"] == ssh_rows[0]["app"] == "myapp"
     assert local_rows[0]["function"] == ssh_rows[0]["function"] == "train"
     assert local_rows[0]["name"] == "runplz-app-train"
@@ -412,7 +412,7 @@ def test_ps_row_parsing_is_shared_by_local_and_ssh():
 
 
 def test_ps_row_parsing_skips_garbage_rather_than_failing():
-    from runplz.backends import _docker
+    from runplz.backends import docker
 
-    rows = _docker.parse_ps_rows("not json\n\n{}\n", backend="local")
+    rows = docker.parse_ps_rows("not json\n\n{}\n", backend="local")
     assert len(rows) == 1  # the empty object still yields a (blank) row

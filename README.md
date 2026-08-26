@@ -177,11 +177,16 @@ So a backend is only its own provider vocabulary:
 
 | shared | per-backend |
 |---|---|
-| dispatch, streaming, outputs, failure tails (`ssh_common`) | how to create a machine |
-| container labels and `docker ps` parsing (`_docker`) | how to reach it over ssh |
-| instance naming, GPU-shape lookup, teardown contract (`_cloud`) | how to tear it down |
-| config field validation (`config`) | which shapes that provider sells |
-| what backends exist and what each accepts (`_registry`) | |
+| `backends.ssh_common` — dispatch, streaming, outputs, failure tails, remote-path validation | how to create a machine |
+| `backends.docker` — container labels and `docker ps` parsing | how to reach it over ssh |
+| `backends.provisioning` — instance naming, GPU-shape lookup, teardown contract | how to tear it down |
+| `backends.registry` — what backends exist and what each accepts | which shapes that provider sells |
+| `config` — field validation shared by every remote config | |
+
+These are public modules with explicit `__all__`s, not private helpers: a
+backend is *expected* to be written against them. `ssh_common.dispatch_to_target`
+is the contract; the staging and streaming helpers it calls internally stay
+private, because a backend should never need to reach past it.
 
 That is why `gcp.py` and `aws.py` are a couple of hundred lines each, and
 why adding another provider is mostly a table of machine types plus three
