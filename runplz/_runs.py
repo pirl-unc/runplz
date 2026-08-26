@@ -12,19 +12,32 @@ remember run IDs or reconstruct ssh commands by hand (issue #57).
 
 import json
 import re
-import shlex
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from runplz.backends.ssh_common import (
+    _SAFE_REMOTE_PATH_RE,
+    DEFAULT_KILL_TIMEOUT_S,
+    KILL_SETTLE_S,
     REMOTE_META_DIRNAME,
     REMOTE_RUNS_DIR,
     _ssh_cmd_opts,
+    build_kill_command,
 )
 
 META_FILENAME = "run.json"
+
+# `kill` exit code for "signalled, but something is still alive" - distinct
+# from 0 (stopped) and from ssh / protocol failures.
+KILL_SURVIVED_RC = 3
+
+# Run ids are generated as <ts>-<slug>-<slug>-<hex>, but --run-id is user
+# input and lands inside a remote shell command, so pin it to a charset that
+# cannot break out of the path it is interpolated into.
+_SAFE_RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 class ManifestNotFound(RuntimeError):
@@ -69,6 +82,11 @@ def resolve_target_and_meta(
     if run_id_override:
         if not host_override:
             raise RuntimeError("--run-id requires --host (no manifest lookup possible)")
+        if not _SAFE_RUN_ID_RE.match(run_id_override):
+            raise RuntimeError(
+                f"--run-id {run_id_override!r} is not a valid run id "
+                f"(letters, digits, dot, dash, underscore only)"
+            )
         meta = f"~/{REMOTE_RUNS_DIR}/{run_id_override}/out/{REMOTE_META_DIRNAME}"
         return (host_override, meta, {})
     manifest = read_manifest(outputs_dir)
@@ -82,6 +100,28 @@ def resolve_target_and_meta(
             raise RuntimeError("manifest is missing both remote_paths.meta and run_id")
         meta = f"~/{REMOTE_RUNS_DIR}/{run_id}/out/{REMOTE_META_DIRNAME}"
     return (target, meta, manifest)
+
+
+def remote_shell_path(path: str) -> str:
+    """Make a manifest path usable inside a remote shell command.
+
+    The manifest records display paths like ``~/runplz-runs/<id>/out/.runplz``.
+    Tilde expansion happens before any quoting, so a ``~/`` path is literal in
+    both ``'...'`` and ``"..."`` — the file is simply never found. ``$HOME``
+    does expand inside double quotes, so callers can interpolate the result
+    into ``"..."`` and get the directory they meant.
+    """
+    if path.startswith("~/"):
+        path = f"$HOME/{path[2:]}"
+    # The manifest is written on the remote box and rsynced down, so this
+    # string is untrusted input about to be interpolated into a double-quoted
+    # remote shell word -- where $(...) and backticks still run.
+    if not _SAFE_REMOTE_PATH_RE.match(path):
+        raise RuntimeError(
+            f"refusing to use remote path {path!r} from the run manifest: expected "
+            f"an absolute or $HOME-relative path of plain path characters"
+        )
+    return path
 
 
 def tail(
@@ -99,9 +139,9 @@ def tail(
         host_override=host_override,
         run_id_override=run_id_override,
     )
-    log_path = f"{meta}/last.log"
+    log_path = remote_shell_path(f"{meta}/last.log")
     flags = "-F" if follow else f"-n {int(lines)}"
-    remote_cmd = f"tail {flags} {shlex.quote(log_path)}"
+    remote_cmd = f'tail {flags} "{log_path}"'
     cmd = ["ssh", *_ssh_cmd_opts(port), target, remote_cmd]
     return subprocess.run(cmd).returncode
 
@@ -121,10 +161,8 @@ def status(
     )
     # One ssh round-trip pulls last events line, last heartbeat line, and
     # an event count so we don't pay 3x ssh latency for a status check.
-    events_path = f"{meta}/events.ndjson"
-    heartbeat_path = f"{meta}/heartbeat.ndjson"
-    ev_q = shlex.quote(events_path)
-    hb_q = shlex.quote(heartbeat_path)
+    ev_q = f'"{remote_shell_path(f"{meta}/events.ndjson")}"'
+    hb_q = f'"{remote_shell_path(f"{meta}/heartbeat.ndjson")}"'
     remote_cmd = (
         f"echo '---LAST_EVENT---'; tail -n 1 {ev_q} 2>/dev/null || true; "
         f"echo '---LAST_HEARTBEAT---'; tail -n 1 {hb_q} 2>/dev/null || true; "
@@ -141,6 +179,158 @@ def status(
     sections = _parse_status_sections(r.stdout)
     print(_format_status(target=target, manifest=manifest, sections=sections))
     return 0
+
+
+def kill(
+    *,
+    outputs_dir: Path,
+    host_override: Optional[str],
+    run_id_override: Optional[str],
+    timeout_s: int = DEFAULT_KILL_TIMEOUT_S,
+    escalate: bool = True,
+    first_signal: str = "TERM",
+    port: Optional[int] = None,
+) -> int:
+    """Stop a detached run and report what happened to it.
+
+    Idempotent by design (issue #67): killing a run that already exited is a
+    normal outcome of "make sure nothing is still burning GPU hours", not an
+    error, so an already-dead run prints its state and returns 0.
+    """
+    target, meta, manifest = resolve_target_and_meta(
+        outputs_dir=outputs_dir,
+        host_override=host_override,
+        run_id_override=run_id_override,
+    )
+    run_id = manifest.get("run_id") or run_id_override or ""
+    # The manifest is a file on disk; don't let a hand-edited run_id reach the
+    # remote shell. It is only used to label the killed_by_user event.
+    if not _SAFE_RUN_ID_RE.match(run_id or ""):
+        run_id = ""
+    remote_cmd = build_kill_command(
+        remote_shell_path(meta),
+        run_id=run_id,
+        timeout_s=timeout_s,
+        escalate=escalate,
+        first_signal=first_signal,
+    )
+    cmd = ["ssh", *_ssh_cmd_opts(port), target, remote_cmd]
+    # The remote side owns the signal/poll/escalate clock; give ssh enough
+    # headroom to outlive the worst case rather than cutting it off mid-dance.
+    ssh_timeout = timeout_s + KILL_SETTLE_S + 60
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=ssh_timeout)
+    except subprocess.TimeoutExpired:
+        print(f"ssh to {target} timed out after {ssh_timeout}s", file=sys.stderr)
+        return 2
+    if r.returncode != 0:
+        print(f"ssh to {target} failed (rc={r.returncode})", file=sys.stderr)
+        if r.stderr:
+            print(r.stderr.strip(), file=sys.stderr)
+        return r.returncode
+    sections = _parse_status_sections(r.stdout)
+    if "SUMMARY" not in sections or "alive_after" not in sections["SUMMARY"]:
+        # ssh succeeded but the script did not run to completion -- a login
+        # shell that cannot parse it, or a banner/sudo prompt on stdout. Never
+        # report a stop we have no evidence of.
+        print(
+            f"could not read a kill result from {target}; the run may still be running",
+            file=sys.stderr,
+        )
+        if r.stdout.strip():
+            print(r.stdout.strip()[:500], file=sys.stderr)
+        return 2
+    fields = _parse_kv_block(sections["SUMMARY"])
+    print(_format_kill(target=target, run_id=run_id, fields=fields, sections=sections))
+    # Survivors mean the kill failed. Exiting 0 here would let
+    # `runplz kill && runplz brev job.py` start a second job on a GPU the
+    # first one still holds.
+    return KILL_SURVIVED_RC if fields.get("alive_after") == "1" else 0
+
+
+def _parse_kv_block(block: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for line in block.splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            out[key.strip()] = value.strip()
+    return out
+
+
+def _format_kill(
+    *, target: str, run_id: str, fields: dict[str, str], sections: dict[str, str]
+) -> str:
+    initial = fields.get("initial", "unknown")
+    final = fields.get("final", "unknown")
+    signalled = fields.get("signalled") == "1"
+    escalated = fields.get("escalated") == "1"
+    alive_after = fields.get("alive_after") == "1"
+    signal = fields.get("signal") or "TERM"
+    container = fields.get("container", "")
+    container_state = fields.get("container_state", "none")
+    survivors = [pid for pid in (fields.get("survivors") or "").split() if pid]
+
+    lines = [f"target:     {target}"]
+    if run_id:
+        lines.append(f"run:        {run_id}")
+    lines.append(f"bootstrap:  pid={fields.get('pid') or '-'}")
+    if container:
+        lines.append(f"container:  {container} ({container_state})")
+
+    if not signalled:
+        lines.append(f"action:     nothing to kill - the run was already {initial}")
+    elif not alive_after:
+        how = f"SIG{signal}, escalated to SIGKILL" if escalated else f"SIG{signal}"
+        lines.append(f"action:     stopped with {how}")
+    else:
+        bits = []
+        if survivors:
+            bits.append(f"pids still alive: {' '.join(survivors)}")
+        if container_state == "running":
+            bits.append("container still running")
+        if not bits:
+            bits.append(f"state {final!r}")
+        lines.append("action:     SIGNALLED BUT STILL ALIVE - " + "; ".join(bits))
+    lines.append(f"state:      {initial} -> {final}")
+
+    if fields.get("scan") == "0":
+        lines.append(
+            "note:       no process marker available (pre-3.16 run, or no procfs); "
+            "fell back to the recorded pid alone"
+        )
+
+    gpu = fields.get("gpu_mem_used", "")
+    if gpu:
+        used = [g for g in gpu.split(",") if g]
+        lines.append("gpu memory: " + ", ".join(f"gpu{i}={m}MiB" for i, m in enumerate(used)))
+
+    heartbeat = (sections.get("HEARTBEAT") or "").strip()
+    if heartbeat:
+        lines.append(f"heartbeat:  {_render_timestamped(heartbeat)}")
+
+    logtail = (sections.get("LOGTAIL") or "").strip()
+    if logtail:
+        lines.append("last log:")
+        # The remote prefixes each line with "| " so log text can never be
+        # mistaken for a ---SECTION--- marker by the section parser.
+        for line in logtail.splitlines():
+            lines.append(f"  {line[2:] if line.startswith('| ') else line}")
+    return "\n".join(lines)
+
+
+def _render_timestamped(line: str) -> str:
+    """Render a lifecycle JSON line as ``<ts> (<age> ago)``.
+
+    Shared by `status` and `kill` so a malformed heartbeat cannot render one
+    way in one command and a different way in the other.
+    """
+    try:
+        ts = json.loads(line).get("ts", "")
+    except (json.JSONDecodeError, AttributeError):
+        return f"(unparsed) {line[:200]}"
+    if not ts:
+        return f"(unparsed) {line[:200]}"
+    return f"{ts}{_age_str(ts)}"
 
 
 def _parse_status_sections(stdout: str) -> dict[str, str]:
@@ -203,13 +393,7 @@ def _format_status(*, target: str, manifest: dict, sections: dict[str, str]) -> 
         lines.append("last event: (none recorded)")
 
     if last_hb_raw:
-        try:
-            hb = json.loads(last_hb_raw)
-            ts = hb.get("ts", "")
-            age = _age_str(ts)
-            lines.append(f"last heartbeat: {ts}{age}")
-        except json.JSONDecodeError:
-            lines.append(f"last heartbeat (unparsed): {last_hb_raw[:200]}")
+        lines.append(f"last heartbeat: {_render_timestamped(last_hb_raw)}")
     else:
         lines.append("last heartbeat: (none yet)")
 

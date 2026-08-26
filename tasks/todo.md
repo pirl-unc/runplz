@@ -1,3 +1,108 @@
+## 2026-08-26 PR Plan — Sweep of #75 / #72 / #67 (kill + packaging)
+
+Branch: `feat/runplz-kill-and-packaging-fixes` (off `main` @ `102cc11`)
+
+### Sweep verdict
+
+| Issue | Status before this PR | Evidence |
+|---|---|---|
+| #75 deploy.sh PEP 668 | Still broken | `deploy.sh:10` still ran `python3 -m pip install --upgrade build twine`, and only *after* `./lint.sh` + `./test.sh` |
+| #72 SPDX license | Still broken | `pyproject.toml:10` still used the `license = {file = ...}` table; `requires = ["setuptools>=61.0"]` predates PEP 639 |
+| #67 `runplz kill` | Partially landed | `runplz ps` / `tail` / `status` shipped in 3.15.x — those were the issue's *bonus* asks. The core `kill` did not exist; its plumbing (run manifest, pid probe, zombie-aware process state) now does. |
+
+Nothing was already fully fixed; #67 had shrunk to just the kill itself.
+
+- [x] #75 — provision an isolated build venv in `deploy.sh` *before* lint/test, so it both
+  stops mutating an externally managed interpreter and fails fast; gitignore `.deploy-venv/`
+- [x] #72 — `license = "Apache-2.0"` + `license-files = ["LICENSE"]`, `setuptools>=77.0.3`;
+  verified `License-Expression` / `License-File` in both wheel and sdist metadata
+- [x] #67 — `runplz kill` / `runplz cancel`
+- [x] #76 (found en route) — manifest paths are `~/`-prefixed and tilde expands before
+  quoting, so `tail`/`status`/`kill` were all reading a path the remote shell cannot resolve;
+  rewrite the leading `~/` to `$HOME/` and validate `--run-id` before it enters a shell command
+- [x] Bump `runplz/version.py` to 3.16.0
+- [x] Run `./format.sh`, `./lint.sh`, and `./test.sh`
+- [ ] Review the final diff, push, open a PR closing #75/#72/#67, wait for green CI, merge,
+  and deploy 3.16.0 to PyPI
+
+### Scope / design
+
+> The first cut here keyed on the process *group*; code review showed that was unsound.
+> See "Code review round 2" below for what actually shipped. Bullets updated to match.
+
+- **Identify a run's processes by a per-run environment marker.** The painful case in #67 is
+  the one where the bash supervisor is already dead and only orphaned workers survive,
+  reparented to init — `pkill -P` has nothing left to match. The bootstrap is exec'd with
+  `RUNPLZ_RUN_ID=<id>`, every descendant inherits it, and kill scans `/proc/*/environ` for it.
+  Unique to the run, survives reparenting, immune to PID wraparound.
+- Runs launched before the marker existed fall back to the recorded bootstrap pid — but only
+  while no terminal exit event has been recorded, since a finished run's pid can be recycled.
+- VM+docker mode records the container name in `<meta>/container`. The container is a child of
+  dockerd, so it carries no marker of ours and must be signalled separately.
+- The whole signal → poll → escalate dance runs remotely in one ssh hop, so the escalation
+  clock measures the job rather than ssh latency and a flaky link can't strand a half-signalled
+  run.
+- Guards: non-numeric pids are discarded and pid 0/1 refused numerically — `kill -TERM 0`
+  signals every process in the caller's own group. Zombies are excluded so they can't pin the
+  wait loop into a pointless SIGKILL.
+- Everything interpolated into the remote shell is validated first, including the meta path,
+  which arrives from a manifest rsynced down off the remote box.
+- Idempotent by design: killing an already-finished run prints `nothing to kill` and exits 0,
+  so it is safe in a relaunch script.
+- Reused `_add_run_lookup_args` and `_parse_status_sections` rather than inventing a second run
+  lookup or output format.
+
+### Code review round 2 — 15 findings, all addressed
+
+The first cut identified a run's processes by **process group**. That was
+wrong: bash disables job control in non-interactive shells, so the bootstrap
+never becomes a group leader and the recorded pgid is the *launching shell's*.
+Blast radius on anything sharing it, and no protection against PID wraparound
+reusing a stale pgid/pid from a finished run.
+
+Replaced with a per-run **environment marker**: the bootstrap is exec'd with
+`RUNPLZ_RUN_ID=<id>`, every descendant inherits it, and kill scans
+`/proc/*/environ` for it. Unique, survives reparenting, cannot be recycled.
+That one change resolved the group-blast-radius, PID-wraparound, zero-padded-
+pgid and duplicated-procfs-parsing findings together.
+
+Also fixed:
+- `alive_after` / `survivors` are now reported, so a kill that left processes
+  running can no longer print "stopped with SIGTERM"
+- `kill` exits 3 when anything survives and 2 when the remote script produced
+  no readable result — it used to return 0 in both cases
+- pid `0`/`1` rejected numerically (`kill -TERM 0` signals our own group)
+- `remote_shell_path` validates the manifest path: dropping `shlex.quote` for
+  `$HOME` expansion had opened `$(...)` execution from a manifest that is
+  rsynced down off the remote box
+- `run_id`, `first_signal`, `timeout_s`, `proc_root` validated in
+  `build_kill_command`, not just at the argparse layer
+- the reported signal is the one actually sent (`--signal INT` no longer
+  claims SIGTERM)
+- log tail lines are prefixed so a `--- ... ---` line in a log can't truncate
+  the section parser
+- one shared heartbeat renderer for `status` and `kill`
+- the runtime-cap timeout path no longer `pkill`s every runplz bootstrap on
+  the box; it stops the specific run
+- `BOOTSTRAP_PID_FILENAME` now actually centralizes the filename
+- a real NUL byte was reaching the generated script instead of the `\0`
+  escape `tr` needs — caught by executing the script, not by reading it
+
+### Review section
+
+- Verified the generated kill shell by executing it, not just by string-matching: it takes down
+  an orphaned bootstrap + 2 workers in a real process group, is a clean no-op on a run that never
+  existed, and refuses pgid 1. Parses under both `sh -n` and `bash -n`.
+- Also fixed two latent problems found on the way:
+  - **#76**: `runplz status` was silently reporting `(none recorded)` for healthy runs because
+    the tilde path never resolved and its errors are swallowed by `2>/dev/null || true`. `kill`
+    would have shipped with the same bug, so this had to be fixed here rather than deferred.
+  - `runplz._runs` shells out to `ssh` but was missing from `conftest._MODULES_TO_GUARD`, so a
+    test that forgot to mock could have hit real infra — exactly what that guard exists to
+    prevent.
+- `./format.sh` and `./lint.sh` pass. `./test.sh` passes (`522 passed`, 93% total coverage),
+  with the new tests clean under `-W error::DeprecationWarning` across 5 consecutive runs.
+
 ## 2026-08-26 PR Plan — HUP-Safe Detached Bootstrap (#73)
 
 Branch: `fix-detached-bootstrap-hup` (off `main` @ `dc5cd38`)

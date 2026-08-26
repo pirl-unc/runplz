@@ -11,6 +11,7 @@ dist/
 
 # Venv
 .venv/
+.deploy-venv/
 venv/
 env/
 

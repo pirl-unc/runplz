@@ -205,10 +205,10 @@ kwargs must be JSON-serializable.
 All four have `app.bind(...)` equivalents (`instance=`, `host=`,
 `build=False`, `outputs_dir=`) for the pure-Python invocation path.
 
-### Operations CLI: `ps`, `tail`, `status`
+### Operations CLI: `ps`, `tail`, `status`, `kill`
 
-Three subcommands let you check on jobs without retyping ssh aliases or
-remembering remote run IDs:
+Four subcommands let you check on — and stop — jobs without retyping ssh
+aliases or remembering remote run IDs:
 
 ```bash
 runplz ps                          # list runplz jobs across all backends
@@ -220,13 +220,58 @@ runplz tail -n 500                 # last N lines (default 120)
 runplz tail -f                     # stream new lines as they arrive
 
 runplz status                      # one-screen summary: target, last event, last heartbeat, event count
+
+runplz kill                        # stop the most recent run (SIGTERM, then SIGKILL)
+runplz kill --timeout 60           # give it longer to checkpoint before SIGKILL
+runplz kill --no-escalate          # SIGTERM only; report whatever survives
+runplz cancel                      # alias for kill
 ```
 
-`tail` and `status` default to "most recent run in `./out/`" by reading
-the local `out/.runplz/run.json` manifest the dispatch path writes. Pass
-`--outputs-dir <path>` to point at a different one, or `--host <h>
---run-id <id>` to inspect a specific run by ID. SSH has no host registry,
-so `runplz ps` skips it unless you pass `--host`.
+`tail`, `status` and `kill` default to "most recent run in `./out/`" by
+reading the local `out/.runplz/run.json` manifest the dispatch path
+writes. Pass `--outputs-dir <path>` to point at a different one, or
+`--host <h> --run-id <id>` to target a specific run by ID. SSH has no
+host registry, so `runplz ps` skips it unless you pass `--host`.
+
+#### What `kill` actually stops
+
+A remote run is a tree, not a process: a bash supervisor, the bootstrap,
+the worker(s) it spawns, and any DataLoader children those fork. runplz
+launches the bootstrap with its run id in the environment, so every
+descendant inherits it, and `kill` stops exactly the processes carrying
+that id. That still finds workers orphaned to init after the supervisor
+died — the case where `pkill -P` has nothing left to match — without
+touching anything else on the box.
+
+A process group would have been the obvious handle, but bash disables job
+control in non-interactive shells, so the bootstrap never becomes a group
+leader and its pgid is the *launching shell's* — not unique to the run,
+and unsafe to signal wholesale. A run id is unique, survives reparenting,
+and cannot be recycled by PID wraparound.
+
+In VM+docker mode the container is signalled separately: it is a child of
+dockerd, so it carries no marker of ours.
+
+`kill` sends `SIGTERM` first so the job can flush checkpoints and close
+writers, waits `--timeout` seconds (default 10), then escalates to
+`SIGKILL` unless you passed `--no-escalate`. On exit it prints the
+before/after state, any surviving pids, per-GPU memory still in use (when
+`nvidia-smi` is present), the last heartbeat and a short log tail, and
+appends `event=killed_by_user` to the run's `events.ndjson`.
+
+Exit codes make it safe to chain:
+
+| Code | Meaning |
+|---|---|
+| `0` | the run is stopped — including "it had already finished", so `kill` is idempotent |
+| `2` | couldn't reach the host, or couldn't read a result — assume nothing was stopped |
+| `3` | signalled, but something is **still alive** (pids or the container) |
+
+So `runplz kill && runplz brev job.py` will not start a second job on a
+GPU the first one still holds.
+
+Runs launched before 3.16 carry no marker; `kill` falls back to the
+recorded bootstrap pid alone and says so in its output.
 
 ## Backend config
 
