@@ -63,13 +63,20 @@ REMOTE_META_DIRNAME = ".runplz"
 REMOTE_IMAGE_TAG = "runplz-train:remote"
 
 # Per-run control files inside the meta dir. The pid is what every probe
-# keys off; the pgid is the handle `runplz kill` needs to reach an orphaned
-# worker tree after the bash supervisor dies (issue #67); the container file
-# names the docker container in VM+docker mode, which lives outside the
-# bootstrap's process group and has to be signalled separately.
+# keys off; the container file names the docker container in VM+docker mode,
+# which is a child of dockerd and has to be signalled separately.
 BOOTSTRAP_PID_FILENAME = "bootstrap.pid"
-BOOTSTRAP_PGID_FILENAME = "bootstrap.pgid"
 CONTAINER_FILENAME = "container"
+
+# The bootstrap is exec'd with its run id in the environment, so every
+# descendant inherits it and `runplz kill` can identify a run's processes
+# exactly -- including workers orphaned to init after the supervisor dies,
+# which is the case that motivated issue #67. A process group would be the
+# obvious handle, but bash disables job control in non-interactive shells, so
+# the bootstrap never becomes a group leader and its pgid is the *launching
+# shell's* -- not unique to the run, and unsafe to signal wholesale. A run id
+# is unique, survives reparenting, and cannot be recycled by PID wraparound.
+RUN_ID_ENV_VAR = "RUNPLZ_RUN_ID"
 
 # container-mode / native paths tee the bootstrap's combined stdout+stderr
 # into this file so we can `tail` it for failure context (issue #17). Lives
@@ -1275,7 +1282,6 @@ def build_detached_launcher(remote_run: RemoteRunContext, wrapped_command: str) 
 
     meta = remote_run.meta_shell
     pid_file = f"{meta}/{BOOTSTRAP_PID_FILENAME}"
-    pgid_file = f"{meta}/{BOOTSTRAP_PGID_FILENAME}"
     run_script = f"{meta}/run.sh"
     driver_log = f"{meta}/run_driver.log"
     delim = f"__RUNPLZ_CMD_{uuid.uuid4().hex}__"
@@ -1288,42 +1294,33 @@ def build_detached_launcher(remote_run: RemoteRunContext, wrapped_command: str) 
         f"{wrapped_command}\n"
         f"{delim}\n"
         f'chmod +x "{run_script}"\n'
+        f"{_run_id_env_assignment(remote_run.run_id)}"
         f'nohup bash "{run_script}" </dev/null >> "{driver_log}" 2>&1 &\n'
         f'echo $! > "{pid_file}"\n'
-        f"{_capture_bootstrap_pgid_shell(pgid_file)}"
     )
 
 
-def _capture_bootstrap_pgid_shell(pgid_file: str) -> str:
-    """Record the freshly spawned bootstrap's process group id, best effort.
+_SAFE_RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]*$")
+# `$HOME/...`, `~/...` or an absolute path, made of path-safe characters only.
+# The meta path comes from a manifest that is rsynced down off the remote box,
+# so it is untrusted input that lands inside a remote shell command.
+_SAFE_REMOTE_PATH_RE = re.compile(r"^(\$HOME/|~/|/)[A-Za-z0-9._/-]*$")
+_KILL_SIGNALS = ("TERM", "INT", "HUP", "QUIT", "KILL")
 
-    ``runplz kill`` signals the whole process group rather than walking a
-    parent/child tree, because the case that actually hurts is the one where
-    the bash supervisor is already gone and only orphaned workers survive,
-    reparented to init (issue #67). Those keep their original pgid, so the
-    group stays a valid handle long after ``pkill -P`` has nothing to match.
 
-    The pgid is only readable from procfs, which the supported remote
-    environments have but a developer's macOS box (running this launcher in
-    tests) does not. Everything here is guarded so a missing ``/proc`` simply
-    leaves no pgid file behind and ``kill`` falls back to the live-process
-    lookup.
-    """
+def _run_id_env_assignment(run_id: str) -> str:
+    """Shell prefix that puts the run id in a command's exec environment."""
+    if not _SAFE_RUN_ID_RE.match(run_id or ""):
+        raise ValueError(f"unsafe run id for remote shell: {run_id!r}")
+    if not run_id:
+        return ""
+    return f"{RUN_ID_ENV_VAR}={run_id} "
 
-    return (
-        'runplz_pgid=""\n'
-        'if [ -r "/proc/$!/stat" ]; then\n'
-        '  runplz_stat=""\n'
-        '  IFS= read -r runplz_stat < "/proc/$!/stat" || true\n'
-        # /proc/<pid>/stat is "pid (comm) state ppid pgrp ...". comm can hold
-        # spaces and parens, so cut past the last ") " before splitting.
-        "  runplz_rest=${runplz_stat##*) }\n"
-        "  runplz_rest=${runplz_rest#* }\n"
-        "  runplz_rest=${runplz_rest#* }\n"
-        "  runplz_pgid=${runplz_rest%% *}\n"
-        "fi\n"
-        f'if [ -n "$runplz_pgid" ]; then printf \'%s\\n\' "$runplz_pgid" > "{pgid_file}"; fi\n'
-    )
+
+def _validate_remote_path(path: str, *, what: str) -> str:
+    if not _SAFE_REMOTE_PATH_RE.match(path or ""):
+        raise ValueError(f"unsafe {what} for remote shell: {path!r}")
+    return path
 
 
 def build_kill_command(
@@ -1333,6 +1330,7 @@ def build_kill_command(
     timeout_s: int = DEFAULT_KILL_TIMEOUT_S,
     escalate: bool = True,
     first_signal: str = "TERM",
+    proc_root: str = "/proc",
 ) -> str:
     """Build the remote shell that stops one detached run in a single hop.
 
@@ -1340,47 +1338,97 @@ def build_kill_command(
     timeout is measured against the job rather than against ssh latency, and
     so a flaky link can't strand the run half-signalled.
 
-    Three things get signalled, because a run can outlive any one of them:
-    the process group (catches orphaned workers and forked DataLoader
-    children), the bootstrap pid itself (in case the pgid is unknown), and
-    the docker container in VM+docker mode (it is a child of dockerd, not of
-    the bootstrap, so no signal to our group ever reaches it).
+    A run's processes are identified by the run id in their environment
+    (see :data:`RUN_ID_ENV_VAR`), which is exact: it finds workers orphaned
+    to init after the supervisor died, and it cannot match anything but this
+    run. The recorded bootstrap pid is only a fallback, for runs launched
+    before the marker existed or on a host without procfs -- and it is used
+    only while the run has no terminal exit event, because a pid outlives its
+    process and can be recycled by PID wraparound.
+
+    The container in VM+docker mode is signalled separately: it is a child of
+    dockerd, so it is in neither the marker set nor the pid's descendants.
+
+    Every value interpolated here is validated first -- the meta path in
+    particular arrives from a manifest rsynced off the remote box.
+
+    ``proc_root`` exists so the marker scan can be exercised on a machine
+    without procfs (a macOS dev box): point it at a tree of ``<pid>/environ``
+    files naming real processes. Production always uses ``/proc``.
     """
 
+    meta = _validate_remote_path(meta, what="meta path")
+    proc_root = _validate_remote_path(proc_root, what="proc root").rstrip("/")
+    if not _SAFE_RUN_ID_RE.match(run_id or ""):
+        raise ValueError(f"unsafe run id for remote shell: {run_id!r}")
+    if first_signal not in _KILL_SIGNALS:
+        raise ValueError(f"unsupported signal {first_signal!r}; expected one of {_KILL_SIGNALS}")
+    timeout_s = int(timeout_s)
+    if timeout_s < 0:
+        raise ValueError(f"timeout_s must be >= 0, got {timeout_s}")
+
     pid_file = f"{meta}/{BOOTSTRAP_PID_FILENAME}"
-    pgid_file = f"{meta}/{BOOTSTRAP_PGID_FILENAME}"
     container_file = f"{meta}/{CONTAINER_FILENAME}"
     events_file = f"{meta}/events.ndjson"
     heartbeat_file = f"{meta}/heartbeat.ndjson"
     log_file = f"{meta}/last.log"
     settle_s = KILL_SETTLE_S
     return f"""\
+runplz_run_id='{run_id}'
 runplz_pid=""
-runplz_pgid=""
 runplz_container=""
 if [ -r "{pid_file}" ]; then IFS= read -r runplz_pid < "{pid_file}" || true; fi
-if [ -r "{pgid_file}" ]; then IFS= read -r runplz_pgid < "{pgid_file}" || true; fi
 if [ -r "{container_file}" ]; then IFS= read -r runplz_container < "{container_file}" || true; fi
 
-# Runs launched before the pgid file existed still have a recoverable group
-# for as long as the bootstrap itself is alive.
-if [ -z "$runplz_pgid" ] && [ -n "$runplz_pid" ] && [ -r "/proc/$runplz_pid/stat" ]; then
-  runplz_stat=""
-  IFS= read -r runplz_stat < "/proc/$runplz_pid/stat" || true
-  runplz_rest=${{runplz_stat##*) }}
-  runplz_rest=${{runplz_rest#* }}
-  runplz_rest=${{runplz_rest#* }}
-  runplz_pgid=${{runplz_rest%% *}}
+# Numeric comparison, not a string case: "0000001" is pid 1 to kill(1), and
+# `kill -TERM 0` signals every process in our own group -- i.e. this script.
+case "$runplz_pid" in ''|*[!0-9]*) runplz_pid="" ;; esac
+if [ -n "$runplz_pid" ] && [ "$runplz_pid" -le 1 ]; then runplz_pid=""; fi
+
+# A finished run's pid may already have been recycled by another job, so the
+# pid fallback is only trusted while no terminal event has been recorded.
+runplz_finished=0
+if grep -Fq 'remote_command_exit' "{events_file}" 2>/dev/null; then
+  runplz_finished=1
 fi
 
-# Reject anything non-numeric, and refuse pgid 0/1 outright: `kill -TERM -1`
-# signals every process the user owns, which on a shared box is a very
-# expensive typo.
-case "$runplz_pid" in ''|*[!0-9]*) runplz_pid="" ;; esac
-case "$runplz_pgid" in ''|*[!0-9]*|0|1) runplz_pgid="" ;; esac
+runplz_scan=0
+if [ -n "$runplz_run_id" ] && [ -d "{proc_root}" ]; then runplz_scan=1; fi
+
+# Every *live* process this run started, found by the run id in its
+# environment. This script does not carry the marker, so it can never signal
+# itself. The `kill -0` filter keeps a dead pid from pinning the wait loop.
+runplz_is_zombie() {{
+  runplz_zstat=""
+  [ -r "{proc_root}/$1/stat" ] || return 1
+  IFS= read -r runplz_zstat < "{proc_root}/$1/stat" || return 1
+  runplz_zrest=${{runplz_zstat##*) }}
+  case "${{runplz_zrest%% *}}" in Z) return 0 ;; esac
+  return 1
+}}
+
+runplz_run_pids() {{
+  [ "$runplz_scan" = "1" ] || return 0
+  for runplz_entry in "{proc_root}"/[0-9]*; do
+    [ -r "$runplz_entry/environ" ] || continue
+    runplz_cand=${{runplz_entry##*/}}
+    kill -0 "$runplz_cand" 2>/dev/null || continue
+    # A zombie answers `kill -0` but is already dead; counting it as alive
+    # would pin the wait loop and force a pointless SIGKILL escalation.
+    if runplz_is_zombie "$runplz_cand"; then continue; fi
+    if tr '\\0' '\\n' < "$runplz_entry/environ" 2>/dev/null \
+      | grep -qxF "{RUN_ID_ENV_VAR}=$runplz_run_id"; then
+      printf '%s\n' "$runplz_cand"
+    fi
+  done
+}}
 
 runplz_pid_state() {{
   {_detached_process_state_shell()}printf '%s' "$runplz_state"
+}}
+
+runplz_pid_usable() {{
+  [ -n "$runplz_pid" ] && [ "$runplz_finished" = "0" ]
 }}
 
 runplz_container_running() {{
@@ -1390,14 +1438,18 @@ runplz_container_running() {{
 }}
 
 runplz_alive() {{
-  case "$(runplz_pid_state)" in running) return 0 ;; esac
-  if [ -n "$runplz_pgid" ] && kill -0 "-$runplz_pgid" 2>/dev/null; then return 0; fi
+  [ -n "$(runplz_run_pids)" ] && return 0
+  if runplz_pid_usable; then
+    case "$(runplz_pid_state)" in running) return 0 ;; esac
+  fi
   runplz_container_running
 }}
 
 runplz_signal() {{
-  if [ -n "$runplz_pgid" ]; then kill -"$1" "-$runplz_pgid" 2>/dev/null || true; fi
-  if [ -n "$runplz_pid" ]; then kill -"$1" "$runplz_pid" 2>/dev/null || true; fi
+  for runplz_victim in $(runplz_run_pids); do
+    kill -"$1" "$runplz_victim" 2>/dev/null || true
+  done
+  if runplz_pid_usable; then kill -"$1" "$runplz_pid" 2>/dev/null || true; fi
   if [ -n "$runplz_container" ]; then
     sudo docker kill --signal="$1" "$runplz_container" >/dev/null 2>&1 || true
   fi
@@ -1415,9 +1467,11 @@ runplz_wait_until_dead() {{
 }}
 
 runplz_initial="$(runplz_pid_state)"
+runplz_alive_before=0
 runplz_escalated=0
 runplz_signalled=0
 if runplz_alive; then
+  runplz_alive_before=1
   runplz_signalled=1
   runplz_signal "{first_signal}"
   if ! runplz_wait_until_dead {timeout_s}; then
@@ -1428,7 +1482,11 @@ if runplz_alive; then
     fi
   fi
 fi
+
 runplz_final="$(runplz_pid_state)"
+runplz_alive_after=0
+if runplz_alive; then runplz_alive_after=1; fi
+runplz_survivors="$(runplz_run_pids | tr '\n' ' ' | sed 's/  *$//')"
 if runplz_container_running; then runplz_container_state=running; \
 elif [ -n "$runplz_container" ]; then runplz_container_state=stopped; \
 else runplz_container_state=none; fi
@@ -1448,18 +1506,25 @@ fi
 
 printf '%s\n' '---SUMMARY---'
 printf 'pid=%s\n' "${{runplz_pid:-}}"
-printf 'pgid=%s\n' "${{runplz_pgid:-}}"
 printf 'container=%s\n' "${{runplz_container:-}}"
 printf 'container_state=%s\n' "$runplz_container_state"
+printf 'scan=%s\n' "$runplz_scan"
+printf 'finished=%s\n' "$runplz_finished"
 printf 'initial=%s\n' "$runplz_initial"
 printf 'final=%s\n' "$runplz_final"
+printf 'alive_before=%s\n' "$runplz_alive_before"
+printf 'alive_after=%s\n' "$runplz_alive_after"
+printf 'survivors=%s\n' "${{runplz_survivors:-}}"
+printf 'signal=%s\n' '{first_signal}'
 printf 'signalled=%s\n' "$runplz_signalled"
 printf 'escalated=%s\n' "$runplz_escalated"
 printf 'gpu_mem_used=%s\n' "${{runplz_gpu:-}}"
 printf '%s\n' '---HEARTBEAT---'
 tail -n 1 "{heartbeat_file}" 2>/dev/null || true
 printf '%s\n' '---LOGTAIL---'
-tail -n 10 "{log_file}" 2>/dev/null || true
+# Prefixed so a log line that happens to look like ---SECTION--- cannot be
+# mistaken for one by the section parser.
+tail -n 10 "{log_file}" 2>/dev/null | sed 's/^/| /' || true
 printf '%s\n' '---END---'
 """
 
@@ -1599,7 +1664,7 @@ def detached_launch_diagnostics(
     """Fetch compact process and lifecycle context for a failed startup."""
 
     meta = remote_run.meta_shell
-    pid_file = f"{meta}/bootstrap.pid"
+    pid_file = f"{meta}/{BOOTSTRAP_PID_FILENAME}"
     driver_log = f"{meta}/run_driver.log"
     command = (
         'runplz_pid=""; '
@@ -1688,11 +1753,17 @@ def launch_detached_and_wait(
                 timeout=max_runtime_seconds,
             )
         except subprocess.TimeoutExpired:
-            _raise_for_runtime_cap(target, max_runtime_seconds, container_name=None, port=port)
+            _raise_for_runtime_cap(
+                target,
+                max_runtime_seconds,
+                container_name=None,
+                port=port,
+                remote_run=remote_run,
+            )
         return r.returncode
 
     meta = remote_run.meta_shell
-    pid_file = f"{meta}/bootstrap.pid"
+    pid_file = f"{meta}/{BOOTSTRAP_PID_FILENAME}"
     log_file = remote_run.last_log_shell
     events_file = remote_run.events_shell
     launcher = build_detached_launcher(remote_run, wrapped_command)
@@ -1742,6 +1813,9 @@ def launch_detached_and_wait(
         max_runtime_seconds=max_runtime_seconds,
         max_reconnects=max_reconnects,
         port=port,
+        # So a runtime-cap timeout stops this run precisely instead of
+        # pkill-ing every runplz bootstrap on the box.
+        remote_run=remote_run,
     )
 
 
@@ -1754,6 +1828,7 @@ def tail_and_wait_for_detached(
     max_runtime_seconds: Optional[int] = None,
     max_reconnects: int = 20,
     port: Optional[int] = None,
+    remote_run: Optional[RemoteRunContext] = None,
 ) -> int:
     """Stream log_file via ssh ``tail -F`` and return remote exit code.
 
@@ -1786,11 +1861,23 @@ def tail_and_wait_for_detached(
                 timeout=_remaining_s(),
             )
         except subprocess.TimeoutExpired:
-            _raise_for_runtime_cap(target, max_runtime_seconds, container_name=None, port=port)
+            _raise_for_runtime_cap(
+                target,
+                max_runtime_seconds,
+                container_name=None,
+                port=port,
+                remote_run=remote_run,
+            )
         if not remote_pid_alive(target, pid_file, port=port):
             break
         if max_runtime_seconds is not None and (time.monotonic() - started) >= max_runtime_seconds:
-            _raise_for_runtime_cap(target, max_runtime_seconds, container_name=None, port=port)
+            _raise_for_runtime_cap(
+                target,
+                max_runtime_seconds,
+                container_name=None,
+                port=port,
+                remote_run=remote_run,
+            )
         reconnects += 1
         if reconnects > max_reconnects:
             print(
@@ -1813,7 +1900,13 @@ def tail_and_wait_for_detached(
     # code, not a premature "unknown").
     while remote_pid_alive(target, pid_file, port=port):
         if max_runtime_seconds is not None and (time.monotonic() - started) >= max_runtime_seconds:
-            _raise_for_runtime_cap(target, max_runtime_seconds, container_name=None, port=port)
+            _raise_for_runtime_cap(
+                target,
+                max_runtime_seconds,
+                container_name=None,
+                port=port,
+                remote_run=remote_run,
+            )
         time.sleep(min(30, HEARTBEAT_INTERVAL_S))
 
     return read_remote_exit_code(target, events_file, port=port)
@@ -2017,17 +2110,35 @@ def _fetch_failure_tail(
         return f"[runplz: could not fetch remote log tail — {type(exc).__name__}: {exc}]"
 
 
-def _raise_for_runtime_cap(target: str, cap_s, container_name, *, port: Optional[int] = None):
+def _raise_for_runtime_cap(
+    target: str,
+    cap_s,
+    container_name,
+    *,
+    port: Optional[int] = None,
+    remote_run: Optional[RemoteRunContext] = None,
+):
     """Shared timeout-path cleanup + raise for issue #16.
 
     container_name: set for VM+docker mode (kill the container with docker kill);
-    None for container-mode / native (pkill the bootstrap process tree).
+    None for container-mode / native.
+
+    When the run context is known, stop exactly this run's processes via
+    :func:`build_kill_command`. The fallback -- ``pkill -f runplz._bootstrap``
+    -- matches on a cmdline substring, so on a box running two jobs it takes
+    the innocent one down too; it is only used when we have no run to scope to.
 
     Best-effort cleanup: if the kill ssh hangs or fails, still raise — the
     on_finish action in the caller's finally block will nuke the box anyway.
     """
     if container_name is not None:
         cleanup = f"sudo docker kill {container_name}"
+    elif remote_run is not None:
+        cleanup = build_kill_command(
+            remote_run.meta_shell,
+            run_id=remote_run.run_id,
+            timeout_s=5,
+        )
     else:
         cleanup = "pkill -f 'runplz._bootstrap' || true"
     try:

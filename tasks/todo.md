@@ -27,24 +27,66 @@ Nothing was already fully fixed; #67 had shrunk to just the kill itself.
 
 ### Scope / design
 
-- **Kill by process group, not by process tree.** The painful case in #67 is the one where the
-  bash supervisor is already dead and only orphaned workers survive, reparented to init —
-  `pkill -P` has nothing left to match, but those workers keep their original pgid. So the
-  launcher now persists `bootstrap.pgid` alongside `bootstrap.pid` (best-effort, procfs-only,
-  a documented no-op on a macOS dev box) and kill signals the group.
-- Runs launched before the pgid file existed still work: kill re-derives the group from
-  `/proc/<pid>/stat` whenever the bootstrap is alive.
+> The first cut here keyed on the process *group*; code review showed that was unsound.
+> See "Code review round 2" below for what actually shipped. Bullets updated to match.
+
+- **Identify a run's processes by a per-run environment marker.** The painful case in #67 is
+  the one where the bash supervisor is already dead and only orphaned workers survive,
+  reparented to init — `pkill -P` has nothing left to match. The bootstrap is exec'd with
+  `RUNPLZ_RUN_ID=<id>`, every descendant inherits it, and kill scans `/proc/*/environ` for it.
+  Unique to the run, survives reparenting, immune to PID wraparound.
+- Runs launched before the marker existed fall back to the recorded bootstrap pid — but only
+  while no terminal exit event has been recorded, since a finished run's pid can be recycled.
 - VM+docker mode records the container name in `<meta>/container`. The container is a child of
-  dockerd, outside the bootstrap's process group, so no group signal would ever reach it.
+  dockerd, so it carries no marker of ours and must be signalled separately.
 - The whole signal → poll → escalate dance runs remotely in one ssh hop, so the escalation
   clock measures the job rather than ssh latency and a flaky link can't strand a half-signalled
   run.
-- Guards: non-numeric pid/pgid are discarded, and pgid 0/1 is refused outright — `kill -TERM -1`
-  would signal every process the user owns.
+- Guards: non-numeric pids are discarded and pid 0/1 refused numerically — `kill -TERM 0`
+  signals every process in the caller's own group. Zombies are excluded so they can't pin the
+  wait loop into a pointless SIGKILL.
+- Everything interpolated into the remote shell is validated first, including the meta path,
+  which arrives from a manifest rsynced down off the remote box.
 - Idempotent by design: killing an already-finished run prints `nothing to kill` and exits 0,
   so it is safe in a relaunch script.
 - Reused `_add_run_lookup_args` and `_parse_status_sections` rather than inventing a second run
   lookup or output format.
+
+### Code review round 2 — 15 findings, all addressed
+
+The first cut identified a run's processes by **process group**. That was
+wrong: bash disables job control in non-interactive shells, so the bootstrap
+never becomes a group leader and the recorded pgid is the *launching shell's*.
+Blast radius on anything sharing it, and no protection against PID wraparound
+reusing a stale pgid/pid from a finished run.
+
+Replaced with a per-run **environment marker**: the bootstrap is exec'd with
+`RUNPLZ_RUN_ID=<id>`, every descendant inherits it, and kill scans
+`/proc/*/environ` for it. Unique, survives reparenting, cannot be recycled.
+That one change resolved the group-blast-radius, PID-wraparound, zero-padded-
+pgid and duplicated-procfs-parsing findings together.
+
+Also fixed:
+- `alive_after` / `survivors` are now reported, so a kill that left processes
+  running can no longer print "stopped with SIGTERM"
+- `kill` exits 3 when anything survives and 2 when the remote script produced
+  no readable result — it used to return 0 in both cases
+- pid `0`/`1` rejected numerically (`kill -TERM 0` signals our own group)
+- `remote_shell_path` validates the manifest path: dropping `shlex.quote` for
+  `$HOME` expansion had opened `$(...)` execution from a manifest that is
+  rsynced down off the remote box
+- `run_id`, `first_signal`, `timeout_s`, `proc_root` validated in
+  `build_kill_command`, not just at the argparse layer
+- the reported signal is the one actually sent (`--signal INT` no longer
+  claims SIGTERM)
+- log tail lines are prefixed so a `--- ... ---` line in a log can't truncate
+  the section parser
+- one shared heartbeat renderer for `status` and `kill`
+- the runtime-cap timeout path no longer `pkill`s every runplz bootstrap on
+  the box; it stops the specific run
+- `BOOTSTRAP_PID_FILENAME` now actually centralizes the filename
+- a real NUL byte was reaching the generated script instead of the `\0`
+  escape `tr` needs — caught by executing the script, not by reading it
 
 ### Review section
 
@@ -58,8 +100,8 @@ Nothing was already fully fixed; #67 had shrunk to just the kill itself.
   - `runplz._runs` shells out to `ssh` but was missing from `conftest._MODULES_TO_GUARD`, so a
     test that forgot to mock could have hit real infra — exactly what that guard exists to
     prevent.
-- `./format.sh` and `./lint.sh` pass. `./test.sh` passes (`487 passed`, 93% total coverage),
-  with the 35 new tests clean under `-W error::DeprecationWarning` across 5 consecutive runs.
+- `./format.sh` and `./lint.sh` pass. `./test.sh` passes (`522 passed`, 93% total coverage),
+  with the new tests clean under `-W error::DeprecationWarning` across 5 consecutive runs.
 
 ## 2026-08-26 PR Plan — HUP-Safe Detached Bootstrap (#73)
 

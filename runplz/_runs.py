@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 from runplz.backends.ssh_common import (
+    _SAFE_REMOTE_PATH_RE,
     DEFAULT_KILL_TIMEOUT_S,
     KILL_SETTLE_S,
     REMOTE_META_DIRNAME,
@@ -28,6 +29,10 @@ from runplz.backends.ssh_common import (
 )
 
 META_FILENAME = "run.json"
+
+# `kill` exit code for "signalled, but something is still alive" - distinct
+# from 0 (stopped) and from ssh / protocol failures.
+KILL_SURVIVED_RC = 3
 
 # Run ids are generated as <ts>-<slug>-<slug>-<hex>, but --run-id is user
 # input and lands inside a remote shell command, so pin it to a charset that
@@ -107,7 +112,15 @@ def remote_shell_path(path: str) -> str:
     into ``"..."`` and get the directory they meant.
     """
     if path.startswith("~/"):
-        return f"$HOME/{path[2:]}"
+        path = f"$HOME/{path[2:]}"
+    # The manifest is written on the remote box and rsynced down, so this
+    # string is untrusted input about to be interpolated into a double-quoted
+    # remote shell word -- where $(...) and backticks still run.
+    if not _SAFE_REMOTE_PATH_RE.match(path):
+        raise RuntimeError(
+            f"refusing to use remote path {path!r} from the run manifest: expected "
+            f"an absolute or $HOME-relative path of plain path characters"
+        )
     return path
 
 
@@ -216,9 +229,23 @@ def kill(
             print(r.stderr.strip(), file=sys.stderr)
         return r.returncode
     sections = _parse_status_sections(r.stdout)
-    fields = _parse_kv_block(sections.get("SUMMARY", ""))
+    if "SUMMARY" not in sections or "alive_after" not in sections["SUMMARY"]:
+        # ssh succeeded but the script did not run to completion -- a login
+        # shell that cannot parse it, or a banner/sudo prompt on stdout. Never
+        # report a stop we have no evidence of.
+        print(
+            f"could not read a kill result from {target}; the run may still be running",
+            file=sys.stderr,
+        )
+        if r.stdout.strip():
+            print(r.stdout.strip()[:500], file=sys.stderr)
+        return 2
+    fields = _parse_kv_block(sections["SUMMARY"])
     print(_format_kill(target=target, run_id=run_id, fields=fields, sections=sections))
-    return 0
+    # Survivors mean the kill failed. Exiting 0 here would let
+    # `runplz kill && runplz brev job.py` start a second job on a GPU the
+    # first one still holds.
+    return KILL_SURVIVED_RC if fields.get("alive_after") == "1" else 0
 
 
 def _parse_kv_block(block: str) -> dict[str, str]:
@@ -237,54 +264,72 @@ def _format_kill(
     final = fields.get("final", "unknown")
     signalled = fields.get("signalled") == "1"
     escalated = fields.get("escalated") == "1"
+    alive_after = fields.get("alive_after") == "1"
+    signal = fields.get("signal") or "TERM"
     container = fields.get("container", "")
     container_state = fields.get("container_state", "none")
+    survivors = [pid for pid in (fields.get("survivors") or "").split() if pid]
 
     lines = [f"target:     {target}"]
     if run_id:
         lines.append(f"run:        {run_id}")
-    pid = fields.get("pid") or "-"
-    pgid = fields.get("pgid") or "-"
-    lines.append(f"bootstrap:  pid={pid} pgid={pgid}")
+    lines.append(f"bootstrap:  pid={fields.get('pid') or '-'}")
     if container:
         lines.append(f"container:  {container} ({container_state})")
 
     if not signalled:
-        lines.append(f"action:     nothing to kill — process was already {initial}")
-    elif final in {"dead", "missing", "zombie"} and container_state != "running":
-        how = "SIGTERM, escalated to SIGKILL" if escalated else "SIGTERM"
+        lines.append(f"action:     nothing to kill - the run was already {initial}")
+    elif not alive_after:
+        how = f"SIG{signal}, escalated to SIGKILL" if escalated else f"SIG{signal}"
         lines.append(f"action:     stopped with {how}")
     else:
-        lines.append(
-            f"action:     signalled, but the run still reports {final!r} — inspect manually"
-        )
+        bits = []
+        if survivors:
+            bits.append(f"pids still alive: {' '.join(survivors)}")
+        if container_state == "running":
+            bits.append("container still running")
+        if not bits:
+            bits.append(f"state {final!r}")
+        lines.append("action:     SIGNALLED BUT STILL ALIVE - " + "; ".join(bits))
     lines.append(f"state:      {initial} -> {final}")
+
+    if fields.get("scan") == "0":
+        lines.append(
+            "note:       no process marker available (pre-3.16 run, or no procfs); "
+            "fell back to the recorded pid alone"
+        )
 
     gpu = fields.get("gpu_mem_used", "")
     if gpu:
         used = [g for g in gpu.split(",") if g]
-        pretty = ", ".join(f"gpu{i}={m}MiB" for i, m in enumerate(used))
-        lines.append(f"gpu memory: {pretty}")
+        lines.append("gpu memory: " + ", ".join(f"gpu{i}={m}MiB" for i, m in enumerate(used)))
 
     heartbeat = (sections.get("HEARTBEAT") or "").strip()
     if heartbeat:
-        lines.append(f"heartbeat:  {_heartbeat_age(heartbeat)}")
+        lines.append(f"heartbeat:  {_render_timestamped(heartbeat)}")
 
     logtail = (sections.get("LOGTAIL") or "").strip()
     if logtail:
         lines.append("last log:")
-        lines.extend(f"  {line}" for line in logtail.splitlines())
+        # The remote prefixes each line with "| " so log text can never be
+        # mistaken for a ---SECTION--- marker by the section parser.
+        for line in logtail.splitlines():
+            lines.append(f"  {line[2:] if line.startswith('| ') else line}")
     return "\n".join(lines)
 
 
-def _heartbeat_age(line: str) -> str:
-    """Render the last heartbeat as ``<ts> (<age> ago)``, matching `status`."""
+def _render_timestamped(line: str) -> str:
+    """Render a lifecycle JSON line as ``<ts> (<age> ago)``.
+
+    Shared by `status` and `kill` so a malformed heartbeat cannot render one
+    way in one command and a different way in the other.
+    """
     try:
         ts = json.loads(line).get("ts", "")
     except (json.JSONDecodeError, AttributeError):
-        return line[:200]
+        return f"(unparsed) {line[:200]}"
     if not ts:
-        return line[:200]
+        return f"(unparsed) {line[:200]}"
     return f"{ts}{_age_str(ts)}"
 
 
@@ -348,13 +393,7 @@ def _format_status(*, target: str, manifest: dict, sections: dict[str, str]) -> 
         lines.append("last event: (none recorded)")
 
     if last_hb_raw:
-        try:
-            hb = json.loads(last_hb_raw)
-            ts = hb.get("ts", "")
-            age = _age_str(ts)
-            lines.append(f"last heartbeat: {ts}{age}")
-        except json.JSONDecodeError:
-            lines.append(f"last heartbeat (unparsed): {last_hb_raw[:200]}")
+        lines.append(f"last heartbeat: {_render_timestamped(last_hb_raw)}")
     else:
         lines.append("last heartbeat: (none yet)")
 
