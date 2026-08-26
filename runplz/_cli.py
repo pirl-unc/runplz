@@ -33,7 +33,7 @@ import sys
 import typing
 from pathlib import Path
 
-from runplz.app import _repo_root_for
+from runplz.app import _VALID_BACKENDS, _repo_root_for
 
 
 def main(argv=None):
@@ -60,7 +60,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(
         prog="runplz", description="Run a Python @app.function on a chosen backend."
     )
-    p.add_argument("backend", choices=["local", "brev", "modal", "ssh"])
+    p.add_argument("backend", choices=list(_VALID_BACKENDS))
     p.add_argument("script", help="Path to a job script defining an App with @local_entrypoint.")
     p.add_argument(
         "--outputs-dir",

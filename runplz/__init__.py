@@ -1,6 +1,6 @@
 """runplz — tiny Modal-shaped job harness.
 
-One Python decoration, four backends (local Docker, Brev, SSH, Modal).
+One Python decoration, six backends (local Docker, Brev, SSH, GCP, AWS, Modal).
 Smallest working script — a single `@app.function` is enough; runplz
 auto-runs it as the entrypoint when there's exactly one:
 
@@ -33,7 +33,7 @@ operations on long-running runs.
 """
 
 from runplz.app import App, Function
-from runplz.config import BrevConfig, ModalConfig, SshConfig
+from runplz.config import AwsConfig, BrevConfig, GcpConfig, ModalConfig, SshConfig
 from runplz.image import Image, ImageOp
 from runplz.version import __version__
 
@@ -42,7 +42,9 @@ __all__ = [
     "Function",
     "Image",
     "ImageOp",
+    "AwsConfig",
     "BrevConfig",
+    "GcpConfig",
     "ModalConfig",
     "SshConfig",
     "__version__",

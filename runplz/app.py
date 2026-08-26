@@ -14,8 +14,13 @@ import json
 from pathlib import Path
 from typing import Callable, Optional
 
-from runplz.config import BrevConfig, ModalConfig, SshConfig
+from runplz.config import AwsConfig, BrevConfig, GcpConfig, ModalConfig, SshConfig
 from runplz.image import Image
+
+_VALID_BACKENDS = ("local", "brev", "modal", "ssh", "gcp", "aws")
+# Backends that create the box themselves, so they take neither an
+# --instance (brev) nor a --host (ssh): there is nothing to point at yet.
+_CLOUD_BACKENDS = ("gcp", "aws")
 
 
 class Function:
@@ -127,11 +132,18 @@ class App:
         brev_config: Optional[BrevConfig] = None,
         modal_config: Optional[ModalConfig] = None,
         ssh_config: Optional[SshConfig] = None,
+        gcp_config: Optional[GcpConfig] = None,
+        aws_config: Optional[AwsConfig] = None,
     ):
         self.name = name
         self.brev_config = brev_config or BrevConfig()
         self.modal_config = modal_config or ModalConfig()
         self.ssh_config = ssh_config or SshConfig()
+        # Provisioning clouds have required fields, so they stay None
+        # until the user supplies one. bind() raises a pointed error
+        # rather than constructing an invalid default.
+        self.gcp_config = gcp_config
+        self.aws_config = aws_config
         self.functions: dict[str, Function] = {}
         self._entrypoint: Optional[Callable] = None
 
@@ -215,10 +227,18 @@ class App:
         The CLI is preferred for CI/shared scripts; this is for notebooks
         and one-off runs where you already have `app` in scope.
         """
-        if backend not in ("local", "brev", "modal", "ssh"):
-            raise ValueError(f"backend must be 'local', 'brev', 'modal', or 'ssh'; got {backend!r}")
+        if backend not in _VALID_BACKENDS:
+            raise ValueError(f"backend must be one of {_VALID_BACKENDS}; got {backend!r}")
         # brev accepts instance=None → ephemeral mode (runplz auto-creates
         # a box sized to the function and deletes it on exit).
+        if backend in _CLOUD_BACKENDS:
+            cfg = getattr(self, f"{backend}_config")
+            if cfg is None:
+                raise ValueError(
+                    f"backend={backend!r} needs App(..., {backend}_config=...). "
+                    f"It provisions a box for you, so it needs to know where: "
+                    f"project/zone for gcp, region/key_name for aws."
+                )
         if backend != "brev" and instance is not None:
             raise ValueError(
                 f"instance={instance!r} only applies to backend='brev'; got backend={backend!r}."
@@ -280,6 +300,14 @@ class App:
             from runplz.backends import ssh
 
             return ssh.run(self, function, args, kwargs, **self._backend_kwargs)
+        if backend == "gcp":
+            from runplz.backends import gcp
+
+            return gcp.run(self, function, args, kwargs, **self._backend_kwargs)
+        if backend == "aws":
+            from runplz.backends import aws
+
+            return aws.run(self, function, args, kwargs, **self._backend_kwargs)
         raise ValueError(f"Unknown backend: {backend!r}")
 
 

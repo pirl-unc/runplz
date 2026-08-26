@@ -215,3 +215,161 @@ class ModalConfig:
     """
 
     pass
+
+
+_VALID_CLOUD_ON_FINISH = ("delete", "stop", "leave")
+
+
+@dataclass(frozen=True)
+class GcpConfig:
+    """Config for the `gcp` backend — provision a GCE VM, run, tear down.
+
+    runplz shells out to `gcloud` rather than the Python SDK: the core
+    stays dependency-free, and the test suite's billed-CLI guard already
+    covers `gcloud` (see tests/conftest.py), so a test that forgets to mock
+    cannot quietly launch a paid instance.
+
+    Auth is whatever `gcloud` already has — ADC or `gcloud auth login`.
+    runplz never handles credentials and never writes them anywhere.
+
+    Networking is pinned, never created: pass an existing `network` /
+    `subnet` if the default VPC isn't what you want. runplz will not create
+    firewall rules for you.
+    """
+
+    # Required. The GCP project and zone to create the instance in.
+    project: str = ""
+    zone: str = ""
+    # Machine type (e.g. "a2-highgpu-1g"). None → derived from the
+    # function's gpu / min_gpus / min_cpu / min_memory.
+    machine_type: Optional[str] = None
+    # Accelerator type (e.g. "nvidia-tesla-a100"). None → derived from
+    # `Function.gpu`. Ignored when the machine type has GPUs built in
+    # (a2/a3 shapes ship with their accelerators attached).
+    accelerator: Optional[str] = None
+    # Boot image. Defaults to Google's Deep Learning VM, which ships with
+    # NVIDIA drivers and docker already installed — without those, every
+    # run would pay a multi-minute driver install before it could start.
+    image_family: str = "common-cu123-py310"
+    image_project: str = "deeplearning-platform-release"
+    # Boot disk. None → Function.min_disk, else GCP's default.
+    boot_disk_gb: Optional[int] = None
+    boot_disk_type: Optional[str] = None
+    # Existing network / subnet to attach to. None → project default.
+    network: Optional[str] = None
+    subnet: Optional[str] = None
+    # Service account + scopes for the instance. None → project default.
+    service_account: Optional[str] = None
+    scopes: Optional[str] = None
+    # Spot (preemptible) capacity. Cheaper, can be reclaimed mid-run.
+    # No retry-on-reclaim loop yet — see issue #25's deferred list.
+    spot: bool = False
+    # What to do with the instance when the run ends. "delete" is the
+    # default because an ephemeral box nothing will reuse is a pure
+    # billing leak if left running.
+    on_finish: str = "delete"
+    # Build/pull a docker image on the instance (True) vs installing a
+    # python venv natively (False). Same meaning as SshConfig.use_docker.
+    use_docker: bool = True
+    max_runtime_seconds: Optional[int] = None
+    ssh_ready_wait_seconds: int = 1800
+    # Print every gcloud command instead of running it. Nothing is created,
+    # nothing is billed — for checking what a config would actually do.
+    dry_run: bool = False
+
+    def __post_init__(self):
+        _validate_cloud_common("GcpConfig", self)
+        if not (self.project or "").strip():
+            raise ValueError(
+                "GcpConfig.project is required, e.g. GcpConfig(project='my-proj', "
+                "zone='us-central1-a'). runplz does not guess it from your "
+                "gcloud config — an instance billed to the wrong project is "
+                "worse than an error."
+            )
+        if not (self.zone or "").strip():
+            raise ValueError(
+                "GcpConfig.zone is required, e.g. GcpConfig(project='my-proj', "
+                "zone='us-central1-a'). GPU availability is per-zone, so there "
+                "is no safe default."
+            )
+
+
+@dataclass(frozen=True)
+class AwsConfig:
+    """Config for the `aws` backend — provision an EC2 instance, run, tear down.
+
+    Shells out to the `aws` CLI for the same reasons as :class:`GcpConfig`.
+    Auth is whatever the CLI already has: profile, env vars, or an
+    instance/SSO role.
+
+    Unlike GCP, EC2 has no `config-ssh` equivalent that publishes an ssh
+    alias for you, so `key_name` is required and the target is built from
+    the instance's public IP.
+
+    The private half of that key pair must be resolvable by ssh itself —
+    loaded into your agent (`ssh-add ~/.ssh/my-key.pem`), named as one of
+    ssh's defaults, or given an `IdentityFile` entry in `~/.ssh/config`.
+    runplz does not take a key path today: `ssh_common` threads a port and
+    nothing else through its ~50 call sites, and plumbing an identity file
+    through all of them belongs in its own change, shared with the ssh,
+    brev and gcp backends rather than bolted on here.
+
+    Networking is pinned, never created: pass an existing `subnet_id` /
+    `security_group_id`. The security group must allow inbound TCP 22 from
+    wherever you are running runplz, or the run will hang waiting for ssh.
+    """
+
+    # Required. Region to launch in.
+    region: str = ""
+    # Instance type (e.g. "g5.xlarge"). None → derived from the function's
+    # gpu / min_gpus / min_cpu / min_memory.
+    instance_type: Optional[str] = None
+    # AMI id. None → resolve the current Deep Learning AMI from SSM, which
+    # ships NVIDIA drivers + docker. AMI ids are region-specific and roll
+    # monthly, so hardcoding one would rot.
+    ami: Optional[str] = None
+    # Required: the EC2 key pair whose private half you hold locally.
+    # Without it the instance launches with no way to ssh in.
+    key_name: Optional[str] = None
+    # Login user for the AMI. Deep Learning AMIs are Ubuntu-based.
+    ssh_user: str = "ubuntu"
+    # Existing VPC bits to attach to. None → account default VPC.
+    subnet_id: Optional[str] = None
+    security_group_id: Optional[str] = None
+    iam_instance_profile: Optional[str] = None
+    # Root volume size. None → Function.min_disk, else the AMI's default.
+    volume_gb: Optional[int] = None
+    # Spot capacity. Cheaper, can be reclaimed mid-run. No retry loop yet.
+    spot: bool = False
+    on_finish: str = "delete"
+    use_docker: bool = True
+    max_runtime_seconds: Optional[int] = None
+    ssh_ready_wait_seconds: int = 1800
+    dry_run: bool = False
+
+    def __post_init__(self):
+        _validate_cloud_common("AwsConfig", self)
+        if not (self.region or "").strip():
+            raise ValueError(
+                "AwsConfig.region is required, e.g. AwsConfig(region='us-east-1', "
+                "key_name='my-key'). GPU availability and pricing are "
+                "per-region, so there is no safe default."
+            )
+
+
+def _validate_cloud_common(cls_name: str, cfg) -> None:
+    """Shared field validation for the provisioning cloud configs."""
+    if cfg.on_finish not in _VALID_CLOUD_ON_FINISH:
+        raise ValueError(
+            f"{cls_name}.on_finish must be one of {_VALID_CLOUD_ON_FINISH}; got {cfg.on_finish!r}."
+        )
+    if cfg.max_runtime_seconds is not None and cfg.max_runtime_seconds <= 0:
+        raise ValueError(
+            f"{cls_name}.max_runtime_seconds must be a positive int (or None); "
+            f"got {cfg.max_runtime_seconds!r}."
+        )
+    if not isinstance(cfg.ssh_ready_wait_seconds, int) or cfg.ssh_ready_wait_seconds <= 0:
+        raise ValueError(
+            f"{cls_name}.ssh_ready_wait_seconds must be a positive int; "
+            f"got {cfg.ssh_ready_wait_seconds!r}."
+        )

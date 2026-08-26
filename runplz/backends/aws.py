@@ -1,0 +1,346 @@
+"""AWS backend: provision an EC2 instance, run one function on it, terminate it.
+
+Shells out to the `aws` CLI. Auth is whatever the CLI already has — a
+profile, environment variables, or an SSO/instance role.
+
+EC2 has no `gcloud compute config-ssh` equivalent, so unlike the GCP
+backend there is no alias to lean on: `key_name` is required and the ssh
+target is built from the instance's public IP. The private half of that key
+must already be resolvable by ssh (agent, default name, or an IdentityFile
+entry) — see :class:`runplz.config.AwsConfig`.
+
+Networking is pinned, never created. The security group in play must allow
+inbound TCP 22 from wherever runplz is running, or the run will sit in the
+ssh wait until it times out.
+"""
+
+from runplz.backends._cloud import (
+    AWS_GPUS,
+    CloudCliError,
+    gpu_count,
+    make_instance_name,
+    resolve_gpu_label,
+    run_cli,
+)
+from runplz.backends.ssh_common import run_on_provisioned_vm
+
+__all__ = ["run"]
+
+# Deep Learning AMI ids are region-specific and roll monthly, so resolve the
+# current one from SSM instead of hardcoding something that rots.
+_DLAMI_SSM_PARAM = (
+    "/aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id"
+)
+# CPU-only runs don't need the (large, GPU-driver-laden) DLAMI.
+_UBUNTU_SSM_PARAM = (
+    "/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id"
+)
+
+
+def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
+    cfg = app.aws_config
+    if not (cfg.key_name or "").strip():
+        # Raise before anything is created: no billable state exists yet, so
+        # this must not go through the teardown path.
+        raise RuntimeError(
+            "AwsConfig.key_name is required — EC2 gives you no way to ssh in "
+            "without a key pair, so runplz would provision a box it cannot "
+            "reach.\n"
+            "  - List your key pairs: aws ec2 describe-key-pairs "
+            f"--region {cfg.region or '<region>'}\n"
+            "  - Then: AwsConfig(region=..., key_name='my-key')\n"
+            "  - The private half must be loaded in your ssh agent "
+            "(`ssh-add ~/.ssh/my-key.pem`) or resolvable from ~/.ssh/config."
+        )
+
+    name = make_instance_name(app.name, function.name)
+    instance_type = resolve_instance_type(cfg, function)
+    state = {"instance_id": None}
+
+    print(
+        f"+ aws: name={name} region={cfg.region} instance-type={instance_type} "
+        f"on_finish={cfg.on_finish}",
+        flush=True,
+    )
+
+    def provision():
+        ami = cfg.ami or resolve_ami(cfg, function)
+        created = run_cli(
+            build_run_instances_command(
+                cfg, function, name=name, instance_type=instance_type, ami=ami
+            ),
+            label=f"aws ec2 run-instances ({name})",
+            timeout=900,
+            dry_run=cfg.dry_run,
+            parse_json=True,
+        )
+        instance_id = _instance_id_from(created)
+        state["instance_id"] = instance_id
+        _wait_running(cfg, instance_id)
+        ip = _public_ip(cfg, instance_id)
+        return (f"{cfg.ssh_user}@{ip}", None)
+
+    def teardown():
+        apply_on_finish(cfg, state["instance_id"], name=name)
+
+    if cfg.dry_run:
+        # Show the whole command sequence without creating or dispatching
+        # anything. state["instance_id"] stays None and the renderers below
+        # substitute a placeholder.
+        provision()
+        teardown()
+        print("+ [dry-run] nothing was created; no dispatch attempted", flush=True)
+        return
+
+    run_on_provisioned_vm(
+        app=app,
+        function=function,
+        args=args,
+        kwargs=kwargs,
+        backend="aws",
+        label=name,
+        provision=provision,
+        teardown=teardown,
+        outputs_dir=outputs_dir,
+        use_docker=cfg.use_docker,
+        max_runtime_seconds=cfg.max_runtime_seconds,
+        ssh_ready_wait_seconds=cfg.ssh_ready_wait_seconds,
+    )
+
+
+def resolve_instance_type(cfg, function) -> str:
+    """Pick an EC2 instance type for the function's resource request."""
+    if cfg.instance_type:
+        return cfg.instance_type
+
+    label = resolve_gpu_label(function, AWS_GPUS)
+    count = gpu_count(function)
+    if label is None:
+        return f"m6i.{_cpu_size_name(function)}"
+
+    family, _vram = AWS_GPUS[label]
+    # The big multi-GPU shapes come in exactly one size each; asking for a
+    # count they don't offer is better rejected here than by EC2.
+    fixed = {"p4d": "p4d.24xlarge", "p4de": "p4de.24xlarge", "p5": "p5.48xlarge"}
+    if family in fixed:
+        if count not in (1, 8):
+            raise CloudCliError(
+                f"{family} only exists as an 8-GPU shape ({fixed[family]}); "
+                f"min_gpus={count} cannot be satisfied. Pass an explicit "
+                f"instance_type to override."
+            )
+        return fixed[family]
+    if count == 1:
+        return f"{family}.xlarge"
+    if count <= 4:
+        return f"{family}.12xlarge"
+    return f"{family}.24xlarge"
+
+
+def _cpu_size_name(function) -> str:
+    want = int(getattr(function, "min_cpu", None) or 2)
+    for size, name in ((2, "large"), (4, "xlarge"), (8, "2xlarge"), (16, "4xlarge")):
+        if size >= want:
+            return name
+    return "8xlarge"
+
+
+def resolve_ami(cfg, function) -> str:
+    """Resolve the current Deep Learning (or plain Ubuntu) AMI via SSM."""
+    wants_gpu = bool(getattr(function, "gpu", None) or getattr(function, "min_gpu_memory", None))
+    param = _DLAMI_SSM_PARAM if wants_gpu else _UBUNTU_SSM_PARAM
+    result = run_cli(
+        [
+            "aws",
+            "ssm",
+            "get-parameter",
+            "--region",
+            cfg.region,
+            "--name",
+            param,
+            "--query",
+            "Parameter.Value",
+            "--output",
+            "text",
+        ],
+        label="aws ssm get-parameter (resolve AMI)",
+        timeout=120,
+        dry_run=cfg.dry_run,
+    )
+    if result is None:  # dry-run
+        return "<ami-resolved-at-run-time>"
+    ami = (result.stdout or "").strip()
+    if not ami.startswith("ami-"):
+        raise CloudCliError(
+            f"Could not resolve an AMI from SSM parameter {param!r} in "
+            f"{cfg.region}; got {ami[:200]!r}. Pass AwsConfig(ami='ami-...') "
+            f"to pin one yourself."
+        )
+    return ami
+
+
+def build_run_instances_command(cfg, function, *, name, instance_type, ami) -> list:
+    """Assemble the `aws ec2 run-instances` argv."""
+    cmd = [
+        "aws",
+        "ec2",
+        "run-instances",
+        "--region",
+        cfg.region,
+        "--image-id",
+        ami,
+        "--instance-type",
+        instance_type,
+        "--key-name",
+        cfg.key_name,
+        "--count",
+        "1",
+        # runplz tags every instance it makes so a leak is greppable in the
+        # console and in Cost Explorer.
+        "--tag-specifications",
+        (f"ResourceType=instance,Tags=[{{Key=Name,Value={name}}},{{Key=runplz,Value=1}}]"),
+        "--output",
+        "json",
+    ]
+    if cfg.subnet_id:
+        cmd += ["--subnet-id", cfg.subnet_id]
+    if cfg.security_group_id:
+        cmd += ["--security-group-ids", cfg.security_group_id]
+    if cfg.iam_instance_profile:
+        cmd += ["--iam-instance-profile", f"Name={cfg.iam_instance_profile}"]
+
+    volume_gb = cfg.volume_gb or getattr(function, "min_disk", None)
+    # Always send an explicit mapping, even at the AMI's default size: it is
+    # what pins DeleteOnTermination, which is what makes on_finish="delete"
+    # actually take the disk with it instead of leaving a billed EBS volume.
+    cmd += [
+        "--block-device-mappings",
+        (
+            "[{"
+            '"DeviceName":"/dev/sda1",'
+            '"Ebs":{'
+            + (f'"VolumeSize":{int(volume_gb)},' if volume_gb else "")
+            + '"DeleteOnTermination":true,"VolumeType":"gp3"'
+            "}}]"
+        ),
+    ]
+    if cfg.spot:
+        cmd += [
+            "--instance-market-options",
+            '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time"}}',
+        ]
+    return cmd
+
+
+def _instance_id_from(created) -> str:
+    if created is None:  # dry-run
+        return "<instance-id-assigned-at-run-time>"
+    try:
+        instance_id = created["Instances"][0]["InstanceId"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise CloudCliError(
+            f"`aws ec2 run-instances` returned no instance id: {str(created)[:500]}"
+        ) from exc
+    print(f"+ aws: launched {instance_id}", flush=True)
+    return instance_id
+
+
+def _wait_running(cfg, instance_id: str) -> None:
+    run_cli(
+        [
+            "aws",
+            "ec2",
+            "wait",
+            "instance-running",
+            "--region",
+            cfg.region,
+            "--instance-ids",
+            instance_id,
+        ],
+        label=f"aws ec2 wait instance-running {instance_id}",
+        timeout=900,
+        dry_run=cfg.dry_run,
+    )
+
+
+def _public_ip(cfg, instance_id: str) -> str:
+    result = run_cli(
+        [
+            "aws",
+            "ec2",
+            "describe-instances",
+            "--region",
+            cfg.region,
+            "--instance-ids",
+            instance_id,
+            "--query",
+            "Reservations[0].Instances[0].PublicIpAddress",
+            "--output",
+            "text",
+        ],
+        label=f"aws ec2 describe-instances {instance_id}",
+        timeout=120,
+        dry_run=cfg.dry_run,
+    )
+    if result is None:  # dry-run
+        return "<public-ip-assigned-at-run-time>"
+    ip = (result.stdout or "").strip()
+    if not ip or ip == "None":
+        raise CloudCliError(
+            f"{instance_id} came up with no public IP. runplz reaches the box "
+            f"over ssh, so it needs one: launch into a subnet that "
+            f"auto-assigns public IPs, or pass a subnet_id that does."
+        )
+    print(f"+ aws: {instance_id} reachable at {ip}", flush=True)
+    return ip
+
+
+def apply_on_finish(cfg, instance_id, *, name: str) -> None:
+    """Terminate / stop / leave the instance per `cfg.on_finish`.
+
+    Always best-effort: teardown runs in a `finally` and must never mask the
+    real error from the run. But a silent failure here is a billing leak, so
+    it shouts loudly instead of passing quietly.
+    """
+    if instance_id is None and not cfg.dry_run:
+        # run-instances never got far enough to return an id. Nothing to
+        # clean up, but say so — silence here reads as "cleaned up".
+        print(
+            f"+ on_finish={cfg.on_finish}: no instance id recorded for {name}; "
+            f"nothing to tear down. If run-instances did launch something, "
+            f"check: aws ec2 describe-instances --region {cfg.region} "
+            f"--filters Name=tag:Name,Values={name}",
+            flush=True,
+        )
+        return
+
+    if cfg.on_finish == "leave":
+        print(f"+ on_finish=leave: {instance_id} left running in {cfg.region}", flush=True)
+        return
+
+    action = "terminate-instances" if cfg.on_finish == "delete" else "stop-instances"
+    try:
+        run_cli(
+            [
+                "aws",
+                "ec2",
+                action,
+                "--region",
+                cfg.region,
+                "--instance-ids",
+                instance_id,
+                "--output",
+                "json",
+            ],
+            label=f"aws ec2 {action} {instance_id}",
+            timeout=600,
+            dry_run=cfg.dry_run,
+        )
+    except CloudCliError as exc:
+        print(
+            f"+ warning: {action} failed for {instance_id}: {exc}\n"
+            f"  The instance may still exist and still be billing. Check: "
+            f"aws ec2 describe-instances --region {cfg.region} "
+            f"--instance-ids {instance_id}",
+            flush=True,
+        )
