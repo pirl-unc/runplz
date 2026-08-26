@@ -105,29 +105,32 @@ def main(argv=None):
 
     app = _load_app(script_path)
 
-    # repo_root = git root or script's parent
-    app._repo_root = _repo_root_for(script_path)
-    app._backend = args.backend
-    app._backend_kwargs = {"outputs_dir": args.outputs_dir}
-
-    if args.backend == "brev":
-        # args.instance can legitimately be None now — triggers ephemeral mode.
-        app._backend_kwargs["instance"] = args.instance
-    elif args.instance:
-        p.error(f"--instance only applies to the brev backend (got {args.backend!r}).")
-    if args.backend == "ssh":
-        if not args.host:
-            p.error("--host is required for the ssh backend")
-        app._backend_kwargs["host"] = args.host
-    elif args.host:
-        p.error(f"--host only applies to the ssh backend (got {args.backend!r}).")
-    if args.no_build:
-        if args.backend != "local":
-            p.error(f"--no-build only applies to the local backend (got {args.backend!r}).")
-        app._backend_kwargs["build"] = False
-
+    # Before binding: bind() would reject a function-less script with a
+    # generic message, and this one names the script and says what to add.
     if app._entrypoint is None:
         _install_default_entrypoint_or_error(app, script_path, p.error)
+
+    # The CLI binds through App.bind() rather than reimplementing it. It used
+    # to set app._backend by hand with its own copy of the validation, and
+    # that copy drifted: it never learned that gcp/aws require a config, so
+    # `runplz gcp job.py` with no GcpConfig died on an AttributeError deep in
+    # the driver instead of saying what was missing.
+    try:
+        app.bind(
+            args.backend,
+            instance=args.instance,
+            host=args.host,
+            outputs_dir=args.outputs_dir,
+            build=not args.no_build,
+        )
+    except (ValueError, RuntimeError) as exc:
+        p.error(str(exc))
+
+    # bind() infers the repo root from a function's defining module, which is
+    # the best it can do from Python. The CLI knows the actual script, and
+    # that is authoritative when functions are imported from elsewhere.
+    app._repo_root = _repo_root_for(script_path)
+
     entrypoint_kwargs = _parse_entrypoint_args(app._entrypoint, entrypoint_argv, p.error)
 
     # Resolve the log path relative to the same outputs-dir we'll hand to

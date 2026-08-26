@@ -269,7 +269,7 @@ def test_ssh_run_end_to_end_passes_port_through_to_helpers(tmp_path):
 def test_app_bind_ssh_requires_host(tmp_path):
     app = _app(tmp_path)
     _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
-    with pytest.raises(ValueError, match="host=... is required"):
+    with pytest.raises(ValueError, match="needs a host"):
         app.bind("ssh")
 
 

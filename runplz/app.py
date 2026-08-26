@@ -237,18 +237,23 @@ class App:
             )
         if instance is not None and not spec.accepts_instance:
             raise ValueError(
-                f"instance={instance!r} only applies to backend='brev'; got backend={backend!r}."
+                f"--instance / instance=... only applies to the brev backend "
+                f"(got backend={backend!r})."
             )
         if spec.accepts_host and not host:
-            raise ValueError("host=... is required when backend='ssh'")
+            raise ValueError(
+                "the ssh backend needs a host: pass --host <target> on the "
+                "command line, or host=... to App.bind()."
+            )
         if host is not None and not spec.accepts_host:
             raise ValueError(
-                f"host={host!r} only applies to backend='ssh'; got backend={backend!r}."
+                f"--host / host=... only applies to the ssh backend (got backend={backend!r})."
             )
         if not build and not spec.accepts_no_build:
             raise ValueError(
-                f"build=False only applies to backend='local' (it skips `docker "
-                f"build`). On backend={backend!r} it would be silently ignored."
+                f"--no-build / build=False only applies to the local backend "
+                f"(it skips `docker build`). On backend={backend!r} it would be "
+                f"silently ignored."
             )
         if not outputs_dir or not str(outputs_dir).strip():
             raise ValueError("outputs_dir must be a non-empty path string.")
@@ -261,11 +266,13 @@ class App:
         self._repo_root = _repo_root_for(Path(any_fn.module_file))
         self._backend = backend
         self._backend_kwargs = {"outputs_dir": outputs_dir}
-        if backend == "brev":
+        # Which selector each backend takes comes from the registry too, so
+        # this stays right when a backend is added.
+        if spec.accepts_instance:
             self._backend_kwargs["instance"] = instance
-        if backend == "ssh":
+        if spec.accepts_host:
             self._backend_kwargs["host"] = host
-        if backend == "local" and not build:
+        if spec.accepts_no_build and not build:
             self._backend_kwargs["build"] = False
         return self
 
@@ -275,7 +282,7 @@ class App:
                 f"{function.name}.remote(...) was called but no backend is "
                 "selected. runplz Functions dispatch via the `runplz` CLI, "
                 "which binds a backend before invoking @local_entrypoint. "
-                f"Run: `runplz <local|brev|modal> {function.module_file}`. "
+                f"Run: `runplz <{'|'.join(registry.names())}> {function.module_file}`. "
                 f"(For in-process execution without a backend, use "
                 f"{function.name}.local(...) instead.)"
             )

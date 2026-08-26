@@ -610,7 +610,7 @@ def test_bind_rejects_instance_on_non_brev_backend():
     def train():
         pass
 
-    with pytest.raises(ValueError, match="only applies to backend='brev'"):
+    with pytest.raises(ValueError, match="only applies to the brev backend"):
         app.bind("local", instance="stray-box")
 
 
@@ -621,7 +621,7 @@ def test_bind_rejects_no_build_on_non_local_backend():
     def train():
         pass
 
-    with pytest.raises(ValueError, match="build=False only applies to backend='local'"):
+    with pytest.raises(ValueError, match="only applies to the local backend"):
         app.bind("brev", instance="b", build=False)
 
 

@@ -183,7 +183,9 @@ def test_cli_ssh_requires_host(tmp_path, capsys):
     )
     with pytest.raises(SystemExit):
         _cli.main(["ssh", str(script)])
-    assert "--host is required" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    # Names the CLI flag, not just the Python kwarg.
+    assert "--host" in err and "needs a host" in err
 
 
 def test_cli_ssh_threads_host_into_backend_kwargs(tmp_path):
@@ -229,7 +231,8 @@ def test_cli_host_rejected_on_non_ssh_backend(tmp_path, capsys):
     )
     with pytest.raises(SystemExit):
         _cli.main(["local", "--host", "x", str(script)])
-    assert "--host only applies" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "--host" in err and "only applies to the ssh backend" in err
 
 
 def test_cli_modal_dispatches_to_modal_backend(tmp_path):
@@ -470,3 +473,83 @@ def test_repo_root_falls_back_to_script_parent_when_no_git(tmp_path):
     script = tmp_path / "job.py"
     script.write_text("x = 1\n")
     assert _cli._repo_root_for(script.resolve()) == tmp_path.resolve()
+
+
+# ---------------------------------------------------------------------------
+# the CLI and App.bind() enforce one set of rules
+
+
+_PLAIN_JOB = """
+    from runplz import App, Image
+
+    app = App("t")
+
+    @app.function(image=Image.from_registry("ubuntu:22.04"))
+    def train():
+        pass
+"""
+
+
+@pytest.mark.parametrize(
+    "backend,config_attr",
+    [("gcp", "gcp_config"), ("aws", "aws_config")],
+)
+def test_cli_says_what_is_missing_when_a_cloud_config_is_absent(
+    tmp_path, capsys, backend, config_attr
+):
+    """Regression: the CLI had its own validation chain that never learned
+    gcp/aws need a config, so this died on an AttributeError deep in the
+    driver ('NoneType' object has no attribute 'machine_type')."""
+    script = _write_job(tmp_path, _PLAIN_JOB)
+    with pytest.raises(SystemExit):
+        _cli.main([backend, str(script), "--no-log-file"])
+    err = capsys.readouterr().err
+    assert config_attr in err
+    assert "AttributeError" not in err
+    assert "NoneType" not in err
+
+
+def test_cli_binds_through_app_bind(tmp_path):
+    """One validator, not two. The CLI must not hand-roll _backend again."""
+    script = _write_job(tmp_path, _PLAIN_JOB)
+    with mock.patch.object(_cli, "_repo_root_for", side_effect=_cli._repo_root_for):
+        with mock.patch("runplz.app.App.bind", autospec=True) as bind_mock:
+            with pytest.raises((SystemExit, AttributeError, TypeError, RuntimeError)):
+                _cli.main(["local", str(script), "--no-log-file"])
+    assert bind_mock.called, "the CLI should delegate backend selection to bind()"
+    kwargs = bind_mock.call_args.kwargs
+    assert kwargs["outputs_dir"] == "out"
+    assert kwargs["build"] is True
+
+
+def test_cli_and_bind_reject_the_same_things(tmp_path, capsys):
+    """Every selector rule is enforced identically from both entry points."""
+    from runplz.app import App
+
+    script = _write_job(tmp_path, _PLAIN_JOB)
+    cases = [
+        (["local", str(script), "--host", "x"], "only applies to the ssh backend"),
+        (["gcp", str(script), "--instance", "x"], "gcp_config"),
+        (["brev", str(script), "--no-build"], "only applies to the local backend"),
+        (["ssh", str(script)], "needs a host"),
+    ]
+    for argv, expected in cases:
+        with pytest.raises(SystemExit):
+            _cli.main([*argv, "--no-log-file"])
+        assert expected in capsys.readouterr().err, argv
+
+    # And the Python surface raises rather than exiting, with the same rules.
+    app = App("t")
+    with pytest.raises(ValueError, match="needs App"):
+        app.bind("gcp")
+
+
+def test_cli_function_less_script_error_beats_the_generic_bind_error(tmp_path, capsys):
+    """bind() would say 'needs at least one @app.function'; the CLI can name
+    the actual script, which is more useful."""
+    script = _write_job(tmp_path, "from runplz import App\napp = App('t')\n")
+    with pytest.raises(SystemExit):
+        _cli.main(["local", str(script), "--no-log-file"])
+    err = capsys.readouterr().err
+    assert "declares no @app.function" in err
+    assert str(script) in err

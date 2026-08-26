@@ -84,9 +84,9 @@ def test_cloud_backends_need_their_config(tmp_path):
 def test_cloud_backends_reject_instance_and_host(tmp_path):
     app = _app(tmp_path, gcp_config=_gcp())
     _function(app)
-    with pytest.raises(ValueError, match="only applies to backend"):
+    with pytest.raises(ValueError, match="only applies to the brev backend"):
         app.bind("gcp", instance="some-box")
-    with pytest.raises(ValueError, match="only applies to backend"):
+    with pytest.raises(ValueError, match="only applies to the ssh backend"):
         app.bind("gcp", host="some-host")
 
 
