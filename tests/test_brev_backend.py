@@ -2770,7 +2770,8 @@ def test_apply_on_finish_warns_on_nonzero_exit(capsys):
 
     out = capsys.readouterr().out
     assert "exited 1" in out
-    assert "check `brev ls`" in out
+    assert "still be billing" in out
+    assert "Check: brev ls" in out
     assert "brev api 503" in out
 
 
@@ -2808,7 +2809,8 @@ def test_apply_on_finish_warns_on_subprocess_exception(capsys):
 
     out = capsys.readouterr().out
     assert "RuntimeError" in out
-    assert "check `brev ls`" in out
+    assert "still be billing" in out
+    assert "Check: brev ls" in out
 
 
 def test_verify_post_action_state_warns_when_delete_still_present(capsys):

@@ -108,21 +108,7 @@ class BrevConfig:
             )
         if self.instance_type is not None and not self.instance_type.strip():
             raise ValueError("BrevConfig.instance_type must be a non-empty string (or None).")
-        if self.on_finish not in _VALID_BREV_ON_FINISH:
-            raise ValueError(
-                f"BrevConfig.on_finish must be one of {_VALID_BREV_ON_FINISH}; "
-                f"got {self.on_finish!r}."
-            )
-        if self.max_runtime_seconds is not None and self.max_runtime_seconds <= 0:
-            raise ValueError(
-                f"BrevConfig.max_runtime_seconds must be a positive int (or None); "
-                f"got {self.max_runtime_seconds!r}."
-            )
-        if not isinstance(self.ssh_ready_wait_seconds, int) or self.ssh_ready_wait_seconds <= 0:
-            raise ValueError(
-                f"BrevConfig.ssh_ready_wait_seconds must be a positive int; "
-                f"got {self.ssh_ready_wait_seconds!r}."
-            )
+        _validate_remote_common("BrevConfig", self, valid_on_finish=_VALID_BREV_ON_FINISH)
         if (
             not isinstance(self.instance_type_fallback_count, int)
             or self.instance_type_fallback_count < 1
@@ -186,22 +172,12 @@ class SshConfig:
             )
         if self.user is not None and not self.user.strip():
             raise ValueError("SshConfig.user must be a non-empty string (or None).")
-        if self.on_finish not in _VALID_SSH_ON_FINISH:
-            raise ValueError(
-                f"SshConfig.on_finish must be one of {_VALID_SSH_ON_FINISH}; "
-                f"got {self.on_finish!r}. (runplz never stops/deletes a "
-                f"user-owned SSH box.)"
-            )
-        if self.max_runtime_seconds is not None and self.max_runtime_seconds <= 0:
-            raise ValueError(
-                f"SshConfig.max_runtime_seconds must be a positive int (or None); "
-                f"got {self.max_runtime_seconds!r}."
-            )
-        if not isinstance(self.ssh_ready_wait_seconds, int) or self.ssh_ready_wait_seconds <= 0:
-            raise ValueError(
-                f"SshConfig.ssh_ready_wait_seconds must be a positive int; "
-                f"got {self.ssh_ready_wait_seconds!r}."
-            )
+        _validate_remote_common(
+            "SshConfig",
+            self,
+            valid_on_finish=_VALID_SSH_ON_FINISH,
+            on_finish_note=" (runplz never stops/deletes a user-owned SSH box.)",
+        )
 
 
 @dataclass(frozen=True)
@@ -278,7 +254,7 @@ class GcpConfig:
     dry_run: bool = False
 
     def __post_init__(self):
-        _validate_cloud_common("GcpConfig", self)
+        _validate_remote_common("GcpConfig", self, valid_on_finish=_VALID_CLOUD_ON_FINISH)
         if not (self.project or "").strip():
             raise ValueError(
                 "GcpConfig.project is required, e.g. GcpConfig(project='my-proj', "
@@ -348,7 +324,7 @@ class AwsConfig:
     dry_run: bool = False
 
     def __post_init__(self):
-        _validate_cloud_common("AwsConfig", self)
+        _validate_remote_common("AwsConfig", self, valid_on_finish=_VALID_CLOUD_ON_FINISH)
         if not (self.region or "").strip():
             raise ValueError(
                 "AwsConfig.region is required, e.g. AwsConfig(region='us-east-1', "
@@ -357,11 +333,21 @@ class AwsConfig:
             )
 
 
-def _validate_cloud_common(cls_name: str, cfg) -> None:
-    """Shared field validation for the provisioning cloud configs."""
-    if cfg.on_finish not in _VALID_CLOUD_ON_FINISH:
+def _validate_remote_common(
+    cls_name: str, cfg, *, valid_on_finish, on_finish_note: str = ""
+) -> None:
+    """Field validation every remote backend config shares.
+
+    All four remote configs carry `on_finish`, `max_runtime_seconds` and
+    `ssh_ready_wait_seconds` with identical rules; only the set of valid
+    `on_finish` values differs (SSH allows "leave" alone, since runplz never
+    owns a user's box). One implementation means the message a user sees has
+    the same shape whichever backend they mistyped.
+    """
+    if cfg.on_finish not in valid_on_finish:
         raise ValueError(
-            f"{cls_name}.on_finish must be one of {_VALID_CLOUD_ON_FINISH}; got {cfg.on_finish!r}."
+            f"{cls_name}.on_finish must be one of {valid_on_finish}; "
+            f"got {cfg.on_finish!r}.{on_finish_note}"
         )
     if cfg.max_runtime_seconds is not None and cfg.max_runtime_seconds <= 0:
         raise ValueError(

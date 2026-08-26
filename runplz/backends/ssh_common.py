@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from runplz._excludes import DEFAULT_TRANSFER_EXCLUDES
+from runplz.backends import _docker
 
 __all__ = [
     "DetachedProcessState",
@@ -1217,10 +1218,7 @@ def _run_container_detached(
     port=None,
 ):
     env_flags = " ".join(f"-e {shlex.quote(f'{k}={v}')}" for k, v in function.env.items())
-    label_flags = "--label runplz=1 "
-    if app_name is not None:
-        label_flags += f"--label {shlex.quote(f'runplz-app={app_name}')} "
-    label_flags += f"--label {shlex.quote(f'runplz-function={function.name}')}"
+    label_flags = _docker.label_flags(app_name, function.name)
     runner_env = (
         f"-e RUNPLZ_OUT=/out "
         f"-e RUNPLZ_SCRIPT={shlex.quote('/workspace/' + rel_script)} "

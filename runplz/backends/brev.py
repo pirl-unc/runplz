@@ -15,11 +15,16 @@ import json
 import re
 import subprocess
 import time
-import uuid
 from pathlib import Path
 from typing import Optional
 
 from runplz._selector import Candidate
+from runplz.backends._cloud import (
+    CloudCliError,
+    apply_teardown,
+    make_instance_name,
+    split_instance_name,
+)
 from runplz.backends.ssh_common import (
     _CLEANUP_SIGNALS as ssh_common_CLEANUP_SIGNALS,
 )
@@ -76,20 +81,11 @@ __all__ = ["run"]
 # Brev instance names must be slug-ish. Lowercase, ASCII, hyphen-separated.
 # Some providers cap names around 30-40 chars; keep the generated part short
 # enough that typical app/function names fit comfortably.
-_BREV_NAME_SAFE_RE = re.compile(r"[^a-z0-9-]+")
-
-
-def _make_ephemeral_name(app_name: str, fn_name: str) -> str:
-    """Generate a Brev-safe instance name for an ephemeral run.
-
-    Shape: ``runplz-<app>-<fn>-<uuid8>``. Trailing uuid makes the name
-    unique per dispatch so two concurrent runs don't collide.
-    """
-
-    def _slug(s: str) -> str:
-        return _BREV_NAME_SAFE_RE.sub("-", s.lower()).strip("-") or "x"
-
-    return f"runplz-{_slug(app_name)}-{_slug(fn_name)}-{uuid.uuid4().hex[:8]}"
+# Instance naming is the shared provisioning contract — see
+# runplz.backends._cloud. Kept as module-level aliases because both have
+# been part of brev's surface since 3.9 and the tests reach them here.
+_make_ephemeral_name = make_instance_name
+_split_ephemeral_name = split_instance_name
 
 
 # Brev's CLI hangs on an interactive walkthrough once an instance exists in the
@@ -286,31 +282,6 @@ def _jobs_from_brev_rows(rows: list[dict]) -> list[dict]:
             }
         )
     return jobs
-
-
-def _split_ephemeral_name(name: str) -> tuple[str, str]:
-    """Best-effort reverse of :func:`_make_ephemeral_name`: ``runplz-<app>-<fn>-<uuid8>``.
-
-    The user's app / function names can themselves contain hyphens (they're
-    slugified but hyphens survive), so we can't perfectly unambiguously split.
-    We trim the ``runplz-`` prefix and the trailing uuid, then take the final
-    remaining segment as the function name and everything before it as the app
-    name — the common convention for ephemeral runs. Returns empty strings if
-    the shape doesn't match.
-    """
-    if not name.startswith("runplz-"):
-        return ("", "")
-    core = name[len("runplz-") :]
-    parts = core.split("-")
-    if len(parts) < 3:
-        return ("", "")
-    # Drop the uuid8 suffix.
-    parts = parts[:-1]
-    if len(parts) < 2:
-        return ("", "")
-    fn = parts[-1]
-    app = "-".join(parts[:-1])
-    return (app, fn)
 
 
 def _instance_exists(name: str) -> bool:
@@ -902,39 +873,34 @@ def _refresh_ssh():
 def _apply_on_finish(*, instance: str, cfg) -> None:
     """Stop / delete / leave the Brev box per `cfg.on_finish`.
 
-    Always best-effort: we never want box-cleanup to swallow a real error
-    from the try block. Transient Brev API errors get retries (via
-    _brev_capture) so a single flaky call doesn't leak a billed box;
-    any final failure prints a loud warning and moves on.
+    Runs under the shared teardown contract (see
+    :func:`runplz.backends._cloud.apply_teardown`): never raises, never fails
+    quietly. Brev adds two things the other providers don't have — retries on
+    transient API errors via :func:`_brev_capture`, so a single flaky call
+    doesn't leak a billed box, and a post-action state check that confirms the
+    box really reached the state we asked for.
     """
-    if cfg.on_finish == "leave":
-        return
-    action = cfg.on_finish  # "stop" or "delete"
-    print(f"+ on_finish={action}: running `brev {action} {instance}`", flush=True)
-    try:
+
+    def _act(action: str) -> None:
+        print(f"+ on_finish={action}: running `brev {action} {instance}`", flush=True)
         r = _brev_capture(
             ["brev", action, instance],
             timeout=120,
             label=f"brev {action} {instance}",
         )
-    except Exception as exc:  # noqa: BLE001
-        print(
-            f"+ warning: `brev {action} {instance}` raised {type(exc).__name__}: {exc}. "
-            f"The box may still be running — check `brev ls`.",
-            flush=True,
-        )
-        return
-    if r.returncode != 0:
-        # Don't raise — we're in a finally block and must not mask the real
-        # error. But DO shout: a silent non-zero here is a billing leak.
-        print(
-            f"+ warning: `brev {action} {instance}` exited {r.returncode}. "
-            f"The box may still be running — check `brev ls`. "
-            f"stderr: {(r.stderr or '').strip()[:500]}",
-            flush=True,
-        )
-        return
-    _verify_post_action_state(action, instance)
+        if r.returncode != 0:
+            raise CloudCliError(
+                f"`brev {action} {instance}` exited {r.returncode}. "
+                f"stderr: {(r.stderr or '').strip()[:500]}"
+            )
+        _verify_post_action_state(action, instance)
+
+    apply_teardown(
+        on_finish=cfg.on_finish,
+        target=instance,
+        run_action=_act,
+        check_hint="brev ls",
+    )
 
 
 # --- Brev instance-type picker -------------------------------------------

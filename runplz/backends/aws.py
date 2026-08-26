@@ -17,6 +17,7 @@ ssh wait until it times out.
 from runplz.backends._cloud import (
     AWS_GPUS,
     CloudCliError,
+    apply_teardown,
     gpu_count,
     make_instance_name,
     resolve_gpu_label,
@@ -296,12 +297,7 @@ def _public_ip(cfg, instance_id: str) -> str:
 
 
 def apply_on_finish(cfg, instance_id, *, name: str) -> None:
-    """Terminate / stop / leave the instance per `cfg.on_finish`.
-
-    Always best-effort: teardown runs in a `finally` and must never mask the
-    real error from the run. But a silent failure here is a billing leak, so
-    it shouts loudly instead of passing quietly.
-    """
+    """Terminate / stop / leave the instance per `cfg.on_finish`."""
     if instance_id is None and not cfg.dry_run:
         # run-instances never got far enough to return an id. Nothing to
         # clean up, but say so — silence here reads as "cleaned up".
@@ -314,12 +310,8 @@ def apply_on_finish(cfg, instance_id, *, name: str) -> None:
         )
         return
 
-    if cfg.on_finish == "leave":
-        print(f"+ on_finish=leave: {instance_id} left running in {cfg.region}", flush=True)
-        return
-
-    action = "terminate-instances" if cfg.on_finish == "delete" else "stop-instances"
-    try:
+    def _act(on_finish: str) -> None:
+        action = "terminate-instances" if on_finish == "delete" else "stop-instances"
         run_cli(
             [
                 "aws",
@@ -336,11 +328,13 @@ def apply_on_finish(cfg, instance_id, *, name: str) -> None:
             timeout=600,
             dry_run=cfg.dry_run,
         )
-    except CloudCliError as exc:
-        print(
-            f"+ warning: {action} failed for {instance_id}: {exc}\n"
-            f"  The instance may still exist and still be billing. Check: "
-            f"aws ec2 describe-instances --region {cfg.region} "
-            f"--instance-ids {instance_id}",
-            flush=True,
-        )
+
+    apply_teardown(
+        on_finish=cfg.on_finish,
+        target=instance_id,
+        run_action=_act,
+        where=f" in {cfg.region}",
+        check_hint=(
+            f"aws ec2 describe-instances --region {cfg.region} --instance-ids {instance_id}"
+        ),
+    )

@@ -14,11 +14,11 @@ This backend shares all the SSH plumbing with the brev backend via the
 public `runplz.backends.ssh_common` module.
 """
 
-import json
 import re
 import subprocess
 from typing import Optional
 
+from runplz.backends import _docker
 from runplz.backends.ssh_common import (
     _parse_probe_sections,
     _ssh_capture,
@@ -64,7 +64,8 @@ def list_jobs(*, host: str, user: Optional[str] = None, port: Optional[int] = No
         "ssh",
         *_ssh_cmd_opts(resolved_port),
         target,
-        "sudo docker ps --filter label=runplz=1 --format '{{json .}}' 2>/dev/null || true",
+        f"sudo docker ps --filter {_docker.PS_FILTER} "
+        f"--format '{_docker.PS_FORMAT}' 2>/dev/null || true",
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
@@ -72,42 +73,7 @@ def list_jobs(*, host: str, user: Optional[str] = None, port: Optional[int] = No
             f"ssh to {target!r} failed (rc={r.returncode}). "
             f"stderr: {(r.stderr or '').strip()[:300]}"
         )
-    return _parse_remote_docker_ps(r.stdout, target=target)
-
-
-def _parse_remote_docker_ps(stdout: str, *, target: str) -> list[dict]:
-    rows = []
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            raw = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        labels = _parse_docker_labels(raw.get("Labels", ""))
-        rows.append(
-            {
-                "backend": "ssh",
-                "name": f"{target}:{raw.get('Names', '') or raw.get('ID', '')}",
-                "app": labels.get("runplz-app", ""),
-                "function": labels.get("runplz-function", ""),
-                "started": raw.get("CreatedAt", "") or raw.get("RunningFor", ""),
-                "status": raw.get("Status", ""),
-            }
-        )
-    return rows
-
-
-def _parse_docker_labels(labels: str) -> dict:
-    out = {}
-    if not labels:
-        return out
-    for part in labels.split(","):
-        if "=" in part:
-            k, v = part.split("=", 1)
-            out[k.strip()] = v.strip()
-    return out
+    return _docker.parse_ps_rows(r.stdout, backend="ssh", name_prefix=f"{target}:")
 
 
 def _build_ssh_target(

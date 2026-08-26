@@ -359,3 +359,60 @@ def test_ps_cli_back_compat_ssh_flag_still_works():
                 with mock.patch.object(ssh_backend, "list_jobs", return_value=[]) as ssh_mock:
                     _cli.main(["ps", "--ssh", "my.gpu.box"])
     ssh_mock.assert_called_once_with(host="my.gpu.box")
+
+
+# ---------------------------------------------------------------------------
+# label producers and consumers share one vocabulary
+
+
+def test_local_and_remote_label_flags_agree():
+    """`runplz ps` finds containers by these labels; a drift breaks it."""
+    from runplz.backends import _docker
+
+    argv = _docker.label_args("myapp", "train")
+    flags = _docker.label_flags("myapp", "train")
+    assert argv == [
+        "--label",
+        "runplz=1",
+        "--label",
+        "runplz-app=myapp",
+        "--label",
+        "runplz-function=train",
+    ]
+    for token in ("runplz=1", "runplz-app=myapp", "runplz-function=train"):
+        assert token in flags
+
+
+def test_ps_filter_matches_the_label_that_gets_stamped():
+    from runplz.backends import _docker
+
+    assert _docker.PS_FILTER == f"label={_docker.RUNPLZ_LABEL}"
+    assert _docker.RUNPLZ_LABEL in " ".join(_docker.label_args("a", "b"))
+
+
+def test_label_args_omit_app_when_unknown():
+    from runplz.backends import _docker
+
+    assert "runplz-app=" not in " ".join(_docker.label_args(None, "train"))
+
+
+def test_ps_row_parsing_is_shared_by_local_and_ssh():
+    from runplz.backends import _docker
+
+    line = (
+        '{"Names":"runplz-app-train","Labels":"runplz=1,runplz-app=myapp,'
+        'runplz-function=train","Status":"Up 2 minutes","CreatedAt":"2026-08-26"}'
+    )
+    local_rows = _docker.parse_ps_rows(line, backend="local")
+    ssh_rows = _docker.parse_ps_rows(line, backend="ssh", name_prefix="gpu.box:")
+    assert local_rows[0]["app"] == ssh_rows[0]["app"] == "myapp"
+    assert local_rows[0]["function"] == ssh_rows[0]["function"] == "train"
+    assert local_rows[0]["name"] == "runplz-app-train"
+    assert ssh_rows[0]["name"] == "gpu.box:runplz-app-train"
+
+
+def test_ps_row_parsing_skips_garbage_rather_than_failing():
+    from runplz.backends import _docker
+
+    rows = _docker.parse_ps_rows("not json\n\n{}\n", backend="local")
+    assert len(rows) == 1  # the empty object still yields a (blank) row

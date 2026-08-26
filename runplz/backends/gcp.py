@@ -18,7 +18,7 @@ from typing import Optional
 
 from runplz.backends._cloud import (
     GCP_GPUS,
-    CloudCliError,
+    apply_teardown,
     gpu_count,
     make_instance_name,
     resolve_gpu_label,
@@ -201,33 +201,25 @@ def _config_ssh(cfg, *, quiet: bool = False) -> None:
 
 
 def apply_on_finish(cfg, name: str) -> None:
-    """Stop / delete / leave the instance per `cfg.on_finish`.
+    """Stop / delete / leave the instance per `cfg.on_finish`."""
 
-    Always best-effort: teardown runs in a `finally` and must never mask the
-    real error from the run. But a silent failure here is a billing leak, so
-    it shouts loudly instead of passing quietly.
-    """
-    if cfg.on_finish == "leave":
-        print(f"+ on_finish=leave: {name} left running in {cfg.zone}", flush=True)
-        return
-
-    verb = "delete" if cfg.on_finish == "delete" else "stop"
-    cmd = [
-        "gcloud",
-        "compute",
-        "instances",
-        verb,
-        name,
-        f"--project={cfg.project}",
-        f"--zone={cfg.zone}",
-        "--quiet",
-    ]
-    if verb == "delete":
-        # Belt and braces on the issue's "must not leave disks behind"
-        # acceptance criterion: the boot disk is auto-delete by default,
-        # but say so explicitly rather than trusting the default.
-        cmd.append("--delete-disks=all")
-    try:
+    def _act(on_finish: str) -> None:
+        verb = "delete" if on_finish == "delete" else "stop"
+        cmd = [
+            "gcloud",
+            "compute",
+            "instances",
+            verb,
+            name,
+            f"--project={cfg.project}",
+            f"--zone={cfg.zone}",
+            "--quiet",
+        ]
+        if verb == "delete":
+            # Belt and braces on the "must not leave disks behind" criterion:
+            # the boot disk is auto-delete by default, but say so rather than
+            # trusting the default.
+            cmd.append("--delete-disks=all")
         run_cli(
             cmd,
             label=f"gcloud compute instances {verb} {name}",
@@ -236,11 +228,13 @@ def apply_on_finish(cfg, name: str) -> None:
             # thing dry-run exists to prevent.
             dry_run=cfg.dry_run,
         )
-    except CloudCliError as exc:
-        print(
-            f"+ warning: {verb} failed for {name}: {exc}\n"
-            f"  The instance may still exist and still be billing. Check: "
-            f"gcloud compute instances list --project={cfg.project} "
-            f"--filter='name={name}'",
-            flush=True,
-        )
+
+    apply_teardown(
+        on_finish=cfg.on_finish,
+        target=name,
+        run_action=_act,
+        where=f" in {cfg.zone}",
+        check_hint=(
+            f"gcloud compute instances list --project={cfg.project} --filter='name={name}'"
+        ),
+    )

@@ -447,3 +447,67 @@ def test_run_cli_rejects_non_json_when_json_expected():
         run_mock.return_value = mock.Mock(returncode=0, stdout="not json", stderr="")
         with pytest.raises(_cloud.CloudCliError, match="not JSON"):
             _cloud.run_cli(["aws", "x"], label="x", parse_json=True)
+
+
+# ---------------------------------------------------------------------------
+# shared teardown contract
+
+
+def test_teardown_leave_announces_and_does_nothing(capsys):
+    calls = []
+    _cloud.apply_teardown(
+        on_finish="leave",
+        target="box-1",
+        run_action=calls.append,
+        check_hint="check me",
+        where=" in us-east-1",
+    )
+    assert calls == []
+    assert "left running in us-east-1" in capsys.readouterr().out
+
+
+def test_teardown_never_raises_but_always_shouts(capsys):
+    """It runs in a finally: raising masks the real error, silence leaks a box."""
+
+    def boom(_on_finish):
+        raise RuntimeError("provider said no")
+
+    _cloud.apply_teardown(
+        on_finish="delete",
+        target="box-1",
+        run_action=boom,
+        check_hint="gcloud compute instances list",
+    )
+    out = capsys.readouterr().out
+    assert "warning" in out
+    assert "provider said no" in out
+    assert "still be billing" in out
+    assert "gcloud compute instances list" in out
+
+
+def test_teardown_passes_the_on_finish_value_through():
+    seen = []
+    _cloud.apply_teardown(on_finish="stop", target="b", run_action=seen.append, check_hint="x")
+    assert seen == ["stop"]
+
+
+# ---------------------------------------------------------------------------
+# naming is a round-trip contract shared by every provisioning backend
+
+
+def test_instance_name_round_trips_through_split():
+    name = _cloud.make_instance_name("vision-train", "train")
+    assert _cloud.split_instance_name(name) == ("vision-train", "train")
+
+
+def test_split_rejects_names_that_are_not_ours():
+    for name in ("my-own-box", "runplz", "runplz-x", ""):
+        assert _cloud.split_instance_name(name) == ("", "")
+
+
+def test_brev_and_cloud_backends_share_one_naming_contract():
+    """A drift here would make `runplz ps` stop recognising its own boxes."""
+    from runplz.backends import brev
+
+    assert brev._make_ephemeral_name is _cloud.make_instance_name
+    assert brev._split_ephemeral_name is _cloud.split_instance_name

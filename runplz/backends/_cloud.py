@@ -1,11 +1,11 @@
-"""Pieces shared by the direct-cloud provisioning backends (issue #25).
+"""Pieces shared by the backends that provision a machine.
 
-GCP and AWS differ in almost everything about *how* you ask for a box, and
-almost nothing about *what* runplz needs from one: a name, a shape that
-matches the function's resource request, and a way to make it go away
-again. This module holds that common middle — naming, GPU-shape lookup,
-CLI invocation with useful errors, and dry-run rendering — so each driver
-is left with only its own cloud's vocabulary.
+Brev, GCP and AWS differ in almost everything about *how* you ask for a box,
+and almost nothing about *what* runplz needs from one: a name, a shape that
+matches the function's resource request, and a way to make it go away again.
+This module holds that common middle — naming, GPU-shape lookup, CLI
+invocation with useful errors, and dry-run rendering — so each driver is
+left with only its own provider's vocabulary.
 
 Both drivers shell out to the vendor CLI rather than a Python SDK. The core
 stays dependency-free, and `tests/conftest.py` already guards `gcloud` and
@@ -29,20 +29,52 @@ class CloudCliError(RuntimeError):
     """A vendor CLI call failed. Carries the stderr that explains why."""
 
 
+INSTANCE_PREFIX = "runplz-"
+_SLUG_LIMIT = 18
+
+
 def make_instance_name(app_name: str, fn_name: str) -> str:
     """Build a unique, DNS-safe instance name tagged as runplz's.
 
-    The `runplz-` prefix and the random suffix both matter: the prefix makes
-    a leaked box obvious in a console full of unrelated instances, and the
-    suffix means two concurrent runs of the same function never collide on a
-    name (which on both clouds is an error, not a queue).
+    Shape: ``runplz-<app>-<fn>-<uuid8>``. The prefix and the random suffix
+    both matter — the prefix makes a leaked box obvious in a console full of
+    unrelated instances, and the suffix means two concurrent runs of the same
+    function never collide on a name (which every provider treats as an
+    error, not a queue).
+
+    Paired with :func:`split_instance_name`, which every provider's job
+    listing uses to read an app/function back out of a name. The two must
+    agree, so they live together.
     """
 
     def slug(value: str, limit: int) -> str:
         out = _NAME_SAFE_RE.sub("-", (value or "").lower()).strip("-")
         return (out[:limit].strip("-")) or "x"
 
-    return f"runplz-{slug(app_name, 18)}-{slug(fn_name, 18)}-{uuid.uuid4().hex[:8]}"
+    return (
+        f"{INSTANCE_PREFIX}{slug(app_name, _SLUG_LIMIT)}-"
+        f"{slug(fn_name, _SLUG_LIMIT)}-{uuid.uuid4().hex[:8]}"
+    )
+
+
+def split_instance_name(name: str) -> tuple:
+    """Best-effort reverse of :func:`make_instance_name`.
+
+    App and function names keep their hyphens through slugification, so the
+    split can't be unambiguous. Trim the prefix and the trailing uuid, then
+    treat the last remaining segment as the function and everything before it
+    as the app — the common shape for a provisioned run. Returns empty
+    strings when the name isn't one of ours.
+    """
+    if not name.startswith(INSTANCE_PREFIX):
+        return ("", "")
+    parts = name[len(INSTANCE_PREFIX) :].split("-")
+    if len(parts) < 3:
+        return ("", "")
+    parts = parts[:-1]  # drop the uuid8 suffix
+    if len(parts) < 2:
+        return ("", "")
+    return ("-".join(parts[:-1]), parts[-1])
 
 
 def render_command(cmd: list) -> str:
@@ -169,3 +201,41 @@ def resolve_gpu_label(function, table: dict) -> Optional[str]:
 
 def gpu_count(function) -> int:
     return max(1, int(getattr(function, "min_gpus", None) or 1))
+
+
+def apply_teardown(
+    *,
+    on_finish: str,
+    target: str,
+    run_action,
+    check_hint: str,
+    where: str = "",
+) -> None:
+    """Run a provisioning backend's teardown under one safety contract.
+
+    Every provider spells the action differently (`brev delete`, `gcloud
+    compute instances delete`, `aws ec2 terminate-instances`), but the rules
+    around it are identical and are what actually protect the user's bill:
+
+    - ``on_finish="leave"`` announces and does nothing.
+    - Teardown never raises. It runs inside a ``finally``, so raising here
+      would mask whatever really went wrong with the run.
+    - But it never fails *quietly* either. A teardown that silently didn't
+      happen is a box that bills until someone notices, so a failure prints
+      loudly and tells the user exactly how to check.
+
+    ``run_action`` receives the on_finish value and does the provider-specific
+    work; raising from it is how it reports failure.
+    """
+    if on_finish == "leave":
+        print(f"+ on_finish=leave: {target} left running{where}", flush=True)
+        return
+    try:
+        run_action(on_finish)
+    except Exception as exc:  # noqa: BLE001 - teardown must never propagate
+        print(
+            f"+ warning: on_finish={on_finish} failed for {target}: "
+            f"{type(exc).__name__}: {exc}\n"
+            f"  It may still exist and still be billing. Check: {check_hint}",
+            flush=True,
+        )
