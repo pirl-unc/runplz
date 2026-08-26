@@ -13,6 +13,8 @@ import json
 import subprocess
 from pathlib import Path
 
+from runplz.backends import docker
+
 IMAGE_TAG_DEFAULT = "runplz-local"
 
 
@@ -50,12 +52,7 @@ def run(
         "--rm",
         "--name",
         f"runplz-{app.name}-{function.name}",
-        "--label",
-        "runplz=1",
-        "--label",
-        f"runplz-app={app.name}",
-        "--label",
-        f"runplz-function={function.name}",
+        *docker.label_args(app.name, function.name),
         "-v",
         f"{host_out}:/out",
         "-w",
@@ -136,14 +133,7 @@ def list_jobs() -> list[dict]:
     """
     try:
         r = subprocess.run(
-            [
-                "docker",
-                "ps",
-                "--filter",
-                "label=runplz=1",
-                "--format",
-                "{{json .}}",
-            ],
+            ["docker", *docker.ps_args()],
             capture_output=True,
             text=True,
         )
@@ -152,63 +142,12 @@ def list_jobs() -> list[dict]:
         # are no local runplz containers because there's no docker at all.
         return []
     if r.returncode != 0:
-        if _looks_like_docker_daemon_down((r.stderr or "") + (r.stdout or "")):
+        if docker.looks_like_daemon_down((r.stderr or "") + (r.stdout or "")):
             return []
         raise RuntimeError(
             f"`docker ps` failed (rc={r.returncode}). stderr: {(r.stderr or '').strip()[:300]}"
         )
-    return _parse_docker_ps_rows(r.stdout)
-
-
-def _looks_like_docker_daemon_down(err: str) -> bool:
-    """Match the canonical 'docker daemon not running' stderr signatures."""
-    low = (err or "").lower()
-    return any(
-        sig in low
-        for sig in (
-            "cannot connect to the docker daemon",
-            "is the docker daemon running",
-            "error during connect",
-            "docker desktop is not running",
-        )
-    )
-
-
-def _parse_docker_ps_rows(stdout: str) -> list[dict]:
-    rows = []
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            raw = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        labels = _parse_docker_labels(raw.get("Labels", ""))
-        rows.append(
-            {
-                "backend": "local",
-                "name": raw.get("Names", "") or raw.get("ID", ""),
-                "app": labels.get("runplz-app", ""),
-                "function": labels.get("runplz-function", ""),
-                "started": raw.get("CreatedAt", "") or raw.get("RunningFor", ""),
-                "status": raw.get("Status", ""),
-            }
-        )
-    return rows
-
-
-def _parse_docker_labels(labels: str) -> dict:
-    """Parse the comma-separated `key=value,key=value` label string from
-    `docker ps --format '{{json .}}'` into a dict. Ignores malformed entries."""
-    out = {}
-    if not labels:
-        return out
-    for part in labels.split(","):
-        if "=" in part:
-            k, v = part.split("=", 1)
-            out[k.strip()] = v.strip()
-    return out
+    return docker.parse_ps_rows(r.stdout, backend="local")
 
 
 def _print_reused_image(tag: str) -> None:

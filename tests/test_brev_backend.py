@@ -3,6 +3,7 @@ subprocess/ssh/rsync mocked out, plus a full happy-path `run()` for
 each of the three modes (docker vm, native vm, container).
 """
 
+import contextlib
 import json
 import subprocess
 import types
@@ -69,7 +70,7 @@ def _job_inside(tmp_path, name="jobs/train.py"):
 # -- _brev_gpu_name covered in test_runplz.py; skipping ------------------
 
 
-# -- _render_ops_script already smoke-tested; add edges ------------------
+# -- render_image_ops_script already smoke-tested; add edges ------------------
 
 
 def test_render_ops_script_run_commands_and_index_url(tmp_path):
@@ -78,14 +79,14 @@ def test_render_ops_script_run_commands_and_index_url(tmp_path):
         .pip_install("torch", index_url="https://download.pytorch.org/whl/cu121")
         .run_commands("echo hi")
     )
-    s = brev._render_ops_script(img)
+    s = brev.render_image_ops_script(img)
     assert "--index-url https://download.pytorch.org/whl/cu121" in s
     assert "echo hi" in s
 
 
 def test_render_ops_script_non_editable_local_dir(tmp_path):
     img = Image.from_registry("ubuntu:22.04").pip_install_local_dir(".", editable=False)
-    s = brev._render_ops_script(img)
+    s = brev.render_image_ops_script(img)
     # The quoted path appears literally with double quotes so $HOME expands.
     assert 'pip install --quiet "$HOME/runplz-repo"' in s
     assert "-e" not in s.split("pip install")[-1]
@@ -164,7 +165,7 @@ def test_instance_exists_handles_dict_with_null_instances():
         assert brev._instance_exists("x") is False
 
 
-# -- _wait_until_ssh_reachable --------------------------------------------
+# -- wait_until_ssh_reachable --------------------------------------------
 
 
 def test_wait_until_ssh_reachable_returns_on_first_success(monkeypatch):
@@ -181,7 +182,7 @@ def test_wait_until_ssh_reachable_returns_on_first_success(monkeypatch):
     sleeps = []
     monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
     with mock.patch("runplz.backends.ssh_common.subprocess.run", fake_run):
-        brev._wait_until_ssh_reachable("box", max_wait_s=60, probe_interval_s=1)
+        brev.wait_until_ssh_reachable("box", max_wait_s=60, probe_interval_s=1)
 
     assert len(calls) == 1
     assert calls[0][:1] == ["ssh"]
@@ -205,7 +206,7 @@ def test_wait_until_ssh_reachable_raises_after_deadline(monkeypatch):
 
     with mock.patch("runplz.backends.ssh_common.subprocess.run", fake_run):
         with pytest.raises(RuntimeError, match="never became reachable"):
-            brev._wait_until_ssh_reachable("box", max_wait_s=5, probe_interval_s=1)
+            brev.wait_until_ssh_reachable("box", max_wait_s=5, probe_interval_s=1)
 
 
 def test_wait_until_ssh_reachable_invokes_refresh_callback_periodically(monkeypatch):
@@ -231,7 +232,7 @@ def test_wait_until_ssh_reachable_invokes_refresh_callback_periodically(monkeypa
 
     with mock.patch("runplz.backends.ssh_common.subprocess.run", fake_run):
         with pytest.raises(RuntimeError):
-            brev._wait_until_ssh_reachable(
+            brev.wait_until_ssh_reachable(
                 "box", max_wait_s=10, probe_interval_s=1, refresh_callback=bump
             )
 
@@ -585,7 +586,7 @@ def test_ensure_docker_happy_path():
 
 
 def test_ensure_docker_falls_back_to_get_docker_sh(capsys):
-    # First call (wait script) fails → fallback calls _sh with curl | sh.
+    # First call (wait script) fails → fallback calls run_local with curl | sh.
     fallback_called = {}
 
     def fake_sh(cmd):
@@ -595,7 +596,7 @@ def test_ensure_docker_falls_back_to_get_docker_sh(capsys):
         "runplz.backends.ssh_common.subprocess.run",
         return_value=mock.Mock(returncode=1),
     ):
-        with mock.patch("runplz.backends.ssh_common._sh", fake_sh):
+        with mock.patch("runplz.backends.ssh_common.run_local", fake_sh):
             brev._ensure_docker("some-box")
 
     assert "get.docker.com" in fallback_called["cmd"][-1]
@@ -621,12 +622,12 @@ def test_remote_has_nvidia_false():
         assert brev._remote_has_nvidia("box") is False
 
 
-# -- rsync_up / _rsync_down / _ssh / _sh ---------------------------------
+# -- rsync_up / rsync_down / ssh_exec / run_local ---------------------------------
 
 
 def test_rsync_up_excludes_and_no_delete(tmp_path):
     recorded = {}
-    with mock.patch("runplz.backends.ssh_common._sh", lambda c: recorded.setdefault("c", c)):
+    with mock.patch("runplz.backends.ssh_common.run_local", lambda c: recorded.setdefault("c", c)):
         brev.rsync_up(tmp_path, "my-box")
     cmd = recorded["c"]
     assert cmd[:2] == ["rsync", "-az"]
@@ -641,7 +642,7 @@ def test_rsync_up_excludes_configured_outputs_dir(tmp_path):
     silently re-uploaded on every launch. Verify the configured outputs_dir
     is added as an --exclude pattern."""
     recorded = {}
-    with mock.patch("runplz.backends.ssh_common._sh", lambda c: recorded.setdefault("c", c)):
+    with mock.patch("runplz.backends.ssh_common.run_local", lambda c: recorded.setdefault("c", c)):
         brev.rsync_up(tmp_path, "my-box", outputs_dir="brev_runs")
     cmd = recorded["c"]
     assert "--exclude=/brev_runs/" in cmd
@@ -653,7 +654,7 @@ def test_rsync_up_excludes_configured_outputs_dir(tmp_path):
 def test_rsync_up_skips_outputs_dir_exclude_for_default(tmp_path):
     """outputs_dir="out" is already in _RSYNC_NOISE_EXCLUDES — don't double up."""
     recorded = {}
-    with mock.patch("runplz.backends.ssh_common._sh", lambda c: recorded.setdefault("c", c)):
+    with mock.patch("runplz.backends.ssh_common.run_local", lambda c: recorded.setdefault("c", c)):
         brev.rsync_up(tmp_path, "my-box", outputs_dir="out")
     cmd = recorded["c"]
     assert cmd.count("--exclude=out") == 1
@@ -664,7 +665,7 @@ def test_rsync_up_handles_nested_outputs_dir(tmp_path):
     """A multi-segment outputs_dir like 'data/runs' must be anchored so we
     don't accidentally exclude every directory named 'runs' in the tree."""
     recorded = {}
-    with mock.patch("runplz.backends.ssh_common._sh", lambda c: recorded.setdefault("c", c)):
+    with mock.patch("runplz.backends.ssh_common.run_local", lambda c: recorded.setdefault("c", c)):
         brev.rsync_up(tmp_path, "my-box", outputs_dir="data/runs")
     cmd = recorded["c"]
     assert "--exclude=/data/runs/" in cmd
@@ -678,7 +679,7 @@ def test_rsync_up_skips_outputs_dir_exclude_when_outside_repo(tmp_path):
     source, so emitting an exclude for them would be noise."""
     outside = tmp_path.parent / "elsewhere"
     recorded = {}
-    with mock.patch("runplz.backends.ssh_common._sh", lambda c: recorded.setdefault("c", c)):
+    with mock.patch("runplz.backends.ssh_common.run_local", lambda c: recorded.setdefault("c", c)):
         brev.rsync_up(tmp_path, "my-box", outputs_dir=str(outside))
     cmd = recorded["c"]
     # No outputs-dir-derived exclude — only the standard noise + secrets.
@@ -691,7 +692,7 @@ def test_rsync_up_excludes_default_secret_files(tmp_path):
     from runplz._excludes import DEFAULT_TRANSFER_EXCLUDES
 
     recorded = {}
-    with mock.patch("runplz.backends.ssh_common._sh", lambda c: recorded.setdefault("c", c)):
+    with mock.patch("runplz.backends.ssh_common.run_local", lambda c: recorded.setdefault("c", c)):
         brev.rsync_up(tmp_path, "my-box")
 
     cmd = recorded["c"]
@@ -701,8 +702,8 @@ def test_rsync_up_excludes_default_secret_files(tmp_path):
 
 def test_rsync_down_runs_correct_cmd(tmp_path):
     recorded = {}
-    with mock.patch("runplz.backends.ssh_common._sh", lambda c: recorded.setdefault("c", c)):
-        brev._rsync_down("my-box", tmp_path)
+    with mock.patch("runplz.backends.ssh_common.run_local", lambda c: recorded.setdefault("c", c)):
+        brev.rsync_down("my-box", tmp_path)
     cmd = recorded["c"]
     assert cmd[:2] == ["rsync", "-az"]
     assert cmd[2].endswith(":runplz-out/")  # remote side
@@ -735,7 +736,7 @@ def test_prepare_remote_run_writes_manifest_and_latest_link(tmp_path):
 
     recorded = {}
     with mock.patch(
-        "runplz.backends.ssh_common._ssh",
+        "runplz.backends.ssh_common.ssh_exec",
         lambda target, cmd, **kw: recorded.update({"target": target, "cmd": cmd}),
     ):
         brev._prepare_remote_run("box", remote_run, manifest=manifest)
@@ -754,7 +755,7 @@ def test_rsync_up_uses_remote_run_repo_when_provided(tmp_path):
     recorded = {}
     with mock.patch("runplz.backends.ssh_common._record_remote_event", lambda *a, **k: None):
         with mock.patch(
-            "runplz.backends.ssh_common._sh",
+            "runplz.backends.ssh_common.run_local",
             lambda c: recorded.setdefault("c", c),
         ):
             brev.rsync_up(tmp_path, "my-box", remote_run=remote_run)
@@ -766,7 +767,7 @@ def test_rsync_up_uses_remote_run_repo_when_provided(tmp_path):
 def test_run_native_with_remote_run_uses_per_run_lifecycle_files(tmp_path):
     """The launcher script handed to ssh must reference the per-run meta
     files (out/, last.log, heartbeat.ndjson) and the wrapper's
-    ``bootstrap_start`` event. Post-3.11 this is visible on the _ssh
+    ``bootstrap_start`` event. Post-3.11 this is visible on the ssh_exec
     launcher call (not subprocess.run) because the bootstrap is now
     detached."""
     app = _app(tmp_path)
@@ -797,7 +798,7 @@ def test_run_native_with_remote_run_uses_per_run_lifecycle_files(tmp_path):
         # tail -F: pretend we streamed then EOF.
         return mock.Mock(returncode=0, stdout="", stderr="")
 
-    with mock.patch("runplz.backends.ssh_common._ssh", fake_ssh):
+    with mock.patch("runplz.backends.ssh_common.ssh_exec", fake_ssh):
         with mock.patch("runplz.backends.ssh_common.subprocess.run", fake_sub_run):
             rc = brev._run_native(
                 target="box",
@@ -810,7 +811,7 @@ def test_run_native_with_remote_run_uses_per_run_lifecycle_files(tmp_path):
             )
 
     assert rc == 0
-    # The launcher script (2nd _ssh call: 1st is the apt-get setup) must
+    # The launcher script (2nd ssh_exec call: 1st is the apt-get setup) must
     # embed the per-run paths through the heredoc-wrapped inner command.
     launcher = recorded["ssh_cmds"][-1]
     assert remote_run.out_rel in launcher
@@ -826,8 +827,8 @@ def test_run_native_with_remote_run_uses_per_run_lifecycle_files(tmp_path):
 
 def test_ssh_packages_cmd_in_bash_lc():
     recorded = {}
-    with mock.patch("runplz.backends.ssh_common._sh", lambda c: recorded.setdefault("c", c)):
-        brev._ssh("instance", "echo hi")
+    with mock.patch("runplz.backends.ssh_common.run_local", lambda c: recorded.setdefault("c", c)):
+        brev.ssh_exec("instance", "echo hi")
     assert recorded["c"][0] == "ssh"
     # Last arg is `bash -lc '<escaped cmd>'`.
     assert recorded["c"][-1].startswith("bash -lc ")
@@ -839,7 +840,7 @@ def test_sh_prints_and_runs(capsys):
         "runplz.backends.ssh_common.subprocess.run",
         return_value=mock.Mock(returncode=0),
     ) as patched:
-        brev._sh(["echo", "hello world"])
+        brev.run_local(["echo", "hello world"])
     assert patched.called
     # shlex-quoted print with + prefix
     assert "+ echo" in capsys.readouterr().out
@@ -850,7 +851,7 @@ def test_ssh_capture_runs_with_capture():
         "runplz.backends.ssh_common.subprocess.run",
         return_value=mock.Mock(returncode=0, stdout="stdout-content"),
     ) as patched:
-        out = brev._ssh_capture("box", "echo hi")
+        out = brev.ssh_capture("box", "echo hi")
     assert out == "stdout-content"
     assert patched.call_args.kwargs.get("capture_output") is True
 
@@ -861,7 +862,7 @@ def test_ssh_capture_runs_with_capture():
 def test_ensure_remote_rsync_sends_expected_cmd():
     recorded = {}
     with mock.patch(
-        "runplz.backends.ssh_common._ssh",
+        "runplz.backends.ssh_common.ssh_exec",
         lambda target, cmd, **kw: recorded.update({"i": target, "c": cmd}),
     ):
         brev._ensure_remote_rsync("box")
@@ -877,7 +878,7 @@ def test_build_image_dockerfile_uses_docker_build_f(tmp_path):
     img = Image.from_dockerfile("docker/Dockerfile")
     recorded = {}
     with mock.patch(
-        "runplz.backends.ssh_common._ssh",
+        "runplz.backends.ssh_common.ssh_exec",
         lambda i, c, **kw: recorded.setdefault("c", c),
     ):
         brev._build_image("box", img)
@@ -889,7 +890,7 @@ def test_build_image_dockerfile_honors_context():
     img = Image.from_dockerfile("docker/Dockerfile", context="docker")
     recorded = {}
     with mock.patch(
-        "runplz.backends.ssh_common._ssh",
+        "runplz.backends.ssh_common.ssh_exec",
         lambda i, c, **kw: recorded.setdefault("c", c),
     ):
         brev._build_image("box", img)
@@ -901,7 +902,7 @@ def test_build_image_from_registry_pipes_synthesized_dockerfile():
     img = Image.from_registry("pytorch/pytorch:2.4.0").pip_install("numpy")
     recorded = {}
     with mock.patch(
-        "runplz.backends.ssh_common._ssh",
+        "runplz.backends.ssh_common.ssh_exec",
         lambda i, c, **kw: recorded.setdefault("c", c),
     ):
         brev._build_image("box", img)
@@ -920,7 +921,7 @@ def test_run_container_detached_builds_full_docker_run(tmp_path):
 
     recorded = {}
     with mock.patch(
-        "runplz.backends.ssh_common._ssh",
+        "runplz.backends.ssh_common.ssh_exec",
         lambda i, c, **kw: recorded.setdefault("c", c),
     ):
         brev._run_container_detached(
@@ -949,7 +950,7 @@ def test_run_container_detached_with_remote_run_starts_monitor(tmp_path):
 
     recorded = {}
     with mock.patch(
-        "runplz.backends.ssh_common._ssh",
+        "runplz.backends.ssh_common.ssh_exec",
         lambda i, c, **kw: recorded.setdefault("c", c),
     ):
         brev._run_container_detached(
@@ -970,11 +971,11 @@ def test_run_container_detached_with_remote_run_starts_monitor(tmp_path):
     assert "docker wait runplz-train-abc123" in c
 
 
-# -- _stream_and_wait + _container_running -------------------------------
+# -- _stream_and_wait + container_running -------------------------------
 
 
 def test_stream_and_wait_exits_when_container_done():
-    # First log-stream ssh returns rc=0; _container_running says not running.
+    # First log-stream ssh returns rc=0; container_running says not running.
     seq = iter(
         [
             mock.Mock(returncode=0),  # docker logs -f
@@ -1052,7 +1053,7 @@ def test_container_running_treats_ssh_failure_as_still_running():
         "runplz.backends.ssh_common.subprocess.run",
         side_effect=__import__("subprocess").TimeoutExpired(cmd="ssh", timeout=30),
     ):
-        assert brev._container_running("box", "c") is True
+        assert brev.container_running("box", "c") is True
 
 
 def test_container_running_returns_false_on_inspect_false():
@@ -1060,7 +1061,7 @@ def test_container_running_returns_false_on_inspect_false():
         "runplz.backends.ssh_common.subprocess.run",
         return_value=mock.Mock(returncode=0, stdout="false\n"),
     ):
-        assert brev._container_running("box", "c") is False
+        assert brev.container_running("box", "c") is False
 
 
 def test_container_running_true_on_running_output():
@@ -1068,7 +1069,7 @@ def test_container_running_true_on_running_output():
         "runplz.backends.ssh_common.subprocess.run",
         return_value=mock.Mock(returncode=0, stdout="true\n"),
     ):
-        assert brev._container_running("box", "c") is True
+        assert brev.container_running("box", "c") is True
 
 
 # -- run() full happy paths -----------------------------------------------
@@ -1097,30 +1098,36 @@ def test_run_vm_docker_mode_end_to_end(tmp_path):
     app = _app(tmp_path, cfg=cfg)
     fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
 
-    with mock.patch.multiple(
-        "runplz.backends.brev",
-        _require_brev_cli=mock.DEFAULT,
-        _skip_onboarding=mock.DEFAULT,
-        _instance_exists=mock.Mock(return_value=True),
-        _refresh_ssh=mock.DEFAULT,
-        _wait_until_ssh_reachable=mock.DEFAULT,
-        _prepare_remote_run=mock.DEFAULT,
-        _ensure_docker=mock.DEFAULT,
-        rsync_up=mock.DEFAULT,
-        _remote_has_nvidia=mock.Mock(return_value=True),
-        _build_image=mock.DEFAULT,
-        _run_container_detached=mock.DEFAULT,
-        _stream_and_wait=mock.Mock(return_value=0),
-        _ssh_capture=mock.DEFAULT,
-        _rsync_down=mock.DEFAULT,
-        _apply_on_finish=mock.DEFAULT,
+    with (
+        mock.patch.multiple(
+            "runplz.backends.brev",
+            _require_brev_cli=mock.DEFAULT,
+            _skip_onboarding=mock.DEFAULT,
+            _instance_exists=mock.Mock(return_value=True),
+            _refresh_ssh=mock.DEFAULT,
+            _apply_on_finish=mock.DEFAULT,
+        ),
+        mock.patch.multiple(
+            "runplz.backends.ssh_common",
+            _ensure_remote_rsync=mock.DEFAULT,
+            wait_until_ssh_reachable=mock.DEFAULT,
+            _prepare_remote_run=mock.DEFAULT,
+            _ensure_docker=mock.DEFAULT,
+            rsync_up=mock.DEFAULT,
+            _remote_has_nvidia=mock.Mock(return_value=True),
+            _build_image=mock.DEFAULT,
+            _run_container_detached=mock.DEFAULT,
+            _stream_and_wait=mock.Mock(return_value=0),
+            ssh_capture=mock.DEFAULT,
+            rsync_down=mock.DEFAULT,
+        ),
     ):
         brev.run(app, fn, [], {}, instance="box")
 
 
 def test_run_threads_ssh_ready_wait_seconds_into_helper(tmp_path):
     """3.7.2: BrevConfig.ssh_ready_wait_seconds must reach
-    _wait_until_ssh_reachable (otherwise the knob is decorative)."""
+    wait_until_ssh_reachable (otherwise the knob is decorative)."""
     cfg = BrevConfig(mode="vm", use_docker=True, ssh_ready_wait_seconds=2400)
     app = _app(tmp_path, cfg=cfg)
     fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
@@ -1130,23 +1137,29 @@ def test_run_threads_ssh_ready_wait_seconds_into_helper(tmp_path):
     def capture_wait(target, **kw):
         seen["max_wait_s"] = kw.get("max_wait_s")
 
-    with mock.patch.multiple(
-        "runplz.backends.brev",
-        _require_brev_cli=mock.DEFAULT,
-        _skip_onboarding=mock.DEFAULT,
-        _instance_exists=mock.Mock(return_value=True),
-        _refresh_ssh=mock.DEFAULT,
-        _wait_until_ssh_reachable=capture_wait,
-        _prepare_remote_run=mock.DEFAULT,
-        _ensure_docker=mock.DEFAULT,
-        rsync_up=mock.DEFAULT,
-        _remote_has_nvidia=mock.Mock(return_value=False),
-        _build_image=mock.DEFAULT,
-        _run_container_detached=mock.DEFAULT,
-        _stream_and_wait=mock.Mock(return_value=0),
-        _ssh_capture=mock.DEFAULT,
-        _rsync_down=mock.DEFAULT,
-        _apply_on_finish=mock.DEFAULT,
+    with (
+        mock.patch.multiple(
+            "runplz.backends.brev",
+            _require_brev_cli=mock.DEFAULT,
+            _skip_onboarding=mock.DEFAULT,
+            _instance_exists=mock.Mock(return_value=True),
+            _refresh_ssh=mock.DEFAULT,
+            _apply_on_finish=mock.DEFAULT,
+        ),
+        mock.patch.multiple(
+            "runplz.backends.ssh_common",
+            _ensure_remote_rsync=mock.DEFAULT,
+            wait_until_ssh_reachable=capture_wait,
+            _prepare_remote_run=mock.DEFAULT,
+            _ensure_docker=mock.DEFAULT,
+            rsync_up=mock.DEFAULT,
+            _remote_has_nvidia=mock.Mock(return_value=False),
+            _build_image=mock.DEFAULT,
+            _run_container_detached=mock.DEFAULT,
+            _stream_and_wait=mock.Mock(return_value=0),
+            ssh_capture=mock.DEFAULT,
+            rsync_down=mock.DEFAULT,
+        ),
     ):
         brev.run(app, fn, [], {}, instance="box")
 
@@ -1169,27 +1182,33 @@ def test_run_vm_docker_mode_nonzero_exit_raises(tmp_path):
             return tail_output
         return ""
 
-    with mock.patch.multiple(
-        "runplz.backends.brev",
-        _require_brev_cli=mock.DEFAULT,
-        _skip_onboarding=mock.DEFAULT,
-        _instance_exists=mock.Mock(return_value=True),
-        _refresh_ssh=mock.DEFAULT,
-        _wait_until_ssh_reachable=mock.DEFAULT,
-        _prepare_remote_run=mock.DEFAULT,
-        _ensure_docker=mock.DEFAULT,
-        rsync_up=mock.DEFAULT,
-        _remote_has_nvidia=mock.Mock(return_value=False),
-        _build_image=mock.DEFAULT,
-        _run_container_detached=mock.DEFAULT,
-        _stream_and_wait=mock.Mock(return_value=137),
-        _ssh_capture=fake_ssh_capture,
-        _rsync_down=mock.DEFAULT,
-        _apply_on_finish=mock.DEFAULT,
+    with (
+        mock.patch.multiple(
+            "runplz.backends.brev",
+            _require_brev_cli=mock.DEFAULT,
+            _skip_onboarding=mock.DEFAULT,
+            _instance_exists=mock.Mock(return_value=True),
+            _refresh_ssh=mock.DEFAULT,
+            _apply_on_finish=mock.DEFAULT,
+        ),
+        mock.patch.multiple(
+            "runplz.backends.ssh_common",
+            _ensure_remote_rsync=mock.DEFAULT,
+            wait_until_ssh_reachable=mock.DEFAULT,
+            _prepare_remote_run=mock.DEFAULT,
+            _ensure_docker=mock.DEFAULT,
+            rsync_up=mock.DEFAULT,
+            _remote_has_nvidia=mock.Mock(return_value=False),
+            _build_image=mock.DEFAULT,
+            _run_container_detached=mock.DEFAULT,
+            _stream_and_wait=mock.Mock(return_value=137),
+            ssh_capture=fake_ssh_capture,
+            rsync_down=mock.DEFAULT,
+        ),
     ):
-        # _fetch_failure_tail lives in ssh_common and calls _ssh_capture
+        # _fetch_failure_tail lives in ssh_common and calls ssh_capture
         # via its own module namespace — patch it there too.
-        with mock.patch("runplz.backends.ssh_common._ssh_capture", fake_ssh_capture):
+        with mock.patch("runplz.backends.ssh_common.ssh_capture", fake_ssh_capture):
             with pytest.raises(RuntimeError) as ei:
                 brev.run(app, fn, [], {}, instance="box")
 
@@ -1218,21 +1237,26 @@ def test_run_container_mode_nonzero_exit_includes_remote_log_tail(tmp_path):
             return tail_output
         return ""
 
-    with mock.patch.multiple(
-        "runplz.backends.brev",
-        _require_brev_cli=mock.DEFAULT,
-        _skip_onboarding=mock.DEFAULT,
-        _instance_exists=mock.Mock(return_value=True),
-        _refresh_ssh=mock.DEFAULT,
-        _wait_until_ssh_reachable=mock.DEFAULT,
-        _prepare_remote_run=mock.DEFAULT,
-        _ensure_remote_rsync=mock.DEFAULT,
-        rsync_up=mock.DEFAULT,
-        _run_container_mode=mock.Mock(return_value=1),
-        _ssh_capture=fake_ssh_capture,
-        _rsync_down=mock.DEFAULT,
+    with (
+        mock.patch.multiple(
+            "runplz.backends.brev",
+            _require_brev_cli=mock.DEFAULT,
+            _skip_onboarding=mock.DEFAULT,
+            _instance_exists=mock.Mock(return_value=True),
+            _refresh_ssh=mock.DEFAULT,
+        ),
+        mock.patch.multiple(
+            "runplz.backends.ssh_common",
+            wait_until_ssh_reachable=mock.DEFAULT,
+            _prepare_remote_run=mock.DEFAULT,
+            _ensure_remote_rsync=mock.DEFAULT,
+            rsync_up=mock.DEFAULT,
+            _run_container_mode=mock.Mock(return_value=1),
+            ssh_capture=fake_ssh_capture,
+            rsync_down=mock.DEFAULT,
+        ),
     ):
-        with mock.patch("runplz.backends.ssh_common._ssh_capture", fake_ssh_capture):
+        with mock.patch("runplz.backends.ssh_common.ssh_capture", fake_ssh_capture):
             with mock.patch(
                 "runplz.backends.brev.subprocess.run",
                 return_value=mock.Mock(returncode=0, stdout="", stderr=""),
@@ -1363,24 +1387,30 @@ def test_run_ephemeral_mode_generates_name_and_forces_delete(tmp_path):
         captured_finish["instance"] = instance
         captured_finish["on_finish"] = cfg.on_finish
 
-    with mock.patch.multiple(
-        "runplz.backends.brev",
-        _require_brev_cli=mock.DEFAULT,
-        _skip_onboarding=mock.DEFAULT,
-        _instance_exists=mock.Mock(return_value=False),
-        _create_instance=capture_create,
-        _refresh_ssh=mock.DEFAULT,
-        _wait_until_ssh_reachable=mock.DEFAULT,
-        _prepare_remote_run=mock.DEFAULT,
-        _ensure_docker=mock.DEFAULT,
-        rsync_up=mock.DEFAULT,
-        _remote_has_nvidia=mock.Mock(return_value=False),
-        _build_image=mock.DEFAULT,
-        _run_container_detached=mock.DEFAULT,
-        _stream_and_wait=mock.Mock(return_value=0),
-        _ssh_capture=mock.DEFAULT,
-        _rsync_down=mock.DEFAULT,
-        _apply_on_finish=capture_finish,
+    with (
+        mock.patch.multiple(
+            "runplz.backends.brev",
+            _require_brev_cli=mock.DEFAULT,
+            _skip_onboarding=mock.DEFAULT,
+            _instance_exists=mock.Mock(return_value=False),
+            _create_instance=capture_create,
+            _refresh_ssh=mock.DEFAULT,
+            _apply_on_finish=capture_finish,
+        ),
+        mock.patch.multiple(
+            "runplz.backends.ssh_common",
+            _ensure_remote_rsync=mock.DEFAULT,
+            wait_until_ssh_reachable=mock.DEFAULT,
+            _prepare_remote_run=mock.DEFAULT,
+            _ensure_docker=mock.DEFAULT,
+            rsync_up=mock.DEFAULT,
+            _remote_has_nvidia=mock.Mock(return_value=False),
+            _build_image=mock.DEFAULT,
+            _run_container_detached=mock.DEFAULT,
+            _stream_and_wait=mock.Mock(return_value=0),
+            ssh_capture=mock.DEFAULT,
+            rsync_down=mock.DEFAULT,
+        ),
     ):
         brev.run(app, fn, [], {}, instance=None)
 
@@ -1406,24 +1436,30 @@ def test_run_ephemeral_preserves_explicit_on_finish_leave(tmp_path):
     def capture_finish(*, instance, cfg):
         captured_finish["on_finish"] = cfg.on_finish
 
-    with mock.patch.multiple(
-        "runplz.backends.brev",
-        _require_brev_cli=mock.DEFAULT,
-        _skip_onboarding=mock.DEFAULT,
-        _instance_exists=mock.Mock(return_value=False),
-        _create_instance=mock.DEFAULT,
-        _refresh_ssh=mock.DEFAULT,
-        _wait_until_ssh_reachable=mock.DEFAULT,
-        _prepare_remote_run=mock.DEFAULT,
-        _ensure_docker=mock.DEFAULT,
-        rsync_up=mock.DEFAULT,
-        _remote_has_nvidia=mock.Mock(return_value=False),
-        _build_image=mock.DEFAULT,
-        _run_container_detached=mock.DEFAULT,
-        _stream_and_wait=mock.Mock(return_value=0),
-        _ssh_capture=mock.DEFAULT,
-        _rsync_down=mock.DEFAULT,
-        _apply_on_finish=capture_finish,
+    with (
+        mock.patch.multiple(
+            "runplz.backends.brev",
+            _require_brev_cli=mock.DEFAULT,
+            _skip_onboarding=mock.DEFAULT,
+            _instance_exists=mock.Mock(return_value=False),
+            _create_instance=mock.DEFAULT,
+            _refresh_ssh=mock.DEFAULT,
+            _apply_on_finish=capture_finish,
+        ),
+        mock.patch.multiple(
+            "runplz.backends.ssh_common",
+            _ensure_remote_rsync=mock.DEFAULT,
+            wait_until_ssh_reachable=mock.DEFAULT,
+            _prepare_remote_run=mock.DEFAULT,
+            _ensure_docker=mock.DEFAULT,
+            rsync_up=mock.DEFAULT,
+            _remote_has_nvidia=mock.Mock(return_value=False),
+            _build_image=mock.DEFAULT,
+            _run_container_detached=mock.DEFAULT,
+            _stream_and_wait=mock.Mock(return_value=0),
+            ssh_capture=mock.DEFAULT,
+            rsync_down=mock.DEFAULT,
+        ),
     ):
         brev.run(app, fn, [], {}, instance=None)
 
@@ -1442,24 +1478,30 @@ def test_run_named_instance_triggers_auto_start_when_stopped(tmp_path):
     def fake_start(name):
         start_calls.append(name)
 
-    with mock.patch.multiple(
-        "runplz.backends.brev",
-        _require_brev_cli=mock.DEFAULT,
-        _skip_onboarding=mock.DEFAULT,
-        _instance_exists=mock.Mock(return_value=True),
-        _start_instance_if_stopped=fake_start,
-        _refresh_ssh=mock.DEFAULT,
-        _wait_until_ssh_reachable=mock.DEFAULT,
-        _prepare_remote_run=mock.DEFAULT,
-        _ensure_docker=mock.DEFAULT,
-        rsync_up=mock.DEFAULT,
-        _remote_has_nvidia=mock.Mock(return_value=False),
-        _build_image=mock.DEFAULT,
-        _run_container_detached=mock.DEFAULT,
-        _stream_and_wait=mock.Mock(return_value=0),
-        _ssh_capture=mock.DEFAULT,
-        _rsync_down=mock.DEFAULT,
-        _apply_on_finish=mock.DEFAULT,
+    with (
+        mock.patch.multiple(
+            "runplz.backends.brev",
+            _require_brev_cli=mock.DEFAULT,
+            _skip_onboarding=mock.DEFAULT,
+            _instance_exists=mock.Mock(return_value=True),
+            _start_instance_if_stopped=fake_start,
+            _refresh_ssh=mock.DEFAULT,
+            _apply_on_finish=mock.DEFAULT,
+        ),
+        mock.patch.multiple(
+            "runplz.backends.ssh_common",
+            _ensure_remote_rsync=mock.DEFAULT,
+            wait_until_ssh_reachable=mock.DEFAULT,
+            _prepare_remote_run=mock.DEFAULT,
+            _ensure_docker=mock.DEFAULT,
+            rsync_up=mock.DEFAULT,
+            _remote_has_nvidia=mock.Mock(return_value=False),
+            _build_image=mock.DEFAULT,
+            _run_container_detached=mock.DEFAULT,
+            _stream_and_wait=mock.Mock(return_value=0),
+            ssh_capture=mock.DEFAULT,
+            rsync_down=mock.DEFAULT,
+        ),
     ):
         brev.run(app, fn, [], {}, instance="my-box")
 
@@ -1470,7 +1512,7 @@ def test_run_named_instance_triggers_auto_start_when_stopped(tmp_path):
 
 
 def test_setup_failure_after_create_still_runs_on_finish(tmp_path):
-    """Regression for #29: if _refresh_ssh / _wait_until_ssh_reachable /
+    """Regression for #29: if _refresh_ssh / wait_until_ssh_reachable /
     rsync_up raises *after* _create_instance succeeds, the Brev box is
     already billed — runplz must still fire _apply_on_finish so the box
     doesn't leak."""
@@ -1488,26 +1530,32 @@ def test_setup_failure_after_create_still_runs_on_finish(tmp_path):
     def fake_create(name, *, cfg=None, image=None, function=None):
         create_calls.append(name)
 
-    with mock.patch.multiple(
-        "runplz.backends.brev",
-        _require_brev_cli=mock.DEFAULT,
-        _skip_onboarding=mock.DEFAULT,
-        _instance_exists=mock.Mock(return_value=False),
-        _create_instance=fake_create,
-        # _refresh_ssh raises — simulates the Brev API transient hitting
-        # a post-create setup step. Before #29 this would leak the box.
-        _refresh_ssh=mock.Mock(side_effect=RuntimeError("rpc error: context deadline exceeded")),
-        _wait_until_ssh_reachable=mock.DEFAULT,
-        _prepare_remote_run=mock.DEFAULT,
-        _ensure_docker=mock.DEFAULT,
-        rsync_up=mock.DEFAULT,
-        _remote_has_nvidia=mock.Mock(return_value=False),
-        _build_image=mock.DEFAULT,
-        _run_container_detached=mock.DEFAULT,
-        _stream_and_wait=mock.Mock(return_value=0),
-        _ssh_capture=mock.DEFAULT,
-        _rsync_down=mock.DEFAULT,
-        _apply_on_finish=capture_finish,
+    with (
+        mock.patch.multiple(
+            "runplz.backends.brev",
+            _require_brev_cli=mock.DEFAULT,
+            _skip_onboarding=mock.DEFAULT,
+            _instance_exists=mock.Mock(return_value=False),
+            _create_instance=fake_create,
+            _refresh_ssh=mock.Mock(
+                side_effect=RuntimeError("rpc error: context deadline exceeded")
+            ),
+            _apply_on_finish=capture_finish,
+        ),
+        mock.patch.multiple(
+            "runplz.backends.ssh_common",
+            _ensure_remote_rsync=mock.DEFAULT,
+            wait_until_ssh_reachable=mock.DEFAULT,
+            _prepare_remote_run=mock.DEFAULT,
+            _ensure_docker=mock.DEFAULT,
+            rsync_up=mock.DEFAULT,
+            _remote_has_nvidia=mock.Mock(return_value=False),
+            _build_image=mock.DEFAULT,
+            _run_container_detached=mock.DEFAULT,
+            _stream_and_wait=mock.Mock(return_value=0),
+            ssh_capture=mock.DEFAULT,
+            rsync_down=mock.DEFAULT,
+        ),
     ):
         with pytest.raises(RuntimeError, match="context deadline"):
             brev.run(app, fn, [], {}, instance="new-box")
@@ -1558,30 +1606,36 @@ def test_sigterm_during_dispatch_triggers_on_finish(tmp_path):
     def capture_finish(*, instance, cfg):
         finish_calls.append(instance)
 
-    def fake_stream(instance, container_name, max_runtime_seconds=None):
+    def fake_stream(instance, container_name, max_runtime_seconds=None, port=None):
         # Simulate the orchestrator receiving SIGTERM while the remote
         # training is streaming. Raise the context manager's translated
         # exception — which is what signal.signal's handler would do.
         raise brev._OrchestratorKilled("runplz orchestrator killed by SIGTERM")
 
-    with mock.patch.multiple(
-        "runplz.backends.brev",
-        _require_brev_cli=mock.DEFAULT,
-        _skip_onboarding=mock.DEFAULT,
-        _instance_exists=mock.Mock(return_value=False),
-        _create_instance=mock.DEFAULT,
-        _refresh_ssh=mock.DEFAULT,
-        _wait_until_ssh_reachable=mock.DEFAULT,
-        _prepare_remote_run=mock.DEFAULT,
-        _ensure_docker=mock.DEFAULT,
-        rsync_up=mock.DEFAULT,
-        _remote_has_nvidia=mock.Mock(return_value=False),
-        _build_image=mock.DEFAULT,
-        _run_container_detached=mock.DEFAULT,
-        _stream_and_wait=fake_stream,
-        _ssh_capture=mock.DEFAULT,
-        _rsync_down=mock.DEFAULT,
-        _apply_on_finish=capture_finish,
+    with (
+        mock.patch.multiple(
+            "runplz.backends.brev",
+            _require_brev_cli=mock.DEFAULT,
+            _skip_onboarding=mock.DEFAULT,
+            _instance_exists=mock.Mock(return_value=False),
+            _create_instance=mock.DEFAULT,
+            _refresh_ssh=mock.DEFAULT,
+            _apply_on_finish=capture_finish,
+        ),
+        mock.patch.multiple(
+            "runplz.backends.ssh_common",
+            _ensure_remote_rsync=mock.DEFAULT,
+            wait_until_ssh_reachable=mock.DEFAULT,
+            _prepare_remote_run=mock.DEFAULT,
+            _ensure_docker=mock.DEFAULT,
+            rsync_up=mock.DEFAULT,
+            _remote_has_nvidia=mock.Mock(return_value=False),
+            _build_image=mock.DEFAULT,
+            _run_container_detached=mock.DEFAULT,
+            _stream_and_wait=fake_stream,
+            ssh_capture=mock.DEFAULT,
+            rsync_down=mock.DEFAULT,
+        ),
     ):
         with pytest.raises(brev._OrchestratorKilled):
             brev.run(app, fn, [], {}, instance=None)
@@ -2022,7 +2076,7 @@ def test_wait_until_ssh_reachable_bails_on_brev_instance_failed(monkeypatch):
 
     with mock.patch("runplz.backends.ssh_common.subprocess.run", always_refused):
         with pytest.raises(brev.BrevInstanceFailed, match="FAILURE"):
-            brev._wait_until_ssh_reachable(
+            brev.wait_until_ssh_reachable(
                 "doomed",
                 max_wait_s=120,
                 probe_interval_s=1,
@@ -2074,7 +2128,7 @@ def test_fetch_failure_tail_returns_empty_on_ssh_error():
     def boom(*a, **kw):
         raise RuntimeError("ssh went away")
 
-    with mock.patch("runplz.backends.ssh_common._ssh_capture", boom):
+    with mock.patch("runplz.backends.ssh_common.ssh_capture", boom):
         out = brev._fetch_failure_tail(target="box", container_name=None)
     # Helper swallows the error and returns a diagnostic string.
     assert "could not fetch remote log tail" in out
@@ -2094,7 +2148,7 @@ def test_raise_for_runtime_cap_kills_container_and_raises():
 
     with mock.patch("runplz.backends.ssh_common.subprocess.run", fake_sub):
         with pytest.raises(RuntimeError) as ei:
-            brev._raise_for_runtime_cap("box", 60, container_name="c-abc")
+            brev.raise_for_runtime_cap("box", 60, container_name="c-abc")
 
     kill_cmds = [c for c in calls if any("docker kill" in tok for tok in c)]
     assert kill_cmds, f"no docker kill issued; saw: {calls}"
@@ -2112,7 +2166,7 @@ def test_raise_for_runtime_cap_pkills_bootstrap_in_native_or_container_mode():
 
     with mock.patch("runplz.backends.ssh_common.subprocess.run", fake_sub):
         with pytest.raises(RuntimeError):
-            brev._raise_for_runtime_cap("box", 30, container_name=None)
+            brev.raise_for_runtime_cap("box", 30, container_name=None)
 
     pkill_cmds = [c for c in calls if any("pkill" in tok for tok in c)]
     assert pkill_cmds, f"no pkill issued; saw: {calls}"
@@ -2121,7 +2175,7 @@ def test_raise_for_runtime_cap_pkills_bootstrap_in_native_or_container_mode():
 
 def test_run_container_mode_timeout_triggers_cap():
     """A TimeoutExpired from the ssh subprocess in container-mode must route
-    through _raise_for_runtime_cap → RuntimeError."""
+    through raise_for_runtime_cap → RuntimeError."""
 
     def fake_sub(cmd, *a, **kw):
         if kw.get("timeout") is not None:
@@ -2134,7 +2188,7 @@ def test_run_container_mode_timeout_triggers_cap():
         env={},
     )
     with mock.patch("runplz.backends.ssh_common.subprocess.run", fake_sub):
-        with mock.patch("runplz.backends.ssh_common._render_ops_script", return_value=""):
+        with mock.patch("runplz.backends.ssh_common.render_image_ops_script", return_value=""):
             with pytest.raises(RuntimeError, match="max_runtime_seconds=5"):
                 brev._run_container_mode(
                     target="box",
@@ -2394,7 +2448,7 @@ def test_stream_and_wait_no_cap_passes_none_timeout():
             # Pretend the container stopped immediately after this.
             return mock.Mock(returncode=0, stdout="", stderr="")
         if "docker inspect" in " ".join(cmd):
-            # _container_running should see False → loop breaks.
+            # container_running should see False → loop breaks.
             return mock.Mock(returncode=0, stdout="false", stderr="")
         if "docker wait" in " ".join(cmd):
             return mock.Mock(returncode=0, stdout="0", stderr="")
@@ -2412,19 +2466,25 @@ def test_run_vm_native_mode_end_to_end(tmp_path):
     app = _app(tmp_path, cfg=cfg)
     fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
 
-    with mock.patch.multiple(
-        "runplz.backends.brev",
-        _require_brev_cli=mock.DEFAULT,
-        _skip_onboarding=mock.DEFAULT,
-        _instance_exists=mock.Mock(return_value=True),
-        _refresh_ssh=mock.DEFAULT,
-        _wait_until_ssh_reachable=mock.DEFAULT,
-        _prepare_remote_run=mock.DEFAULT,
-        rsync_up=mock.DEFAULT,
-        _remote_has_nvidia=mock.Mock(return_value=False),
-        _run_native=mock.Mock(return_value=0),
-        _rsync_down=mock.DEFAULT,
-        _apply_on_finish=mock.DEFAULT,
+    with (
+        mock.patch.multiple(
+            "runplz.backends.brev",
+            _require_brev_cli=mock.DEFAULT,
+            _skip_onboarding=mock.DEFAULT,
+            _instance_exists=mock.Mock(return_value=True),
+            _refresh_ssh=mock.DEFAULT,
+            _apply_on_finish=mock.DEFAULT,
+        ),
+        mock.patch.multiple(
+            "runplz.backends.ssh_common",
+            _ensure_remote_rsync=mock.DEFAULT,
+            wait_until_ssh_reachable=mock.DEFAULT,
+            _prepare_remote_run=mock.DEFAULT,
+            rsync_up=mock.DEFAULT,
+            _remote_has_nvidia=mock.Mock(return_value=False),
+            _run_native=mock.Mock(return_value=0),
+            rsync_down=mock.DEFAULT,
+        ),
     ):
         brev.run(app, fn, [], {}, instance="box")
 
@@ -2438,19 +2498,24 @@ def test_run_container_mode_end_to_end(tmp_path):
         module_file=_job_inside(tmp_path),
     )
 
-    with mock.patch.multiple(
-        "runplz.backends.brev",
-        _require_brev_cli=mock.DEFAULT,
-        _skip_onboarding=mock.DEFAULT,
-        _instance_exists=mock.Mock(return_value=True),
-        _refresh_ssh=mock.DEFAULT,
-        _wait_until_ssh_reachable=mock.DEFAULT,
-        _prepare_remote_run=mock.DEFAULT,
-        _ensure_remote_rsync=mock.DEFAULT,
-        rsync_up=mock.DEFAULT,
-        _run_container_mode=mock.Mock(return_value=0),
-        _rsync_down=mock.DEFAULT,
-        _apply_on_finish=mock.DEFAULT,
+    with (
+        mock.patch.multiple(
+            "runplz.backends.brev",
+            _require_brev_cli=mock.DEFAULT,
+            _skip_onboarding=mock.DEFAULT,
+            _instance_exists=mock.Mock(return_value=True),
+            _refresh_ssh=mock.DEFAULT,
+            _apply_on_finish=mock.DEFAULT,
+        ),
+        mock.patch.multiple(
+            "runplz.backends.ssh_common",
+            wait_until_ssh_reachable=mock.DEFAULT,
+            _prepare_remote_run=mock.DEFAULT,
+            _ensure_remote_rsync=mock.DEFAULT,
+            rsync_up=mock.DEFAULT,
+            _run_container_mode=mock.Mock(return_value=0),
+            rsync_down=mock.DEFAULT,
+        ),
     ):
         brev.run(app, fn, [], {}, instance="box")
 
@@ -2466,24 +2531,30 @@ def test_run_creates_instance_when_auto_create(tmp_path):
         created["name"] = name
         created["function"] = function
 
-    with mock.patch.multiple(
-        "runplz.backends.brev",
-        _require_brev_cli=mock.DEFAULT,
-        _skip_onboarding=mock.DEFAULT,
-        _instance_exists=mock.Mock(return_value=False),
-        _create_instance=fake_create,
-        _refresh_ssh=mock.DEFAULT,
-        _wait_until_ssh_reachable=mock.DEFAULT,
-        _prepare_remote_run=mock.DEFAULT,
-        _ensure_docker=mock.DEFAULT,
-        rsync_up=mock.DEFAULT,
-        _remote_has_nvidia=mock.Mock(return_value=False),
-        _build_image=mock.DEFAULT,
-        _run_container_detached=mock.DEFAULT,
-        _stream_and_wait=mock.Mock(return_value=0),
-        _ssh_capture=mock.DEFAULT,
-        _rsync_down=mock.DEFAULT,
-        _apply_on_finish=mock.DEFAULT,
+    with (
+        mock.patch.multiple(
+            "runplz.backends.brev",
+            _require_brev_cli=mock.DEFAULT,
+            _skip_onboarding=mock.DEFAULT,
+            _instance_exists=mock.Mock(return_value=False),
+            _create_instance=fake_create,
+            _refresh_ssh=mock.DEFAULT,
+            _apply_on_finish=mock.DEFAULT,
+        ),
+        mock.patch.multiple(
+            "runplz.backends.ssh_common",
+            _ensure_remote_rsync=mock.DEFAULT,
+            wait_until_ssh_reachable=mock.DEFAULT,
+            _prepare_remote_run=mock.DEFAULT,
+            _ensure_docker=mock.DEFAULT,
+            rsync_up=mock.DEFAULT,
+            _remote_has_nvidia=mock.Mock(return_value=False),
+            _build_image=mock.DEFAULT,
+            _run_container_detached=mock.DEFAULT,
+            _stream_and_wait=mock.Mock(return_value=0),
+            ssh_capture=mock.DEFAULT,
+            rsync_down=mock.DEFAULT,
+        ),
     ):
         brev.run(app, fn, [], {}, instance="newbox")
 
@@ -2495,25 +2566,51 @@ def test_run_creates_instance_when_auto_create(tmp_path):
 
 
 def _full_run_mocks():
-    """Shared mock.multiple kwargs for brev.run() end-to-end with a clean VM-
-    docker-mode path. Callers override `_stream_and_wait` to control exit code
-    (and can wrap in another context to assert _apply_on_finish calls)."""
+    """Brev-scoped mock.multiple kwargs for brev.run() end-to-end.
+
+    Split from `_full_dispatch_mocks` because brev's dispatch runs through
+    `ssh_common.dispatch_to_target` — the provisioning helpers still live on
+    the brev module, the staging/run helpers are reached via ssh_common.
+    Use both together via `_full_run_patches()`.
+    """
     return dict(
         _require_brev_cli=mock.DEFAULT,
         _skip_onboarding=mock.DEFAULT,
         _instance_exists=mock.Mock(return_value=True),
         _refresh_ssh=mock.DEFAULT,
-        _wait_until_ssh_reachable=mock.DEFAULT,
+    )
+
+
+def _full_dispatch_mocks(**overrides):
+    """ssh_common-scoped kwargs for a clean VM-docker-mode dispatch.
+
+    Callers override `_stream_and_wait` to control the exit code.
+    """
+    mocks = dict(
+        wait_until_ssh_reachable=mock.DEFAULT,
         _prepare_remote_run=mock.DEFAULT,
+        _ensure_remote_rsync=mock.DEFAULT,
         _ensure_docker=mock.DEFAULT,
         rsync_up=mock.DEFAULT,
         _remote_has_nvidia=mock.Mock(return_value=False),
         _build_image=mock.DEFAULT,
         _run_container_detached=mock.DEFAULT,
         _stream_and_wait=mock.Mock(return_value=0),
-        _ssh_capture=mock.DEFAULT,
-        _rsync_down=mock.DEFAULT,
+        ssh_capture=mock.DEFAULT,
+        rsync_down=mock.DEFAULT,
     )
+    mocks.update(overrides)
+    return mocks
+
+
+@contextlib.contextmanager
+def _full_run_patches(**dispatch_overrides):
+    """Patch both halves of a brev.run() end-to-end path at once."""
+    with mock.patch.multiple("runplz.backends.brev", **_full_run_mocks()):
+        with mock.patch.multiple(
+            "runplz.backends.ssh_common", **_full_dispatch_mocks(**dispatch_overrides)
+        ):
+            yield
 
 
 def test_on_finish_default_stop_calls_brev_stop(tmp_path):
@@ -2527,7 +2624,7 @@ def test_on_finish_default_stop_calls_brev_stop(tmp_path):
         captured["calls"].append(list(cmd))
         return mock.Mock(returncode=0, stdout="", stderr="")
 
-    with mock.patch.multiple("runplz.backends.brev", **_full_run_mocks()):
+    with _full_run_patches():
         with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
             brev.run(app, fn, [], {}, instance="box")
 
@@ -2546,7 +2643,7 @@ def test_on_finish_delete_calls_brev_delete(tmp_path):
         captured["calls"].append(list(cmd))
         return mock.Mock(returncode=0, stdout="", stderr="")
 
-    with mock.patch.multiple("runplz.backends.brev", **_full_run_mocks()):
+    with _full_run_patches():
         with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
             brev.run(app, fn, [], {}, instance="box")
 
@@ -2565,7 +2662,7 @@ def test_on_finish_leave_never_touches_box(tmp_path):
         captured["calls"].append(list(cmd))
         return mock.Mock(returncode=0, stdout="", stderr="")
 
-    with mock.patch.multiple("runplz.backends.brev", **_full_run_mocks()):
+    with _full_run_patches():
         with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
             brev.run(app, fn, [], {}, instance="box")
 
@@ -2588,10 +2685,7 @@ def test_on_finish_fires_even_when_remote_run_fails(tmp_path):
         return mock.Mock(returncode=0, stdout="", stderr="")
 
     # Simulate non-zero exit from the remote container.
-    mocks = _full_run_mocks()
-    mocks["_stream_and_wait"] = mock.Mock(return_value=137)
-
-    with mock.patch.multiple("runplz.backends.brev", **mocks):
+    with _full_run_patches(_stream_and_wait=mock.Mock(return_value=137)):
         with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
             with pytest.raises(RuntimeError, match="status 137"):
                 brev.run(app, fn, [], {}, instance="box")
@@ -2613,12 +2707,11 @@ def test_container_rm_force_called_in_finally_on_failure(tmp_path):
         ssh_calls["cmds"].append(cmd)
         return ""
 
-    mocks = _full_run_mocks()
     # Simulate an exception in the middle of the run (after container start).
-    mocks["_rsync_down"] = mock.Mock(side_effect=RuntimeError("rsync exploded"))
-    mocks["_ssh_capture"] = fake_ssh_capture
-
-    with mock.patch.multiple("runplz.backends.brev", **mocks):
+    with _full_run_patches(
+        rsync_down=mock.Mock(side_effect=RuntimeError("rsync exploded")),
+        ssh_capture=fake_ssh_capture,
+    ):
         with pytest.raises(RuntimeError, match="rsync exploded"):
             brev.run(app, fn, [], {}, instance="box")
 
@@ -2640,18 +2733,23 @@ def test_on_finish_fires_in_container_mode(tmp_path):
         captured["calls"].append(list(cmd))
         return mock.Mock(returncode=0, stdout="", stderr="")
 
-    with mock.patch.multiple(
-        "runplz.backends.brev",
-        _require_brev_cli=mock.DEFAULT,
-        _skip_onboarding=mock.DEFAULT,
-        _instance_exists=mock.Mock(return_value=True),
-        _refresh_ssh=mock.DEFAULT,
-        _wait_until_ssh_reachable=mock.DEFAULT,
-        _prepare_remote_run=mock.DEFAULT,
-        _ensure_remote_rsync=mock.DEFAULT,
-        rsync_up=mock.DEFAULT,
-        _run_container_mode=mock.Mock(return_value=0),
-        _rsync_down=mock.DEFAULT,
+    with (
+        mock.patch.multiple(
+            "runplz.backends.brev",
+            _require_brev_cli=mock.DEFAULT,
+            _skip_onboarding=mock.DEFAULT,
+            _instance_exists=mock.Mock(return_value=True),
+            _refresh_ssh=mock.DEFAULT,
+        ),
+        mock.patch.multiple(
+            "runplz.backends.ssh_common",
+            wait_until_ssh_reachable=mock.DEFAULT,
+            _prepare_remote_run=mock.DEFAULT,
+            _ensure_remote_rsync=mock.DEFAULT,
+            rsync_up=mock.DEFAULT,
+            _run_container_mode=mock.Mock(return_value=0),
+            rsync_down=mock.DEFAULT,
+        ),
     ):
         with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
             brev.run(app, fn, [], {}, instance="box")
@@ -2672,7 +2770,8 @@ def test_apply_on_finish_warns_on_nonzero_exit(capsys):
 
     out = capsys.readouterr().out
     assert "exited 1" in out
-    assert "check `brev ls`" in out
+    assert "still be billing" in out
+    assert "Check: brev ls" in out
     assert "brev api 503" in out
 
 
@@ -2710,7 +2809,8 @@ def test_apply_on_finish_warns_on_subprocess_exception(capsys):
 
     out = capsys.readouterr().out
     assert "RuntimeError" in out
-    assert "check `brev ls`" in out
+    assert "still be billing" in out
+    assert "Check: brev ls" in out
 
 
 def test_verify_post_action_state_warns_when_delete_still_present(capsys):
@@ -2745,7 +2845,7 @@ def test_run_native_builds_expected_remote_cmd(tmp_path):
         recorded["run_cmd"] = cmd
         return mock.Mock(returncode=0)
 
-    with mock.patch("runplz.backends.ssh_common._ssh", fake_sh_ssh):
+    with mock.patch("runplz.backends.ssh_common.ssh_exec", fake_sh_ssh):
         with mock.patch("runplz.backends.ssh_common.subprocess.run", fake_sub_run):
             rc = brev._run_native(
                 target="box",
@@ -2775,7 +2875,7 @@ def test_run_native_cpu_index_url(tmp_path):
     def fake_ssh(i, c, **kw):
         recorded.setdefault("setup", c)
 
-    with mock.patch("runplz.backends.ssh_common._ssh", fake_ssh):
+    with mock.patch("runplz.backends.ssh_common.ssh_exec", fake_ssh):
         with mock.patch(
             "runplz.backends.ssh_common.subprocess.run",
             return_value=mock.Mock(returncode=0),
@@ -2810,7 +2910,7 @@ def test_run_container_mode_builds_expected_remote_cmd(tmp_path):
         recorded["run"] = cmd
         return mock.Mock(returncode=0)
 
-    with mock.patch("runplz.backends.ssh_common._ssh", fake_ssh):
+    with mock.patch("runplz.backends.ssh_common.ssh_exec", fake_ssh):
         with mock.patch("runplz.backends.ssh_common.subprocess.run", fake_sub_run):
             rc = brev._run_container_mode(
                 target="box",
@@ -2822,3 +2922,72 @@ def test_run_container_mode_builds_expected_remote_cmd(tmp_path):
     assert rc == 0
     assert "pip install --quiet pandas" in recorded["ops"]
     assert "runplz._bootstrap" in recorded["run"][-1]
+
+
+# ---------------------------------------------------------------------------
+# brev runs on the shared dispatch core
+
+
+@pytest.mark.parametrize(
+    "cfg_kwargs,expect",
+    [
+        ({"mode": "container"}, "container"),
+        ({"mode": "vm", "use_docker": True}, "docker"),
+        ({"mode": "vm", "use_docker": False}, "native"),
+        # mode="container" + use_docker=False is rejected by BrevConfig
+        # itself, so there is no fourth case to map.
+    ],
+)
+def test_dispatch_mode_maps_brev_config_onto_the_shared_runner(cfg_kwargs, expect):
+    assert brev.dispatch_mode(BrevConfig(**cfg_kwargs)) == expect
+
+
+def test_brev_run_goes_through_the_shared_dispatch(tmp_path):
+    """brev must not keep a private copy of the dispatch sequence."""
+    cfg = BrevConfig(mode="vm", use_docker=True, on_finish="leave")
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+
+    with mock.patch.multiple(
+        "runplz.backends.brev",
+        _require_brev_cli=mock.DEFAULT,
+        _skip_onboarding=mock.DEFAULT,
+        _instance_exists=mock.Mock(return_value=True),
+        _refresh_ssh=mock.DEFAULT,
+        _apply_on_finish=mock.DEFAULT,
+    ):
+        with mock.patch.object(brev, "run_on_provisioned_vm", return_value=None) as shared_mock:
+            brev.run(app, fn, [], {}, instance="box")
+
+    kwargs = shared_mock.call_args.kwargs
+    assert kwargs["backend"] == "brev"
+    assert kwargs["label"] == "box"
+    assert kwargs["mode"] == "docker"
+    assert kwargs["ssh_ready_wait_seconds"] == cfg.ssh_ready_wait_seconds
+    # Brev's own provisioning and teardown ride in as callables.
+    assert callable(kwargs["provision"])
+    assert callable(kwargs["teardown"])
+    assert callable(kwargs["refresh_callback"])
+
+
+def test_brev_teardown_runs_even_when_provisioning_fails(tmp_path):
+    """Issue #29: a create that dies after allocating still leaks a billed box."""
+    cfg = BrevConfig(auto_create_instances=True, mode="vm", on_finish="delete")
+    app = _app(tmp_path, cfg=cfg)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
+
+    finished = []
+
+    with mock.patch.multiple(
+        "runplz.backends.brev",
+        _require_brev_cli=mock.DEFAULT,
+        _skip_onboarding=mock.DEFAULT,
+        _instance_exists=mock.Mock(return_value=False),
+        _refresh_ssh=mock.DEFAULT,
+        _create_instance=mock.Mock(side_effect=RuntimeError("provider exploded")),
+        _apply_on_finish=lambda *, instance, cfg: finished.append(instance),
+    ):
+        with pytest.raises(RuntimeError, match="provider exploded"):
+            brev.run(app, fn, [], {}, instance="box")
+
+    assert finished == ["box"], "teardown must still fire when provisioning fails"

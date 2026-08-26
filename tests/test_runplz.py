@@ -17,7 +17,7 @@ from runplz import App, BrevConfig, Image, ModalConfig
 from runplz.backends.brev import (
     _brev_gpu_name,
     _pick_instance_type,
-    _render_ops_script,
+    render_image_ops_script,
 )
 
 # ---- Image DSL rendering --------------------------------------------------
@@ -74,7 +74,7 @@ def test_render_dockerfile_requires_from_registry():
 
 
 def test_render_ops_script_uses_shlex_quote_for_packages():
-    script = _render_ops_script(_sample_image())
+    script = render_image_ops_script(_sample_image())
     # Each op becomes a semicolon-joined bash line. Version specifiers
     # with shell metacharacters must be single-quoted by shlex.quote.
     assert "'pandas>=2.0'" in script
@@ -82,7 +82,7 @@ def test_render_ops_script_uses_shlex_quote_for_packages():
     assert 'pip install --quiet -e "$HOME/runplz-repo"' in script
 
 
-# `_render_ops_script` is never reached with a Dockerfile image — the
+# `render_image_ops_script` is never reached with a Dockerfile image — the
 # Function-level validator in runplz.app rejects that combo at decoration
 # time (see test_function_rejects_dockerfile_image_on_container_mode below).
 
@@ -593,7 +593,7 @@ def test_bind_rejects_unknown_backend():
     def train():
         pass
 
-    with pytest.raises(ValueError, match="must be 'local', 'brev', 'modal', or 'ssh'"):
+    with pytest.raises(ValueError, match="backend must be one of"):
         app.bind("k8s")
 
 
@@ -610,7 +610,7 @@ def test_bind_rejects_instance_on_non_brev_backend():
     def train():
         pass
 
-    with pytest.raises(ValueError, match="only applies to backend='brev'"):
+    with pytest.raises(ValueError, match="only applies to the brev backend"):
         app.bind("local", instance="stray-box")
 
 
@@ -621,7 +621,7 @@ def test_bind_rejects_no_build_on_non_local_backend():
     def train():
         pass
 
-    with pytest.raises(ValueError, match="build=False only applies to backend='local'"):
+    with pytest.raises(ValueError, match="only applies to the local backend"):
         app.bind("brev", instance="b", build=False)
 
 

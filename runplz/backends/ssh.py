@@ -14,33 +14,17 @@ This backend shares all the SSH plumbing with the brev backend via the
 public `runplz.backends.ssh_common` module.
 """
 
-import json
 import re
 import subprocess
-from pathlib import Path
 from typing import Optional
 
+from runplz.backends import docker
 from runplz.backends.ssh_common import (
-    FAILURE_TAIL_LINES,
-    _build_image,
-    _check_preconditions,
-    _ensure_docker,
-    _ensure_remote_rsync,
-    _fetch_failure_tail,
-    _parse_probe_sections,
-    _prepare_remote_run,
-    _remote_has_nvidia,
-    _rsync_down,
-    _run_container_detached,
-    _run_native,
-    _ssh_capture,
-    _ssh_cmd_opts,
-    _stream_and_wait,
-    _wait_until_ssh_reachable,
-    build_remote_run_manifest,
-    make_container_name,
-    make_remote_run_context,
-    rsync_up,
+    dispatch_to_target,
+    parse_probe_sections,
+    ssh_capture,
+    ssh_cmd_opts,
+    wait_until_ssh_reachable,
 )
 
 __all__ = ["run", "list_jobs"]
@@ -50,113 +34,23 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
     cfg = app.ssh_config
     target, port = _build_ssh_target(host, user=cfg.user, port=cfg.port)
 
-    _wait_until_ssh_reachable(target, port=port, max_wait_s=cfg.ssh_ready_wait_seconds)
+    wait_until_ssh_reachable(target, port=port, max_wait_s=cfg.ssh_ready_wait_seconds)
     _warn_on_spec_mismatch(target, function, port=port)
 
-    repo = app._repo_root
-    host_out = (repo / outputs_dir).resolve()
-    host_out.mkdir(parents=True, exist_ok=True)
-    remote_run = make_remote_run_context(
-        backend="ssh",
+    # No teardown: the user owns this box's lifecycle, which is the whole
+    # point of the ssh backend. Everything else is the shared dispatch.
+    dispatch_to_target(
+        app=app,
+        function=function,
+        args=args,
+        kwargs=kwargs,
         target=target,
-        function_name=function.name,
-    )
-    _prepare_remote_run(
-        target,
-        remote_run,
-        manifest=build_remote_run_manifest(
-            remote_run=remote_run,
-            repo=repo,
-            outputs_dir=outputs_dir,
-            args=args,
-            kwargs=kwargs,
-            env=function.env,
-        ),
+        backend="ssh",
+        outputs_dir=outputs_dir,
+        mode="docker" if cfg.use_docker else "native",
+        max_runtime_seconds=cfg.max_runtime_seconds,
         port=port,
     )
-
-    # Make sure rsync is present before we try to upload.
-    _ensure_remote_rsync(target, port=port)
-    rsync_up(repo, target, outputs_dir=outputs_dir, remote_run=remote_run, port=port)
-
-    # Probe declared remote preconditions (issue #56) before bootstrap so a
-    # misprovisioned box (small /dev/shm, full disk, missing GPU) fails fast
-    # instead of wasting paid GPU minutes on a doomed run.
-    _check_preconditions(target, function.preconditions, port=port)
-
-    rel_script = Path(function.module_file).resolve().relative_to(repo)
-
-    container_name: Optional[str] = None
-    exit_code: Optional[int] = None
-    try:
-        if cfg.use_docker:
-            _ensure_docker(target, port=port)
-            gpu_flag = "--gpus all" if _remote_has_nvidia(target, port=port) else ""
-            container_name = make_container_name(function.name)
-            _build_image(target, function.image, remote_run=remote_run, port=port)
-            _run_container_detached(
-                target=target,
-                container_name=container_name,
-                function=function,
-                rel_script=str(rel_script),
-                args=args,
-                kwargs=kwargs,
-                gpu_flag=gpu_flag,
-                app_name=app.name,
-                remote_run=remote_run,
-                port=port,
-            )
-            exit_code = _stream_and_wait(
-                target,
-                container_name,
-                max_runtime_seconds=cfg.max_runtime_seconds,
-                port=port,
-            )
-        else:
-            # Native: can't use Image.from_registry's container env — fall back
-            # to installing python+torch in a venv on the remote. Mirrors
-            # brev's use_docker=False path.
-            exit_code = _run_native(
-                target=target,
-                function=function,
-                rel_script=str(rel_script),
-                args=args,
-                kwargs=kwargs,
-                has_nvidia=_remote_has_nvidia(target, port=port),
-                remote_run=remote_run,
-                max_runtime_seconds=cfg.max_runtime_seconds,
-                port=port,
-            )
-        _rsync_down(target, host_out, remote_run=remote_run, port=port)
-    finally:
-        failure_tail = ""
-        if exit_code is not None and exit_code != 0:
-            failure_tail = _fetch_failure_tail(
-                target=target,
-                container_name=container_name,
-                remote_run=remote_run,
-                port=port,
-            )
-        if container_name is not None:
-            try:
-                _ssh_capture(
-                    target,
-                    f"sudo docker rm -f {container_name} >/dev/null 2>&1 || true",
-                    port=port,
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"+ warning: failed to remove container {container_name}: {exc}", flush=True)
-        # No on_finish for SSH backend: the user owns the box lifecycle.
-
-    if exit_code != 0:
-        msg = f"Remote run exited with status {exit_code}"
-        if failure_tail:
-            msg += (
-                f"\n--- last {FAILURE_TAIL_LINES} lines of remote output ---\n"
-                f"{failure_tail}\n"
-                f"--- end remote output ---"
-            )
-        raise RuntimeError(msg)
 
 
 def list_jobs(*, host: str, user: Optional[str] = None, port: Optional[int] = None) -> list[dict]:
@@ -168,9 +62,10 @@ def list_jobs(*, host: str, user: Optional[str] = None, port: Optional[int] = No
     target, resolved_port = _build_ssh_target(host, user=user, port=port)
     cmd = [
         "ssh",
-        *_ssh_cmd_opts(resolved_port),
+        *ssh_cmd_opts(resolved_port),
         target,
-        "sudo docker ps --filter label=runplz=1 --format '{{json .}}' 2>/dev/null || true",
+        f"sudo docker ps --filter {docker.PS_FILTER} "
+        f"--format '{docker.PS_FORMAT}' 2>/dev/null || true",
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
@@ -178,42 +73,7 @@ def list_jobs(*, host: str, user: Optional[str] = None, port: Optional[int] = No
             f"ssh to {target!r} failed (rc={r.returncode}). "
             f"stderr: {(r.stderr or '').strip()[:300]}"
         )
-    return _parse_remote_docker_ps(r.stdout, target=target)
-
-
-def _parse_remote_docker_ps(stdout: str, *, target: str) -> list[dict]:
-    rows = []
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            raw = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        labels = _parse_docker_labels(raw.get("Labels", ""))
-        rows.append(
-            {
-                "backend": "ssh",
-                "name": f"{target}:{raw.get('Names', '') or raw.get('ID', '')}",
-                "app": labels.get("runplz-app", ""),
-                "function": labels.get("runplz-function", ""),
-                "started": raw.get("CreatedAt", "") or raw.get("RunningFor", ""),
-                "status": raw.get("Status", ""),
-            }
-        )
-    return rows
-
-
-def _parse_docker_labels(labels: str) -> dict:
-    out = {}
-    if not labels:
-        return out
-    for part in labels.split(","):
-        if "=" in part:
-            k, v = part.split("=", 1)
-            out[k.strip()] = v.strip()
-    return out
+    return docker.parse_ps_rows(r.stdout, backend="ssh", name_prefix=f"{target}:")
 
 
 def _build_ssh_target(
@@ -265,7 +125,7 @@ def _warn_on_spec_mismatch(target: str, function, *, port: Optional[int] = None)
     add latency for every dimension.
     """
     try:
-        probe = _ssh_capture(
+        probe = ssh_capture(
             target,
             "echo '---NPROC---'; nproc; "
             "echo '---MEMINFO---'; cat /proc/meminfo 2>/dev/null | head -1; "
@@ -281,7 +141,7 @@ def _warn_on_spec_mismatch(target: str, function, *, port: Optional[int] = None)
         )
         return
 
-    sections = _parse_probe_sections(probe)
+    sections = parse_probe_sections(probe)
     warnings = []
     warnings.extend(_check_cpu(sections.get("NPROC", ""), function))
     warnings.extend(_check_memory(sections.get("MEMINFO", ""), function))

@@ -1,7 +1,7 @@
 """Local-side helpers for the ``runplz tail`` / ``runplz status`` CLI.
 
 Reads the ``run.json`` manifest the orchestrator writes into the local
-outputs dir (via ``_rsync_down``), pulls out the target host + remote
+outputs dir (via ``rsync_down``), pulls out the target host + remote
 meta path, and shells to ``ssh`` to fetch ``last.log`` /
 ``events.ndjson`` / ``heartbeat.ndjson``.
 
@@ -19,13 +19,14 @@ from pathlib import Path
 from typing import Optional
 
 from runplz.backends.ssh_common import (
-    _SAFE_REMOTE_PATH_RE,
     DEFAULT_KILL_TIMEOUT_S,
     KILL_SETTLE_S,
     REMOTE_META_DIRNAME,
     REMOTE_RUNS_DIR,
-    _ssh_cmd_opts,
     build_kill_command,
+    is_safe_run_id,
+    remote_shell_path,
+    ssh_cmd_opts,
 )
 
 META_FILENAME = "run.json"
@@ -33,11 +34,6 @@ META_FILENAME = "run.json"
 # `kill` exit code for "signalled, but something is still alive" - distinct
 # from 0 (stopped) and from ssh / protocol failures.
 KILL_SURVIVED_RC = 3
-
-# Run ids are generated as <ts>-<slug>-<slug>-<hex>, but --run-id is user
-# input and lands inside a remote shell command, so pin it to a charset that
-# cannot break out of the path it is interpolated into.
-_SAFE_RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 class ManifestNotFound(RuntimeError):
@@ -48,7 +44,7 @@ def find_local_manifest(outputs_dir: Path) -> Path:
     """Return the path to the most recent ``run.json`` under ``outputs_dir``.
 
     The orchestrator writes ``<remote_run.out>/.runplz/run.json`` and
-    ``_rsync_down`` brings that into ``<outputs_dir>/.runplz/run.json``. We
+    ``rsync_down`` brings that into ``<outputs_dir>/.runplz/run.json``. We
     only ever have *one* such file locally (rsync overwrites on the next
     run), which is fine — the user wants the most-recent run by default.
     """
@@ -82,7 +78,7 @@ def resolve_target_and_meta(
     if run_id_override:
         if not host_override:
             raise RuntimeError("--run-id requires --host (no manifest lookup possible)")
-        if not _SAFE_RUN_ID_RE.match(run_id_override):
+        if not is_safe_run_id(run_id_override):
             raise RuntimeError(
                 f"--run-id {run_id_override!r} is not a valid run id "
                 f"(letters, digits, dot, dash, underscore only)"
@@ -100,28 +96,6 @@ def resolve_target_and_meta(
             raise RuntimeError("manifest is missing both remote_paths.meta and run_id")
         meta = f"~/{REMOTE_RUNS_DIR}/{run_id}/out/{REMOTE_META_DIRNAME}"
     return (target, meta, manifest)
-
-
-def remote_shell_path(path: str) -> str:
-    """Make a manifest path usable inside a remote shell command.
-
-    The manifest records display paths like ``~/runplz-runs/<id>/out/.runplz``.
-    Tilde expansion happens before any quoting, so a ``~/`` path is literal in
-    both ``'...'`` and ``"..."`` — the file is simply never found. ``$HOME``
-    does expand inside double quotes, so callers can interpolate the result
-    into ``"..."`` and get the directory they meant.
-    """
-    if path.startswith("~/"):
-        path = f"$HOME/{path[2:]}"
-    # The manifest is written on the remote box and rsynced down, so this
-    # string is untrusted input about to be interpolated into a double-quoted
-    # remote shell word -- where $(...) and backticks still run.
-    if not _SAFE_REMOTE_PATH_RE.match(path):
-        raise RuntimeError(
-            f"refusing to use remote path {path!r} from the run manifest: expected "
-            f"an absolute or $HOME-relative path of plain path characters"
-        )
-    return path
 
 
 def tail(
@@ -142,7 +116,7 @@ def tail(
     log_path = remote_shell_path(f"{meta}/last.log")
     flags = "-F" if follow else f"-n {int(lines)}"
     remote_cmd = f'tail {flags} "{log_path}"'
-    cmd = ["ssh", *_ssh_cmd_opts(port), target, remote_cmd]
+    cmd = ["ssh", *ssh_cmd_opts(port), target, remote_cmd]
     return subprocess.run(cmd).returncode
 
 
@@ -169,7 +143,7 @@ def status(
         f"echo '---EVENT_COUNT---'; wc -l < {ev_q} 2>/dev/null || echo 0; "
         f"echo '---END---'"
     )
-    cmd = ["ssh", *_ssh_cmd_opts(port), target, remote_cmd]
+    cmd = ["ssh", *ssh_cmd_opts(port), target, remote_cmd]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         print(f"ssh to {target} failed (rc={r.returncode})")
@@ -205,7 +179,7 @@ def kill(
     run_id = manifest.get("run_id") or run_id_override or ""
     # The manifest is a file on disk; don't let a hand-edited run_id reach the
     # remote shell. It is only used to label the killed_by_user event.
-    if not _SAFE_RUN_ID_RE.match(run_id or ""):
+    if not is_safe_run_id(run_id):
         run_id = ""
     remote_cmd = build_kill_command(
         remote_shell_path(meta),
@@ -214,7 +188,7 @@ def kill(
         escalate=escalate,
         first_signal=first_signal,
     )
-    cmd = ["ssh", *_ssh_cmd_opts(port), target, remote_cmd]
+    cmd = ["ssh", *ssh_cmd_opts(port), target, remote_cmd]
     # The remote side owns the signal/poll/escalate clock; give ssh enough
     # headroom to outlive the worst case rather than cutting it off mid-dance.
     ssh_timeout = timeout_s + KILL_SETTLE_S + 60

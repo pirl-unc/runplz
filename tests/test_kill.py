@@ -419,7 +419,7 @@ def test_container_mode_records_container_name_for_kill():
     remote_run = ssh_common.make_remote_run_context(
         backend="brev", target="box", function_name="train"
     )
-    with mock.patch.object(ssh_common, "_ssh", fake_ssh):
+    with mock.patch.object(ssh_common, "ssh_exec", fake_ssh):
         ssh_common._run_container_detached(
             target="box",
             container_name="runplz-train-abc12345",
@@ -602,7 +602,9 @@ def test_kill_refuses_a_tampered_meta_path_from_the_manifest(tmp_path, capsys):
     )
     rc = _cli.main(["kill", "--outputs-dir", str(tmp_path)])
     assert rc == 2
-    assert "refusing to use remote path" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "refusing to use remote path from the run manifest" in err
+    assert "runplz-probe" in err, "the rejected value should be shown"
 
 
 def test_kill_drops_a_tampered_run_id_from_the_remote_command(tmp_path):
@@ -704,7 +706,7 @@ def test_runtime_cap_stops_only_this_run_when_the_context_is_known():
 
     with mock.patch.object(ssh_common.subprocess, "run", fake_run):
         with pytest.raises(RuntimeError):
-            ssh_common._raise_for_runtime_cap("box", 60, container_name=None, remote_run=remote_run)
+            ssh_common.raise_for_runtime_cap("box", 60, container_name=None, remote_run=remote_run)
     remote_cmd = sent["cmd"][-1]
     assert "pkill" not in remote_cmd
     assert f"{ssh_common.RUN_ID_ENV_VAR}=$runplz_run_id" in remote_cmd
@@ -720,5 +722,5 @@ def test_runtime_cap_falls_back_to_pkill_without_a_run_context():
 
     with mock.patch.object(ssh_common.subprocess, "run", fake_run):
         with pytest.raises(RuntimeError):
-            ssh_common._raise_for_runtime_cap("box", 60, container_name=None)
+            ssh_common.raise_for_runtime_cap("box", 60, container_name=None)
     assert "pkill" in sent["cmd"][-1]

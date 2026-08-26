@@ -1,3 +1,134 @@
+## 2026-08-26 PR Plan — Direct GCP / AWS provisioning backends (#25)
+
+Branch: `feat/gcp-aws-backends` (off `main` @ `27fd9c5`)
+
+- [x] Commit 1 — extract the shared VM dispatch + lifecycle core into `ssh_common`
+- [x] Commit 2/3 — `gcp.py` + `GcpConfig`, `aws.py` + `AwsConfig`, both CLI-based
+- [x] Bump `runplz/version.py` to 3.17.0
+- [x] Run `./format.sh`, `./lint.sh`, `./test.sh`
+- [ ] Review the final diff, push, open a PR closing #25, merge, deploy 3.17.0
+
+### The "is there a library for this" question
+
+No third-party one worth taking. Apache Libcloud adds a dependency to a repo whose
+stated scope is stdlib-only, and its GCE accelerator support is weak. SkyPilot/dstack
+sit at runplz's own layer and would subsume it rather than serve it. The abstraction
+worth having was *internal* and already half-present: `ssh.py::run()` and
+`brev.py::run()` duplicated the dispatch core almost line for line. Extracting it once
+means a new cloud is ~150 lines of provision → hand over a target → tear down.
+
+### CLI, not SDK
+
+The issue text suggested `boto3 ec2.run_instances`. Went the other way, because
+`tests/conftest.py` already lists `gcloud` and `aws` in `_BILLED_COMMANDS` behind
+`live_gcp`/`live_aws` markers — an SDK call is invisible to that guard, so a test that
+forgot to mock could launch a real p5.48xlarge. CLI keeps the new code inside the
+existing safety net and the core dependency-free. Added `test_conftest_guard` cases
+proving the guard covers `runplz.backends._cloud`.
+
+### Scope / design
+
+- `dispatch_to_target()` owns its own container cleanup and failure-tail capture,
+  because both must happen before a provisioning caller deletes the box — afterwards
+  the logs are gone.
+- `run_on_provisioned_vm()` opens its try *before* provision so a mid-provision failure
+  still reaches teardown (issue #29), and only tears down if something was allocated.
+- `orchestrator_signal_cleanup` moved up from brev so every provisioning backend gets
+  the SIGTERM/SIGHUP billing-leak protection from #38, not just brev.
+- GCP SSH rides on `gcloud compute config-ssh` — a direct analogue of `brev refresh`,
+  so it plugs into the existing `_wait_until_ssh_reachable` refresh callback with no
+  new ssh plumbing.
+- AWS always sends an explicit block-device-mapping even at the AMI's default size:
+  that is what pins `DeleteOnTermination`, without which `on_finish="delete"` leaves a
+  billed EBS volume and fails the issue's own "deletes VM + disks" criterion.
+- brev.py migrated onto the shared core as well. First cut deferred it (filed #78) on
+  risk grounds; that was wrong — brev is the backend in daily use, so leaving it on a
+  private copy means shared-core fixes never reach the code that matters most, and its
+  2800 lines of tests are the safety net that makes the migration checkable, not a
+  reason to avoid it. -93 lines. Doing it surfaced a real bug in my own extraction:
+  `run_on_provisioned_vm` skipped teardown when provision() raised, which is exactly
+  the billing leak #29 fixed. Teardown is now unconditional.
+
+### Unification pass
+
+After brev moved onto the shared core, kept going through the rest of the
+per-backend duplication:
+
+- **`_docker.py`** — container labels were string literals in four files (written in
+  `local.py` + `ssh_common.py`, read back in `local.py` + `ssh.py`), so a rename would
+  have silently broken `runplz ps` rather than failing anything. Producer and consumer
+  now share constants; the two near-identical `docker ps` row parsers and the
+  verbatim-duplicated label parser collapse into one.
+- **`config.py`** — one `_validate_remote_common` backs all four remote configs instead
+  of three copies of the same three checks.
+- **`_cloud.py`** — owns instance naming for every provisioning backend, both halves.
+  `make_instance_name` / `split_instance_name` are inverses that must agree (ps reads
+  app/function back out of a name) and were 200 lines apart in a brev-only file.
+- **`apply_teardown()`** — brev, gcp and aws each restated the same billing-safety
+  contract (leave = nothing; never raise, it runs in a finally; never fail quietly,
+  a silent teardown is a box that bills). One implementation owns the rules; each
+  backend supplies only its provider's command. brev keeps its retries and
+  post-action verification inside its own action callable.
+- **`_registry.py`** — adding a backend meant editing five places that had to agree
+  (bind validator, argparse choices, `_dispatch` if-chain, ps tuple, ps if-chain).
+  Now one entry.
+
+Net: ssh/gcp/aws are 7-9 functions each. brev's remaining 30 are all genuinely
+`brev`-CLI vocabulary — ls/create/start/refresh, search-row parsing, onboarding,
+terminal states, instance-type picking.
+
+**Stopped short of** merging `brev._brev_capture` into `_cloud.run_cli`. The retry
+*loop* is common but the *classification* is not — brev's transient/non-retriable
+patterns are Brev-API-specific (issue #62's org/config gaps), and GCP quota errors
+and AWS throttling look nothing like them. The contracts differ too: `_brev_capture`
+returns a CompletedProcess for the caller to inspect, `run_cli` raises. Extracting
+just the loop would be a thin win wrapped around the most heavily-tested code path in
+the repo. Filed as a follow-up rather than forced.
+
+### Making the shared layer public
+
+The unified modules were private (`_cloud`, `_docker`, `_registry`) and much of the
+shared contract sat behind underscores, which was the wrong signal: a backend is
+*expected* to be written against this layer.
+
+- Modules renamed with semantic names: `_docker` -> `backends.docker`,
+  `_cloud` -> `backends.provisioning` (brev provisions too, so "cloud" was wrong),
+  `_registry` -> `backends.registry`.
+- Promoted the 13 ssh_common names other modules actually call:
+  `wait_until_ssh_reachable`, `ssh_exec`, `ssh_capture`, `ssh_cmd_opts`, `run_local`,
+  `rsync_down`, `rsync_ssh_transport`, `parse_probe_sections`, `container_running`,
+  `raise_for_runtime_cap`, `render_image_ops_script`, `CLEANUP_SIGNALS`,
+  `validate_remote_path`. No compat aliases — every reference was updated.
+- `remote_shell_path` moved from `_runs` into `ssh_common` alongside
+  `validate_remote_path` / `validate_run_id` / `is_safe_run_id`. `_runs` was reaching
+  across a module line for two regexes; now it calls functions.
+- Every shared module declares an explicit `__all__` grouped by purpose.
+
+**What stayed private, deliberately.** The staging/streaming helpers
+(`_prepare_remote_run`, `_build_image`, `_run_container_detached`, `_stream_and_wait`,
+`_run_native`, `_check_preconditions`, ...) are internals of `dispatch_to_target`.
+`dispatch_to_target` *is* the contract; a backend should never need to reach past it.
+`tests/test_public_api.py` pins both halves: nothing exported may be private, and
+those internals may not appear in `__all__`.
+
+One behavior change fell out: rejecting a tampered manifest path now raises
+`ValueError` (the accurate type) rather than `RuntimeError`, so the three CLI
+handlers catch both. The message got better in the process — it names where the bad
+value came from.
+
+### Review section
+
+- All flags were validated offline against the installed CLIs (`gcloud compute
+  instances create --help`, `aws ec2 run-instances help`) before being emitted —
+  caught `--subnet` vs `--subnetwork` without touching either cloud account.
+- Running `dry_run=True` end to end caught a real bug: gcp's teardown was missing the
+  flag and **actually invoked `gcloud compute instances delete`** during a dry run. It
+  failed only because the local auth token happened to be stale. Fixed, plus a test per
+  backend asserting `subprocess.run` is never called in dry-run.
+- `./format.sh` and `./lint.sh` pass. `./test.sh` passes (`577 passed`, 93% coverage),
+  55 of them new.
+- No live cloud calls at any point. Nothing was provisioned and nothing was billed.
+
 ## 2026-08-26 PR Plan — Sweep of #75 / #72 / #67 (kill + packaging)
 
 Branch: `feat/runplz-kill-and-packaging-fixes` (off `main` @ `102cc11`)

@@ -33,7 +33,8 @@ import sys
 import typing
 from pathlib import Path
 
-from runplz.app import _repo_root_for
+from runplz.app import _VALID_BACKENDS, _repo_root_for
+from runplz.backends import registry
 
 
 def main(argv=None):
@@ -60,7 +61,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(
         prog="runplz", description="Run a Python @app.function on a chosen backend."
     )
-    p.add_argument("backend", choices=["local", "brev", "modal", "ssh"])
+    p.add_argument("backend", choices=list(_VALID_BACKENDS))
     p.add_argument("script", help="Path to a job script defining an App with @local_entrypoint.")
     p.add_argument(
         "--outputs-dir",
@@ -104,29 +105,31 @@ def main(argv=None):
 
     app = _load_app(script_path)
 
-    # repo_root = git root or script's parent
-    app._repo_root = _repo_root_for(script_path)
-    app._backend = args.backend
-    app._backend_kwargs = {"outputs_dir": args.outputs_dir}
-
-    if args.backend == "brev":
-        # args.instance can legitimately be None now — triggers ephemeral mode.
-        app._backend_kwargs["instance"] = args.instance
-    elif args.instance:
-        p.error(f"--instance only applies to the brev backend (got {args.backend!r}).")
-    if args.backend == "ssh":
-        if not args.host:
-            p.error("--host is required for the ssh backend")
-        app._backend_kwargs["host"] = args.host
-    elif args.host:
-        p.error(f"--host only applies to the ssh backend (got {args.backend!r}).")
-    if args.no_build:
-        if args.backend != "local":
-            p.error(f"--no-build only applies to the local backend (got {args.backend!r}).")
-        app._backend_kwargs["build"] = False
-
+    # Before binding: bind() would reject a function-less script with a
+    # generic message, and this one names the script and says what to add.
     if app._entrypoint is None:
         _install_default_entrypoint_or_error(app, script_path, p.error)
+
+    # The CLI binds through App.bind() rather than reimplementing it. It used
+    # to set app._backend by hand with its own copy of the validation, and
+    # that copy drifted: it never learned that gcp/aws require a config, so
+    # `runplz gcp job.py` with no GcpConfig died on an AttributeError deep in
+    # the driver instead of saying what was missing.
+    try:
+        app.bind(
+            args.backend,
+            instance=args.instance,
+            host=args.host,
+            outputs_dir=args.outputs_dir,
+            build=not args.no_build,
+            # The CLI knows the script being run, which beats the module a
+            # function happens to be defined in — and hands bind() the answer
+            # rather than making it shell out to git a second time.
+            repo_root=_repo_root_for(script_path),
+        )
+    except (ValueError, RuntimeError) as exc:
+        p.error(str(exc))
+
     entrypoint_kwargs = _parse_entrypoint_args(app._entrypoint, entrypoint_argv, p.error)
 
     # Resolve the log path relative to the same outputs-dir we'll hand to
@@ -325,7 +328,9 @@ def _load_app(script_path: Path):
     return apps[0]
 
 
-_PS_BACKENDS = ("local", "brev", "modal")
+# Which backends `runplz ps` can enumerate is a property of each backend,
+# declared once in runplz.backends.registry.
+_PS_BACKENDS = registry.ps_names()
 
 
 def _ps_main(argv):
@@ -384,19 +389,7 @@ def _ps_main(argv):
 
 
 def _collect_backend_jobs(backend: str) -> list[dict]:
-    if backend == "local":
-        from runplz.backends import local as local_backend
-
-        return local_backend.list_jobs()
-    if backend == "brev":
-        from runplz.backends import brev as brev_backend
-
-        return brev_backend.list_jobs()
-    if backend == "modal":
-        from runplz.backends import modal as modal_backend
-
-        return modal_backend.list_jobs()
-    raise ValueError(f"unknown backend: {backend}")
+    return registry.load(backend).list_jobs()
 
 
 def _print_ps_table(rows: list[dict]) -> None:
@@ -448,7 +441,7 @@ def _tail_main(argv):
     except _runs.ManifestNotFound as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
@@ -471,7 +464,7 @@ def _status_main(argv):
     except _runs.ManifestNotFound as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
@@ -527,7 +520,7 @@ def _kill_main(argv, *, prog="kill"):
     except _runs.ManifestNotFound as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 

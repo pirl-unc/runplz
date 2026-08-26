@@ -19,8 +19,9 @@ def test_app_dispatch_rejects_unknown_backend():
     def fn():
         pass
 
-    app._backend = "k8s"  # not one of local/brev/modal
-    with pytest.raises(ValueError, match="Unknown backend"):
+    app._backend = "k8s"  # not a registered backend
+    # Same message bind() gives — one registry, one wording.
+    with pytest.raises(ValueError, match="backend must be one of"):
         fn.remote()
 
 
@@ -86,3 +87,45 @@ def test_image_pip_install_local_dir_non_editable():
     # Non-editable install uses the argv-form without "-e".
     assert '"pip", "install", "--no-cache-dir", "/workspace"' in df
     assert '"-e"' not in df
+
+
+# ---------------------------------------------------------------------------
+# the backend registry is the single source of truth
+
+
+def test_registry_backs_every_parallel_backend_list():
+    """These used to be three hand-maintained tuples that had to agree."""
+    from runplz import _cli
+    from runplz.app import _VALID_BACKENDS
+    from runplz.backends import registry
+
+    assert _VALID_BACKENDS == registry.names()
+    assert _cli._PS_BACKENDS == registry.ps_names()
+    assert set(registry.ps_names()) <= set(registry.names())
+    assert set(registry.provisioning_names()) <= set(registry.names())
+
+
+def test_every_registered_backend_is_importable_and_runnable():
+    from runplz.backends import registry
+
+    for name in registry.names():
+        if name == "modal":
+            continue  # optional extra; may not be installed
+        module = registry.load(name)
+        assert callable(module.run), name
+
+
+def test_every_ps_backend_exposes_list_jobs():
+    from runplz.backends import registry
+
+    for name in registry.ps_names():
+        if name == "modal":
+            continue
+        assert callable(registry.load(name).list_jobs), name
+
+
+def test_registry_rejects_an_unknown_backend():
+    from runplz.backends import registry
+
+    with pytest.raises(ValueError, match="backend must be one of"):
+        registry.get("k8s")

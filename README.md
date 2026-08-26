@@ -163,6 +163,35 @@ Either way, `.remote()` serializes a minimal dispatch (env vars + a
 path to your script) and runs on the selected backend. Args and
 kwargs must be JSON-serializable.
 
+#### What a backend actually is
+
+Very little. Everything a run does on a remote box — staging the repo,
+probing preconditions, building/running the container, streaming output,
+collecting outputs, capturing a failure tail, removing the container — is
+one shared path in `ssh_common.dispatch_to_target`. Provisioning backends
+wrap it in `run_on_provisioned_vm`, which handles the signal traps and the
+always-runs teardown that stop a killed orchestrator from leaking a billed
+box.
+
+So a backend is only its own provider vocabulary:
+
+| shared | per-backend |
+|---|---|
+| `backends.ssh_common` — dispatch, streaming, outputs, failure tails, remote-path validation | how to create a machine |
+| `backends.docker` — container labels and `docker ps` parsing | how to reach it over ssh |
+| `backends.provisioning` — instance naming, GPU-shape lookup, teardown contract | how to tear it down |
+| `backends.registry` — what backends exist and what each accepts | which shapes that provider sells |
+| `config` — field validation shared by every remote config | |
+
+These are public modules with explicit `__all__`s, not private helpers: a
+backend is *expected* to be written against them. `ssh_common.dispatch_to_target`
+is the contract; the staging and streaming helpers it calls internally stay
+private, because a backend should never need to reach past it.
+
+That is why `gcp.py` and `aws.py` are a couple of hundred lines each, and
+why adding another provider is mostly a table of machine types plus three
+functions.
+
 ### Decorators you'll use
 
 - **`@app.function(image=..., gpu=..., ...)`** — marks a function as
@@ -352,6 +381,83 @@ otherwise select them:
 `.env`, `.env.local`, `.env.*.local`, `.env.production`, `.env.development`, `*.pem`, `*.key`, `id_rsa`, `id_rsa.*`, `id_ed25519`, `id_ed25519.*`, `credentials.json`, `.aws`, `.ssh`, `.netrc`, `.git-credentials`
 
 If you *need* a secret inside the remote environment, inject it via `@app.function(env={"X": ...})` or Modal Secrets rather than by relaxing this list.
+
+### GcpConfig
+
+`App(..., gcp_config=GcpConfig(...))`, then `runplz gcp jobs/train.py` or
+`app.bind("gcp")`. runplz creates a GCE VM sized to your function, runs the
+job on it, and deletes it — there is no instance name to pass, because it
+makes one.
+
+```python
+from runplz import App, GcpConfig, Image
+
+app = App("vision", gcp_config=GcpConfig(project="my-proj", zone="us-central1-a"))
+
+@app.function(image=Image.from_registry("pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime"),
+              gpu="A100-80GB", min_gpus=8, min_disk=500)
+def train():
+    ...
+```
+
+`gpu=` / `min_gpus` / `min_gpu_memory` pick the machine type
+(`a2-ultragpu-8g` above); pass `machine_type=` to override. Auth is
+whatever `gcloud` already has. SSH rides on `gcloud compute config-ssh`,
+which publishes a `NAME.ZONE.PROJECT` alias — so plain `ssh`/`rsync` work
+and you can ssh to a `on_finish="leave"` box yourself afterwards.
+
+| field | default | notes |
+|---|---|---|
+| `project`, `zone` | **required** | no guessing from your gcloud config: a box billed to the wrong project is worse than an error |
+| `machine_type`, `accelerator` | derived | escape hatch for shapes runplz has no table entry for |
+| `image_family`, `image_project` | Deep Learning VM | ships NVIDIA drivers + docker, so runs don't pay a driver install first |
+| `network`, `subnet` | project default | pinned, never created — runplz opens no firewall rules |
+| `spot` | `False` | cheaper, reclaimable. No retry-on-reclaim yet |
+| `on_finish` | `"delete"` | `"stop"` / `"leave"` also valid |
+| `dry_run` | `False` | print every gcloud command, execute none |
+
+### AwsConfig
+
+`App(..., aws_config=AwsConfig(...))`, then `runplz aws jobs/train.py` or
+`app.bind("aws")`.
+
+```python
+from runplz import App, AwsConfig
+
+app = App("vision", aws_config=AwsConfig(region="us-east-1", key_name="my-key"))
+```
+
+`key_name` is **required** — EC2 gives no way to reach a box without a key
+pair, so runplz refuses to provision one it cannot ssh to. The private half
+must be resolvable by ssh itself: `ssh-add ~/.ssh/my-key.pem`, a default
+`~/.ssh/id_*` name, or an `IdentityFile` entry. runplz takes no key path
+today (see Caveats).
+
+The security group in play must allow inbound TCP 22 from wherever you run
+runplz, or the run will sit in the ssh wait until it times out.
+
+| field | default | notes |
+|---|---|---|
+| `region`, `key_name` | **required** | |
+| `instance_type` | derived | from `gpu=` / `min_gpus`; `g5.12xlarge`, `p5.48xlarge`, … |
+| `ami` | resolved from SSM | Deep Learning AMI. Ids are region-specific and roll monthly, so runplz looks the current one up rather than pinning a stale id |
+| `ssh_user` | `"ubuntu"` | DLAMIs are Ubuntu-based |
+| `subnet_id`, `security_group_id` | account default VPC | pinned, never created |
+| `volume_gb` | `Function.min_disk` | always sent with `DeleteOnTermination`, so `on_finish="delete"` takes the disk too |
+| `spot` | `False` | cheaper, reclaimable. No retry-on-reclaim yet |
+| `on_finish` | `"delete"` | `"stop"` / `"leave"` also valid |
+| `dry_run` | `False` | print every aws command, execute none |
+
+Both drivers shell out to the vendor CLI rather than an SDK: it keeps
+runplz's core dependency-free, and the test suite's billed-command guard
+already covers `gcloud` and `aws`, so a test that forgets to mock cannot
+quietly launch a paid instance.
+
+All four remote backends — `brev`, `ssh`, `gcp`, `aws` — run the same
+dispatch core (`ssh_common.dispatch_to_target`), so staging, preconditions,
+streaming, output collection, failure tails and container cleanup behave
+identically wherever you run. A backend is only its own provisioning and
+teardown.
 
 ### ModalConfig
 
@@ -627,6 +733,15 @@ has, or push to S3 at the end of the function.
   package), so it can live anywhere in the repo.
 - One `App` per script. Multiple `App`s in one file is ambiguous for the
   CLI loader and errors.
+- `AwsConfig` takes no key path. The EC2 key pair's private half must be
+  loaded in your ssh agent or resolvable from `~/.ssh/config`. Threading an
+  identity file through `ssh_common` touches ~50 call sites and belongs in
+  its own change, shared with the ssh/brev/gcp backends.
+- `runplz ps` does not list `gcp` / `aws` jobs yet — that needs a per-cloud
+  query. `runplz tail` / `status` / `kill` work as usual once a run has
+  written its manifest.
+- Spot capacity (`spot=True`) is a plain passthrough on both clouds: if the
+  provider reclaims the box mid-run, the run fails. No retry loop yet.
 
 ## Tests
 

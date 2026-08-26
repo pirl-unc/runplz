@@ -10,55 +10,58 @@ managed SSH config (`brev refresh` populates ~/.brev/ssh_config, which
 ~/.ssh/config Includes).
 """
 
-import contextlib
 import dataclasses
 import json
 import re
-import signal
 import subprocess
 import time
-import uuid
 from pathlib import Path
 from typing import Optional
 
 from runplz._selector import Candidate
+from runplz.backends.provisioning import (
+    CloudCliError,
+    apply_teardown,
+    make_instance_name,
+    split_instance_name,
+)
 from runplz.backends.ssh_common import (
+    CLEANUP_SIGNALS as ssh_common_CLEANUP_SIGNALS,
+)
+
+# brev's dispatch runs through ssh_common.run_on_provisioned_vm, so the
+# staging/run helpers below are no longer called from this module — they are
+# internals of dispatch_to_target now. They stay imported because
+# `runplz.backends.brev.<helper>` has been part of this module's surface
+# since 3.5 and the test suite patches them here.
+from runplz.backends.ssh_common import (  # noqa: F401
     FAILURE_TAIL_LINES,
+    OrchestratorKilled,
     _build_image,
     _check_preconditions,
-    _container_running,
     _ensure_docker,
     _ensure_remote_rsync,
     _fetch_failure_tail,
     _prepare_remote_run,
-    _raise_for_runtime_cap,
     _remote_has_nvidia,
-    _render_ops_script,
-    _rsync_down,
     _run_container_detached,
     _run_container_mode,
     _run_native,
-    _sh,
-    _ssh,
-    _ssh_capture,
     _stream_and_wait,
-    _wait_until_ssh_reachable,
     build_remote_run_manifest,
+    container_running,
     make_container_name,
     make_remote_run_context,
+    orchestrator_signal_cleanup,
+    raise_for_runtime_cap,
+    render_image_ops_script,
+    rsync_down,
     rsync_up,
-)
-
-# Re-exports so older test patches and external code that patched these
-# keep working without a hard rename. 3.8's _brev_capture / _brev_sh
-# replaced `_sh` for brev CLI calls, but tests still patch `brev._sh`
-# in a few places — the re-export keeps the test surface stable.
-_ = (  # noqa: F841 — held for test-mocking compatibility
-    _container_running,
-    _raise_for_runtime_cap,
-    _render_ops_script,
-    _sh,
-    _ssh,
+    run_local,
+    run_on_provisioned_vm,
+    ssh_capture,
+    ssh_exec,
+    wait_until_ssh_reachable,
 )
 
 __all__ = ["run"]
@@ -67,20 +70,11 @@ __all__ = ["run"]
 # Brev instance names must be slug-ish. Lowercase, ASCII, hyphen-separated.
 # Some providers cap names around 30-40 chars; keep the generated part short
 # enough that typical app/function names fit comfortably.
-_BREV_NAME_SAFE_RE = re.compile(r"[^a-z0-9-]+")
-
-
-def _make_ephemeral_name(app_name: str, fn_name: str) -> str:
-    """Generate a Brev-safe instance name for an ephemeral run.
-
-    Shape: ``runplz-<app>-<fn>-<uuid8>``. Trailing uuid makes the name
-    unique per dispatch so two concurrent runs don't collide.
-    """
-
-    def _slug(s: str) -> str:
-        return _BREV_NAME_SAFE_RE.sub("-", s.lower()).strip("-") or "x"
-
-    return f"runplz-{_slug(app_name)}-{_slug(fn_name)}-{uuid.uuid4().hex[:8]}"
+# Instance naming is the shared provisioning contract — see
+# runplz.backends.provisioning. Kept as module-level aliases because both have
+# been part of brev's surface since 3.9 and the tests reach them here.
+_make_ephemeral_name = make_instance_name
+_split_ephemeral_name = split_instance_name
 
 
 # Brev's CLI hangs on an interactive walkthrough once an instance exists in the
@@ -99,58 +93,19 @@ _BREV_ONBOARDING_DONE = {
 # translate to KeyboardInterrupt ourselves too (Python does it by default
 # on the main thread, but installing our handler makes the behavior
 # explicit and consistent across platforms).
-_CLEANUP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+# Signal-driven cleanup lives in ssh_common now, shared with every
+# provisioning backend. These names are kept so existing callers and tests
+# keep working.
+CLEANUP_SIGNALS = ssh_common_CLEANUP_SIGNALS
+_OrchestratorKilled = OrchestratorKilled
+_orchestrator_signal_cleanup = orchestrator_signal_cleanup
 
 
-class _OrchestratorKilled(RuntimeError):
-    """Raised when the runplz orchestrator receives SIGTERM / SIGHUP /
-    SIGINT. Propagates through the dispatch try/finally so _apply_on_finish
-    fires. Issue #38."""
-
-
-@contextlib.contextmanager
-def _orchestrator_signal_cleanup(instance: str):
-    """Install translators that convert termination signals into an
-    exception so brev.run()'s finally block can clean up the Brev box.
-
-    Without this, `kill -TERM <runplz pid>` used to exit cleanly while
-    leaving the freshly-provisioned ephemeral box running — no on_finish
-    action, no remote cleanup. A leaked A100 at $1.49/hr adds up fast.
-
-    Only runs on the main thread (signal.signal is main-thread-only). If
-    called off-main (e.g. from a test runner worker) the handlers aren't
-    installed; cleanup degrades to Ctrl-C only, which is acceptable since
-    signal-driven teardown is a main-process concern anyway.
-    """
-    previous = {}
-
-    def _handler(signum, _frame):
-        signame = signal.Signals(signum).name
-        print(
-            f"+ runplz received {signame} — triggering Brev cleanup for {instance!r}",
-            flush=True,
-        )
-        raise _OrchestratorKilled(
-            f"runplz orchestrator killed by {signame}; "
-            f"running on_finish for {instance!r} before exit."
-        )
-
-    try:
-        for sig in _CLEANUP_SIGNALS:
-            try:
-                previous[sig] = signal.signal(sig, _handler)
-            except (ValueError, OSError):
-                # Not the main thread, or signal not supported on this
-                # platform. Skip — cleanup on that signal is unavailable,
-                # but the rest of dispatch still works.
-                pass
-        yield
-    finally:
-        for sig, prev in previous.items():
-            try:
-                signal.signal(sig, prev)
-            except (ValueError, OSError):
-                pass
+def dispatch_mode(cfg) -> str:
+    """Map BrevConfig's two knobs onto the shared dispatcher's one."""
+    if cfg.mode == "container":
+        return "container"
+    return "docker" if cfg.use_docker else "native"
 
 
 def run(
@@ -187,8 +142,9 @@ def run(
             flush=True,
         )
 
-    # Typo guard (pre-provision): raise BEFORE the try/finally so the
-    # cleanup path doesn't run — we haven't touched any billable state yet.
+    # Typo guard (pre-provision): raise BEFORE handing off to the shared
+    # lifecycle so its teardown doesn't run — we haven't touched any
+    # billable state yet.
     existed = _instance_exists(instance)
     if not existed and not cfg.auto_create_instances:
         raise RuntimeError(
@@ -201,158 +157,51 @@ def run(
             f"--container-image <IMAGE>` (or --type <TYPE> for vm mode)."
         )
 
-    container_name: Optional[str] = None
-    exit_code: Optional[int] = None
-    remote_run = None
-    # Signal handlers: SIGTERM / SIGHUP on the orchestrator used to exit
-    # cleanly without firing the finally's _apply_on_finish, leaking a
-    # billed box (issue #38). Install translators that convert the signal
-    # into a RuntimeError so the finally runs. Original handlers are
-    # restored on exit.
-    with _orchestrator_signal_cleanup(instance):
-        try:
-            # Everything inside this block can leak a billed box if it
-            # raises — widen the scope beyond just the dispatch (issue #29).
-            if not existed:
-                _create_instance(instance, cfg=cfg, image=function.image, function=function)
-            else:
-                # Existing instance — may have been stopped by a previous
-                # run's `on_finish="stop"`. Resume it before SSH.
-                _start_instance_if_stopped(instance)
-            _refresh_ssh()
+    # Refresh callback does two things per invocation:
+    # 1. Runs `brev refresh` so ~/.brev/ssh_config picks up any port
+    #    changes when the instance transitions from the bootstrap-shim
+    #    port to the real one.
+    # 2. Checks `brev ls` for terminal failure states and raises
+    #    BrevInstanceFailed early, so a box stuck in FAILURE / DEAD /
+    #    DEPLOYING_FAILED doesn't burn the full budget.
+    def _poll_refresh_and_check():
+        _refresh_ssh()
+        _check_terminal_state(instance)
 
-            # `brev create` has its own internal wait-for-ready loop, but
-            # on some providers (8-GPU boxes, slow pull of large container
-            # images) that loop times out before SSH is actually reachable.
-            # Poll explicitly with a refresh callback so ssh_common can
-            # re-run `brev refresh` mid-poll when the instance transitions
-            # from bootstrap-shim port to real port.
-            # Refresh callback does two things per invocation:
-            # 1. Runs `brev refresh` so ~/.brev/ssh_config picks up any
-            #    port changes when the instance transitions from the
-            #    bootstrap-shim port to the real one.
-            # 2. Checks `brev ls` for terminal failure states and raises
-            #    BrevInstanceFailed early, so a box stuck in FAILURE /
-            #    DEAD / DEPLOYING_FAILED doesn't burn the full budget.
-            def _poll_refresh_and_check():
-                _refresh_ssh()
-                _check_terminal_state(instance)
+    def provision():
+        if not existed:
+            _create_instance(instance, cfg=cfg, image=function.image, function=function)
+        else:
+            # Existing instance — may have been stopped by a previous run's
+            # `on_finish="stop"`. Resume it before SSH.
+            _start_instance_if_stopped(instance)
+        _refresh_ssh()
+        # Brev publishes its own ssh alias, so the instance name IS the
+        # target and there is no port to pin.
+        return (instance, None)
 
-            _wait_until_ssh_reachable(
-                instance,
-                refresh_callback=_poll_refresh_and_check,
-                max_wait_s=cfg.ssh_ready_wait_seconds,
-            )
+    def teardown():
+        _apply_on_finish(instance=instance, cfg=cfg)
 
-            repo = app._repo_root
-            host_out = (repo / outputs_dir).resolve()
-            host_out.mkdir(parents=True, exist_ok=True)
-            remote_run = make_remote_run_context(
-                backend="brev",
-                target=instance,
-                function_name=function.name,
-            )
-            _prepare_remote_run(
-                instance,
-                remote_run,
-                manifest=build_remote_run_manifest(
-                    remote_run=remote_run,
-                    repo=repo,
-                    outputs_dir=outputs_dir,
-                    args=args,
-                    kwargs=kwargs,
-                    env=function.env,
-                ),
-            )
-
-            if cfg.mode == "container":
-                # Pre-built container images (e.g. pytorch/pytorch) don't
-                # ship with rsync. Install it before the first rsync call.
-                _ensure_remote_rsync(instance)
-            rsync_up(repo, instance, outputs_dir=outputs_dir, remote_run=remote_run)
-
-            # Probe declared remote preconditions (issue #56) before bootstrap.
-            # See ssh_common._check_preconditions for the warn/fail rule.
-            _check_preconditions(instance, function.preconditions)
-
-            rel_script = Path(function.module_file).resolve().relative_to(repo)
-
-            if cfg.mode == "container":
-                exit_code = _run_container_mode(
-                    target=instance,
-                    function=function,
-                    rel_script=str(rel_script),
-                    args=args,
-                    kwargs=kwargs,
-                    remote_run=remote_run,
-                    max_runtime_seconds=cfg.max_runtime_seconds,
-                )
-            elif cfg.use_docker:
-                _ensure_docker(instance)
-                gpu_flag = "--gpus all" if _remote_has_nvidia(instance) else ""
-                container_name = make_container_name(function.name)
-                _build_image(instance, function.image, remote_run=remote_run)
-                _run_container_detached(
-                    target=instance,
-                    container_name=container_name,
-                    function=function,
-                    rel_script=str(rel_script),
-                    args=args,
-                    kwargs=kwargs,
-                    gpu_flag=gpu_flag,
-                    app_name=app.name,
-                    remote_run=remote_run,
-                )
-                exit_code = _stream_and_wait(
-                    instance, container_name, max_runtime_seconds=cfg.max_runtime_seconds
-                )
-            else:
-                # Legacy native path. Skips docker; installs python + torch
-                # + user code into a venv on a plain VM-mode Brev box.
-                exit_code = _run_native(
-                    target=instance,
-                    function=function,
-                    rel_script=str(rel_script),
-                    args=args,
-                    kwargs=kwargs,
-                    has_nvidia=_remote_has_nvidia(instance),
-                    remote_run=remote_run,
-                    max_runtime_seconds=cfg.max_runtime_seconds,
-                )
-            _rsync_down(instance, host_out, remote_run=remote_run)
-        finally:
-            # Fetch a log tail BEFORE container/box cleanup — afterwards
-            # the logs are gone (docker rm wipes container state; brev
-            # stop/delete makes the box unreachable). Only do this on
-            # failure.
-            failure_tail = ""
-            if exit_code is not None and exit_code != 0:
-                failure_tail = _fetch_failure_tail(
-                    target=instance,
-                    container_name=container_name,
-                    remote_run=remote_run,
-                )
-            if container_name is not None:
-                try:
-                    _ssh_capture(
-                        instance,
-                        f"sudo docker rm -f {container_name} >/dev/null 2>&1 || true",
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    print(
-                        f"+ warning: failed to remove container {container_name}: {exc}",
-                        flush=True,
-                    )
-            _apply_on_finish(instance=instance, cfg=cfg)
-    if exit_code != 0:
-        msg = f"Remote run exited with status {exit_code}"
-        if failure_tail:
-            msg += (
-                f"\n--- last {FAILURE_TAIL_LINES} lines of remote output ---\n"
-                f"{failure_tail}\n"
-                f"--- end remote output ---"
-            )
-        raise RuntimeError(msg)
+    # `brev create` has its own wait-for-ready loop, but on some providers
+    # (8-GPU boxes, slow pull of large container images) it returns before
+    # SSH is actually reachable — hence the explicit poll with the refresh
+    # callback above.
+    run_on_provisioned_vm(
+        app=app,
+        function=function,
+        args=args,
+        kwargs=kwargs,
+        backend="brev",
+        label=instance,
+        provision=provision,
+        teardown=teardown,
+        outputs_dir=outputs_dir,
+        mode=dispatch_mode(cfg),
+        max_runtime_seconds=cfg.max_runtime_seconds,
+        ssh_ready_wait_seconds=cfg.ssh_ready_wait_seconds,
+        refresh_callback=_poll_refresh_and_check,
+    )
 
 
 # --- Brev CLI lifecycle --------------------------------------------------
@@ -422,31 +271,6 @@ def _jobs_from_brev_rows(rows: list[dict]) -> list[dict]:
             }
         )
     return jobs
-
-
-def _split_ephemeral_name(name: str) -> tuple[str, str]:
-    """Best-effort reverse of :func:`_make_ephemeral_name`: ``runplz-<app>-<fn>-<uuid8>``.
-
-    The user's app / function names can themselves contain hyphens (they're
-    slugified but hyphens survive), so we can't perfectly unambiguously split.
-    We trim the ``runplz-`` prefix and the trailing uuid, then take the final
-    remaining segment as the function name and everything before it as the app
-    name — the common convention for ephemeral runs. Returns empty strings if
-    the shape doesn't match.
-    """
-    if not name.startswith("runplz-"):
-        return ("", "")
-    core = name[len("runplz-") :]
-    parts = core.split("-")
-    if len(parts) < 3:
-        return ("", "")
-    # Drop the uuid8 suffix.
-    parts = parts[:-1]
-    if len(parts) < 2:
-        return ("", "")
-    fn = parts[-1]
-    app = "-".join(parts[:-1])
-    return (app, fn)
 
 
 def _instance_exists(name: str) -> bool:
@@ -630,7 +454,7 @@ class BrevInstanceFailed(RuntimeError):
 def _check_terminal_state(name: str) -> None:
     """Raise BrevInstanceFailed if `brev ls` reports a terminal failure
     state for this instance. Called periodically during
-    _wait_until_ssh_reachable so we stop probing dead boxes early.
+    wait_until_ssh_reachable so we stop probing dead boxes early.
 
     Silent no-op if status isn't recognizable — the reachability loop
     handles ambiguous cases by timing out normally.
@@ -653,7 +477,7 @@ def _start_instance_if_stopped(name: str) -> None:
 
     The 3.2 default of `on_finish="stop"` means every previous runplz run
     leaves the box powered off — without this, the next run silently hangs
-    in `_wait_until_ssh_reachable` until the 20-minute deadline. Best-
+    in `wait_until_ssh_reachable` until the 20-minute deadline. Best-
     effort: if Brev's schema doesn't expose a status we can recognize, we
     skip and let the SSH reachability loop figure it out (or time out).
     """
@@ -1008,7 +832,7 @@ def _brev_sh(
     retry_waits: tuple = _BREV_DEFAULT_RETRIES,
     label: Optional[str] = None,
 ):
-    """Analogue of `_sh` for brev CLI calls: runs with retries, prints the
+    """Analogue of `run_local` for brev CLI calls: runs with retries, prints the
     command, and raises on final non-zero exit."""
     import shlex as _shlex
 
@@ -1038,39 +862,34 @@ def _refresh_ssh():
 def _apply_on_finish(*, instance: str, cfg) -> None:
     """Stop / delete / leave the Brev box per `cfg.on_finish`.
 
-    Always best-effort: we never want box-cleanup to swallow a real error
-    from the try block. Transient Brev API errors get retries (via
-    _brev_capture) so a single flaky call doesn't leak a billed box;
-    any final failure prints a loud warning and moves on.
+    Runs under the shared teardown contract (see
+    :func:`runplz.backends.provisioning.apply_teardown`): never raises, never fails
+    quietly. Brev adds two things the other providers don't have — retries on
+    transient API errors via :func:`_brev_capture`, so a single flaky call
+    doesn't leak a billed box, and a post-action state check that confirms the
+    box really reached the state we asked for.
     """
-    if cfg.on_finish == "leave":
-        return
-    action = cfg.on_finish  # "stop" or "delete"
-    print(f"+ on_finish={action}: running `brev {action} {instance}`", flush=True)
-    try:
+
+    def _act(action: str) -> None:
+        print(f"+ on_finish={action}: running `brev {action} {instance}`", flush=True)
         r = _brev_capture(
             ["brev", action, instance],
             timeout=120,
             label=f"brev {action} {instance}",
         )
-    except Exception as exc:  # noqa: BLE001
-        print(
-            f"+ warning: `brev {action} {instance}` raised {type(exc).__name__}: {exc}. "
-            f"The box may still be running — check `brev ls`.",
-            flush=True,
-        )
-        return
-    if r.returncode != 0:
-        # Don't raise — we're in a finally block and must not mask the real
-        # error. But DO shout: a silent non-zero here is a billing leak.
-        print(
-            f"+ warning: `brev {action} {instance}` exited {r.returncode}. "
-            f"The box may still be running — check `brev ls`. "
-            f"stderr: {(r.stderr or '').strip()[:500]}",
-            flush=True,
-        )
-        return
-    _verify_post_action_state(action, instance)
+        if r.returncode != 0:
+            raise CloudCliError(
+                f"`brev {action} {instance}` exited {r.returncode}. "
+                f"stderr: {(r.stderr or '').strip()[:500]}"
+            )
+        _verify_post_action_state(action, instance)
+
+    apply_teardown(
+        on_finish=cfg.on_finish,
+        target=instance,
+        run_action=_act,
+        check_hint="brev ls",
+    )
 
 
 # --- Brev instance-type picker -------------------------------------------

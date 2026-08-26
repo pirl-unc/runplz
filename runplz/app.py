@@ -14,8 +14,14 @@ import json
 from pathlib import Path
 from typing import Callable, Optional
 
-from runplz.config import BrevConfig, ModalConfig, SshConfig
+from runplz.backends import registry
+from runplz.config import AwsConfig, BrevConfig, GcpConfig, ModalConfig, SshConfig
 from runplz.image import Image
+
+# What backends exist, and what each accepts, is described once in
+# runplz.backends.registry. Kept as a module-level name because the CLI
+# imports it for argparse `choices`.
+_VALID_BACKENDS = registry.names()
 
 
 class Function:
@@ -127,11 +133,18 @@ class App:
         brev_config: Optional[BrevConfig] = None,
         modal_config: Optional[ModalConfig] = None,
         ssh_config: Optional[SshConfig] = None,
+        gcp_config: Optional[GcpConfig] = None,
+        aws_config: Optional[AwsConfig] = None,
     ):
         self.name = name
         self.brev_config = brev_config or BrevConfig()
         self.modal_config = modal_config or ModalConfig()
         self.ssh_config = ssh_config or SshConfig()
+        # Provisioning clouds have required fields, so they stay None
+        # until the user supplies one. bind() raises a pointed error
+        # rather than constructing an invalid default.
+        self.gcp_config = gcp_config
+        self.aws_config = aws_config
         self.functions: dict[str, Function] = {}
         self._entrypoint: Optional[Callable] = None
 
@@ -191,11 +204,13 @@ class App:
         host: Optional[str] = None,
         outputs_dir: str = "out",
         build: bool = True,
+        repo_root: Optional[Path] = None,
     ) -> "App":
         """Attach a backend to this App from pure Python, no CLI needed.
 
         Args:
-          backend: "local", "brev", "ssh", or "modal".
+          backend: one of `runplz.backends.registry.names()` — currently
+            local, brev, modal, ssh, gcp, aws.
           instance: required for `backend="brev"`; rejected for others.
           host: required for `backend="ssh"`; rejected for others. The
             ssh endpoint (hostname, user@host, or an ssh config alias).
@@ -203,6 +218,10 @@ class App:
           build: local-only. `False` skips `docker build` and reuses the last
             tagged image. Rejected for non-local backends (Brev rebuilds on
             the remote; Modal manages its own layer cache).
+          repo_root: skip the git lookup and use this. The CLI knows the
+            script being run, which is more authoritative than the module a
+            function happens to be defined in — and it saves a second
+            `git rev-parse`.
 
         Use from a `if __name__ == "__main__":` guard in your script:
 
@@ -215,24 +234,32 @@ class App:
         The CLI is preferred for CI/shared scripts; this is for notebooks
         and one-off runs where you already have `app` in scope.
         """
-        if backend not in ("local", "brev", "modal", "ssh"):
-            raise ValueError(f"backend must be 'local', 'brev', 'modal', or 'ssh'; got {backend!r}")
-        # brev accepts instance=None → ephemeral mode (runplz auto-creates
-        # a box sized to the function and deletes it on exit).
-        if backend != "brev" and instance is not None:
+        spec = registry.get(backend)
+        if spec.required_config_attr and getattr(self, spec.required_config_attr) is None:
             raise ValueError(
-                f"instance={instance!r} only applies to backend='brev'; got backend={backend!r}."
+                f"backend={backend!r} needs App(..., {spec.required_config_attr}=...). "
+                f"It provisions a box for you, so it needs to know where: "
+                f"project/zone for gcp, region/key_name for aws."
             )
-        if backend == "ssh" and not host:
-            raise ValueError("host=... is required when backend='ssh'")
-        if backend != "ssh" and host is not None:
+        if instance is not None and not spec.accepts_instance:
             raise ValueError(
-                f"host={host!r} only applies to backend='ssh'; got backend={backend!r}."
+                f"--instance / instance=... only applies to the brev backend "
+                f"(got backend={backend!r})."
             )
-        if backend != "local" and not build:
+        if spec.accepts_host and not host:
             raise ValueError(
-                f"build=False only applies to backend='local' (it skips `docker "
-                f"build`). On backend={backend!r} it would be silently ignored."
+                "the ssh backend needs a host: pass --host <target> on the "
+                "command line, or host=... to App.bind()."
+            )
+        if host is not None and not spec.accepts_host:
+            raise ValueError(
+                f"--host / host=... only applies to the ssh backend (got backend={backend!r})."
+            )
+        if not build and not spec.accepts_no_build:
+            raise ValueError(
+                f"--no-build / build=False only applies to the local backend "
+                f"(it skips `docker build`). On backend={backend!r} it would be "
+                f"silently ignored."
             )
         if not outputs_dir or not str(outputs_dir).strip():
             raise ValueError("outputs_dir must be a non-empty path string.")
@@ -241,15 +268,20 @@ class App:
                 "App.bind() needs at least one @app.function() declared so we "
                 "can locate the script's repo root."
             )
-        any_fn = next(iter(self.functions.values()))
-        self._repo_root = _repo_root_for(Path(any_fn.module_file))
+        if repo_root is not None:
+            self._repo_root = repo_root
+        else:
+            any_fn = next(iter(self.functions.values()))
+            self._repo_root = _repo_root_for(Path(any_fn.module_file))
         self._backend = backend
         self._backend_kwargs = {"outputs_dir": outputs_dir}
-        if backend == "brev":
+        # Which selector each backend takes comes from the registry too, so
+        # this stays right when a backend is added.
+        if spec.accepts_instance:
             self._backend_kwargs["instance"] = instance
-        if backend == "ssh":
+        if spec.accepts_host:
             self._backend_kwargs["host"] = host
-        if backend == "local" and not build:
+        if spec.accepts_no_build and not build:
             self._backend_kwargs["build"] = False
         return self
 
@@ -259,28 +291,12 @@ class App:
                 f"{function.name}.remote(...) was called but no backend is "
                 "selected. runplz Functions dispatch via the `runplz` CLI, "
                 "which binds a backend before invoking @local_entrypoint. "
-                f"Run: `runplz <local|brev|modal> {function.module_file}`. "
+                f"Run: `runplz <{'|'.join(registry.names())}> {function.module_file}`. "
                 f"(For in-process execution without a backend, use "
                 f"{function.name}.local(...) instead.)"
             )
-        backend = self._backend
-        if backend == "local":
-            from runplz.backends import local
-
-            return local.run(self, function, args, kwargs, **self._backend_kwargs)
-        if backend == "brev":
-            from runplz.backends import brev
-
-            return brev.run(self, function, args, kwargs, **self._backend_kwargs)
-        if backend == "modal":
-            from runplz.backends import modal
-
-            return modal.run(self, function, args, kwargs, **self._backend_kwargs)
-        if backend == "ssh":
-            from runplz.backends import ssh
-
-            return ssh.run(self, function, args, kwargs, **self._backend_kwargs)
-        raise ValueError(f"Unknown backend: {backend!r}")
+        module = registry.load(self._backend)
+        return module.run(self, function, args, kwargs, **self._backend_kwargs)
 
 
 def _ensure_json_safe(args, kwargs):
