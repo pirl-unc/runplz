@@ -41,8 +41,13 @@ proving the guard covers `runplz.backends._cloud`.
 - AWS always sends an explicit block-device-mapping even at the AMI's default size:
   that is what pins `DeleteOnTermination`, without which `on_finish="delete"` leaves a
   billed EBS volume and fails the issue's own "deletes VM + disks" criterion.
-- brev.py deliberately NOT migrated onto the shared core — 1200 lines behind 2800 lines
-  of tests, wrong risk trade in a PR adding two backends. Filed as #78.
+- brev.py migrated onto the shared core as well. First cut deferred it (filed #78) on
+  risk grounds; that was wrong — brev is the backend in daily use, so leaving it on a
+  private copy means shared-core fixes never reach the code that matters most, and its
+  2800 lines of tests are the safety net that makes the migration checkable, not a
+  reason to avoid it. -93 lines. Doing it surfaced a real bug in my own extraction:
+  `run_on_provisioned_vm` skipped teardown when provision() raised, which is exactly
+  the billing leak #29 fixed. Teardown is now unconditional.
 
 ### Review section
 

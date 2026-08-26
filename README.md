@@ -424,6 +424,12 @@ runplz's core dependency-free, and the test suite's billed-command guard
 already covers `gcloud` and `aws`, so a test that forgets to mock cannot
 quietly launch a paid instance.
 
+All four remote backends — `brev`, `ssh`, `gcp`, `aws` — run the same
+dispatch core (`ssh_common.dispatch_to_target`), so staging, preconditions,
+streaming, output collection, failure tails and container cleanup behave
+identically wherever you run. A backend is only its own provisioning and
+teardown.
+
 ### ModalConfig
 
 `ModalConfig()` is a no-op today. Modal reads auth from `~/.modal.toml`
