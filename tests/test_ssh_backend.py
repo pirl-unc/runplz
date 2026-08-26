@@ -237,21 +237,26 @@ def test_ssh_run_end_to_end_passes_port_through_to_helpers(tmp_path):
         seen_ports["stream"] = port
         return 0
 
-    with mock.patch.multiple(
-        "runplz.backends.ssh",
-        _wait_until_ssh_reachable=fake_wait,
-        _warn_on_spec_mismatch=mock.DEFAULT,
-        _prepare_remote_run=mock.DEFAULT,
-        _ensure_remote_rsync=mock.DEFAULT,
-        rsync_up=fake_rsync_up,
-        _ensure_docker=mock.DEFAULT,
-        _remote_has_nvidia=mock.Mock(return_value=False),
-        _build_image=fake_build,
-        _run_container_detached=mock.DEFAULT,
-        _stream_and_wait=fake_stream,
-        _ssh_capture=mock.DEFAULT,
-        _rsync_down=mock.DEFAULT,
-        _fetch_failure_tail=mock.DEFAULT,
+    with (
+        mock.patch.multiple(
+            "runplz.backends.ssh",
+            _wait_until_ssh_reachable=fake_wait,
+            _warn_on_spec_mismatch=mock.DEFAULT,
+        ),
+        mock.patch.multiple(
+            "runplz.backends.ssh_common",
+            _prepare_remote_run=mock.DEFAULT,
+            _ensure_remote_rsync=mock.DEFAULT,
+            rsync_up=fake_rsync_up,
+            _ensure_docker=mock.DEFAULT,
+            _remote_has_nvidia=mock.Mock(return_value=False),
+            _build_image=fake_build,
+            _run_container_detached=mock.DEFAULT,
+            _stream_and_wait=fake_stream,
+            _ssh_capture=mock.DEFAULT,
+            _rsync_down=mock.DEFAULT,
+            _fetch_failure_tail=mock.DEFAULT,
+        ),
     ):
         ssh.run(app, fn, [], {}, host="gpu.example.com")
 
@@ -407,20 +412,25 @@ def test_ssh_run_vm_docker_happy_path(tmp_path):
         module_file=_job_inside(tmp_path),
     )
 
-    with mock.patch.multiple(
-        "runplz.backends.ssh",
-        _wait_until_ssh_reachable=mock.DEFAULT,
-        _warn_on_spec_mismatch=mock.DEFAULT,
-        _prepare_remote_run=mock.DEFAULT,
-        _ensure_remote_rsync=mock.DEFAULT,
-        rsync_up=mock.DEFAULT,
-        _ensure_docker=mock.DEFAULT,
-        _remote_has_nvidia=mock.Mock(return_value=True),
-        _build_image=mock.DEFAULT,
-        _run_container_detached=mock.DEFAULT,
-        _stream_and_wait=mock.Mock(return_value=0),
-        _ssh_capture=mock.DEFAULT,
-        _rsync_down=mock.DEFAULT,
+    with (
+        mock.patch.multiple(
+            "runplz.backends.ssh",
+            _wait_until_ssh_reachable=mock.DEFAULT,
+            _warn_on_spec_mismatch=mock.DEFAULT,
+        ),
+        mock.patch.multiple(
+            "runplz.backends.ssh_common",
+            _prepare_remote_run=mock.DEFAULT,
+            _ensure_remote_rsync=mock.DEFAULT,
+            rsync_up=mock.DEFAULT,
+            _ensure_docker=mock.DEFAULT,
+            _remote_has_nvidia=mock.Mock(return_value=True),
+            _build_image=mock.DEFAULT,
+            _run_container_detached=mock.DEFAULT,
+            _stream_and_wait=mock.Mock(return_value=0),
+            _ssh_capture=mock.DEFAULT,
+            _rsync_down=mock.DEFAULT,
+        ),
     ):
         ssh.run(app, fn, [], {}, host="gpu.example.com")
 
@@ -430,16 +440,21 @@ def test_ssh_run_native_happy_path(tmp_path):
     app = _app(tmp_path, cfg)
     fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
 
-    with mock.patch.multiple(
-        "runplz.backends.ssh",
-        _wait_until_ssh_reachable=mock.DEFAULT,
-        _warn_on_spec_mismatch=mock.DEFAULT,
-        _prepare_remote_run=mock.DEFAULT,
-        _ensure_remote_rsync=mock.DEFAULT,
-        rsync_up=mock.DEFAULT,
-        _remote_has_nvidia=mock.Mock(return_value=False),
-        _run_native=mock.Mock(return_value=0),
-        _rsync_down=mock.DEFAULT,
+    with (
+        mock.patch.multiple(
+            "runplz.backends.ssh",
+            _wait_until_ssh_reachable=mock.DEFAULT,
+            _warn_on_spec_mismatch=mock.DEFAULT,
+        ),
+        mock.patch.multiple(
+            "runplz.backends.ssh_common",
+            _prepare_remote_run=mock.DEFAULT,
+            _ensure_remote_rsync=mock.DEFAULT,
+            rsync_up=mock.DEFAULT,
+            _remote_has_nvidia=mock.Mock(return_value=False),
+            _run_native=mock.Mock(return_value=0),
+            _rsync_down=mock.DEFAULT,
+        ),
     ):
         ssh.run(app, fn, [], {}, host="user@gpu.example.com")
 
@@ -451,21 +466,26 @@ def test_ssh_run_nonzero_exit_raises_with_tail(tmp_path):
     app = _app(tmp_path, cfg)
     fn = _function(app, Image.from_registry("ubuntu:22.04"), module_file=_job_inside(tmp_path))
 
-    with mock.patch.multiple(
-        "runplz.backends.ssh",
-        _wait_until_ssh_reachable=mock.DEFAULT,
-        _warn_on_spec_mismatch=mock.DEFAULT,
-        _prepare_remote_run=mock.DEFAULT,
-        _ensure_remote_rsync=mock.DEFAULT,
-        rsync_up=mock.DEFAULT,
-        _ensure_docker=mock.DEFAULT,
-        _remote_has_nvidia=mock.Mock(return_value=False),
-        _build_image=mock.DEFAULT,
-        _run_container_detached=mock.DEFAULT,
-        _stream_and_wait=mock.Mock(return_value=42),
-        _ssh_capture=mock.DEFAULT,
-        _rsync_down=mock.DEFAULT,
-        _fetch_failure_tail=mock.Mock(return_value="KeyError: missing-key"),
+    with (
+        mock.patch.multiple(
+            "runplz.backends.ssh",
+            _wait_until_ssh_reachable=mock.DEFAULT,
+            _warn_on_spec_mismatch=mock.DEFAULT,
+        ),
+        mock.patch.multiple(
+            "runplz.backends.ssh_common",
+            _prepare_remote_run=mock.DEFAULT,
+            _ensure_remote_rsync=mock.DEFAULT,
+            rsync_up=mock.DEFAULT,
+            _ensure_docker=mock.DEFAULT,
+            _remote_has_nvidia=mock.Mock(return_value=False),
+            _build_image=mock.DEFAULT,
+            _run_container_detached=mock.DEFAULT,
+            _stream_and_wait=mock.Mock(return_value=42),
+            _ssh_capture=mock.DEFAULT,
+            _rsync_down=mock.DEFAULT,
+            _fetch_failure_tail=mock.Mock(return_value="KeyError: missing-key"),
+        ),
     ):
         with pytest.raises(RuntimeError) as ei:
             ssh.run(app, fn, [], {}, host="gpu.example.com")

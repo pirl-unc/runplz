@@ -10,11 +10,9 @@ managed SSH config (`brev refresh` populates ~/.brev/ssh_config, which
 ~/.ssh/config Includes).
 """
 
-import contextlib
 import dataclasses
 import json
 import re
-import signal
 import subprocess
 import time
 import uuid
@@ -23,7 +21,11 @@ from typing import Optional
 
 from runplz._selector import Candidate
 from runplz.backends.ssh_common import (
+    _CLEANUP_SIGNALS as ssh_common_CLEANUP_SIGNALS,
+)
+from runplz.backends.ssh_common import (
     FAILURE_TAIL_LINES,
+    OrchestratorKilled,
     _build_image,
     _check_preconditions,
     _container_running,
@@ -46,6 +48,7 @@ from runplz.backends.ssh_common import (
     build_remote_run_manifest,
     make_container_name,
     make_remote_run_context,
+    orchestrator_signal_cleanup,
     rsync_up,
 )
 
@@ -99,58 +102,12 @@ _BREV_ONBOARDING_DONE = {
 # translate to KeyboardInterrupt ourselves too (Python does it by default
 # on the main thread, but installing our handler makes the behavior
 # explicit and consistent across platforms).
-_CLEANUP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
-
-
-class _OrchestratorKilled(RuntimeError):
-    """Raised when the runplz orchestrator receives SIGTERM / SIGHUP /
-    SIGINT. Propagates through the dispatch try/finally so _apply_on_finish
-    fires. Issue #38."""
-
-
-@contextlib.contextmanager
-def _orchestrator_signal_cleanup(instance: str):
-    """Install translators that convert termination signals into an
-    exception so brev.run()'s finally block can clean up the Brev box.
-
-    Without this, `kill -TERM <runplz pid>` used to exit cleanly while
-    leaving the freshly-provisioned ephemeral box running — no on_finish
-    action, no remote cleanup. A leaked A100 at $1.49/hr adds up fast.
-
-    Only runs on the main thread (signal.signal is main-thread-only). If
-    called off-main (e.g. from a test runner worker) the handlers aren't
-    installed; cleanup degrades to Ctrl-C only, which is acceptable since
-    signal-driven teardown is a main-process concern anyway.
-    """
-    previous = {}
-
-    def _handler(signum, _frame):
-        signame = signal.Signals(signum).name
-        print(
-            f"+ runplz received {signame} — triggering Brev cleanup for {instance!r}",
-            flush=True,
-        )
-        raise _OrchestratorKilled(
-            f"runplz orchestrator killed by {signame}; "
-            f"running on_finish for {instance!r} before exit."
-        )
-
-    try:
-        for sig in _CLEANUP_SIGNALS:
-            try:
-                previous[sig] = signal.signal(sig, _handler)
-            except (ValueError, OSError):
-                # Not the main thread, or signal not supported on this
-                # platform. Skip — cleanup on that signal is unavailable,
-                # but the rest of dispatch still works.
-                pass
-        yield
-    finally:
-        for sig, prev in previous.items():
-            try:
-                signal.signal(sig, prev)
-            except (ValueError, OSError):
-                pass
+# Signal-driven cleanup lives in ssh_common now, shared with every
+# provisioning backend. These names are kept so existing callers and tests
+# keep working.
+_CLEANUP_SIGNALS = ssh_common_CLEANUP_SIGNALS
+_OrchestratorKilled = OrchestratorKilled
+_orchestrator_signal_cleanup = orchestrator_signal_cleanup
 
 
 def run(

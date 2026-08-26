@@ -15,10 +15,12 @@ patching `runplz.backends.brev.<name>` continue to work — brev.py
 holds its own module-level reference to the imported function.
 """
 
+import contextlib
 import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import time
 import uuid
@@ -2162,3 +2164,268 @@ def _raise_for_runtime_cap(
 def make_container_name(fn_name: str) -> str:
     """Unique container name, short enough to read in logs."""
     return f"runplz-{fn_name}-{uuid.uuid4().hex[:8]}"
+
+
+# --- Shared VM dispatch + lifecycle --------------------------------------
+#
+# Every backend that ends up with an ssh-reachable box runs the same
+# sequence, and the provisioning ones wrap it in the same try/finally. The
+# pieces below are that shared middle, so a new cloud driver only has to
+# answer three questions: how do I create a box, what target do I hand
+# over, and how do I tear it down.
+
+_CLEANUP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+
+
+class OrchestratorKilled(RuntimeError):
+    """Raised in place of a termination signal so cleanup still runs."""
+
+
+@contextlib.contextmanager
+def orchestrator_signal_cleanup(label: str):
+    """Turn termination signals into an exception so a `finally` can run.
+
+    Without this, `kill -TERM <runplz pid>` exits cleanly while leaving a
+    freshly provisioned box running — no teardown, no on_finish. A leaked
+    8xA100 adds up fast (issue #38).
+
+    Only works on the main thread (``signal.signal`` is main-thread-only).
+    Off-main — a test runner worker, say — the handlers are not installed and
+    cleanup degrades to Ctrl-C, which is acceptable: signal-driven teardown is
+    a main-process concern anyway.
+    """
+    previous = {}
+
+    def _handler(signum, _frame):
+        signame = signal.Signals(signum).name
+        print(
+            f"+ runplz received {signame} — triggering cleanup for {label!r}",
+            flush=True,
+        )
+        raise OrchestratorKilled(
+            f"runplz orchestrator killed by {signame}; cleaning up {label!r} before exit."
+        )
+
+    try:
+        for sig in _CLEANUP_SIGNALS:
+            try:
+                previous[sig] = signal.signal(sig, _handler)
+            except (ValueError, OSError):
+                # Not the main thread, or unsupported on this platform.
+                pass
+        yield
+    finally:
+        for sig, prev in previous.items():
+            try:
+                signal.signal(sig, prev)
+            except (ValueError, OSError):
+                pass
+
+
+@dataclass
+class DispatchResult:
+    """What a dispatch produced, for callers that must clean up after it."""
+
+    exit_code: Optional[int]
+    container_name: Optional[str]
+    remote_run: Optional[RemoteRunContext]
+    failure_tail: str = ""
+
+
+def dispatch_to_target(
+    *,
+    app,
+    function,
+    args: list,
+    kwargs: dict,
+    target: str,
+    backend: str,
+    outputs_dir: str = "out",
+    use_docker: bool = True,
+    max_runtime_seconds: Optional[int] = None,
+    port: Optional[int] = None,
+) -> DispatchResult:
+    """Run one function on an already-reachable box, start to finish.
+
+    Stages the repo, probes preconditions, runs the job (docker or native),
+    streams its output and brings the outputs back. Raises ``RuntimeError``
+    with a log tail if the remote command exited non-zero.
+
+    Owns its own container cleanup and failure-tail capture, because both have
+    to happen before a caller tears the box down — afterwards the logs are
+    gone. Provisioning backends wrap this in their own try/finally for the box
+    itself; see :func:`run_on_provisioned_vm`.
+    """
+    repo = app._repo_root
+    host_out = (repo / outputs_dir).resolve()
+    host_out.mkdir(parents=True, exist_ok=True)
+
+    remote_run = make_remote_run_context(
+        backend=backend,
+        target=target,
+        function_name=function.name,
+    )
+    _prepare_remote_run(
+        target,
+        remote_run,
+        manifest=build_remote_run_manifest(
+            remote_run=remote_run,
+            repo=repo,
+            outputs_dir=outputs_dir,
+            args=args,
+            kwargs=kwargs,
+            env=function.env,
+        ),
+        port=port,
+    )
+
+    # Pre-built images (and minimal cloud images) need not ship rsync.
+    _ensure_remote_rsync(target, port=port)
+    rsync_up(repo, target, outputs_dir=outputs_dir, remote_run=remote_run, port=port)
+
+    # Probe declared preconditions (issue #56) before bootstrap, so a
+    # misprovisioned box fails fast instead of burning paid GPU minutes.
+    _check_preconditions(target, function.preconditions, port=port)
+
+    rel_script = Path(function.module_file).resolve().relative_to(repo)
+
+    container_name: Optional[str] = None
+    exit_code: Optional[int] = None
+    failure_tail = ""
+    try:
+        if use_docker:
+            _ensure_docker(target, port=port)
+            gpu_flag = "--gpus all" if _remote_has_nvidia(target, port=port) else ""
+            container_name = make_container_name(function.name)
+            _build_image(target, function.image, remote_run=remote_run, port=port)
+            _run_container_detached(
+                target=target,
+                container_name=container_name,
+                function=function,
+                rel_script=str(rel_script),
+                args=args,
+                kwargs=kwargs,
+                gpu_flag=gpu_flag,
+                app_name=app.name,
+                remote_run=remote_run,
+                port=port,
+            )
+            exit_code = _stream_and_wait(
+                target,
+                container_name,
+                max_runtime_seconds=max_runtime_seconds,
+                port=port,
+            )
+        else:
+            exit_code = _run_native(
+                target=target,
+                function=function,
+                rel_script=str(rel_script),
+                args=args,
+                kwargs=kwargs,
+                has_nvidia=_remote_has_nvidia(target, port=port),
+                remote_run=remote_run,
+                max_runtime_seconds=max_runtime_seconds,
+                port=port,
+            )
+        _rsync_down(target, host_out, remote_run=remote_run, port=port)
+    finally:
+        # Grab the log tail before the container goes away — `docker rm`
+        # wipes it, and a provisioning caller is about to delete the box.
+        if exit_code is not None and exit_code != 0:
+            failure_tail = _fetch_failure_tail(
+                target=target,
+                container_name=container_name,
+                remote_run=remote_run,
+                port=port,
+            )
+        if container_name is not None:
+            try:
+                _ssh_capture(
+                    target,
+                    f"sudo docker rm -f {container_name} >/dev/null 2>&1 || true",
+                    port=port,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"+ warning: failed to remove container {container_name}: {exc}",
+                    flush=True,
+                )
+
+    result = DispatchResult(
+        exit_code=exit_code,
+        container_name=container_name,
+        remote_run=remote_run,
+        failure_tail=failure_tail,
+    )
+    if exit_code != 0:
+        raise RuntimeError(format_remote_failure(exit_code, failure_tail))
+    return result
+
+
+def format_remote_failure(exit_code: Optional[int], failure_tail: str) -> str:
+    msg = f"Remote run exited with status {exit_code}"
+    if failure_tail:
+        msg += (
+            f"\n--- last {FAILURE_TAIL_LINES} lines of remote output ---\n"
+            f"{failure_tail}\n"
+            f"--- end remote output ---"
+        )
+    return msg
+
+
+def run_on_provisioned_vm(
+    *,
+    app,
+    function,
+    args: list,
+    kwargs: dict,
+    backend: str,
+    label: str,
+    provision: Callable[[], tuple],
+    teardown: Callable[[], None],
+    outputs_dir: str = "out",
+    use_docker: bool = True,
+    max_runtime_seconds: Optional[int] = None,
+    ssh_ready_wait_seconds: int = 1800,
+    refresh_callback: Optional[Callable[[], None]] = None,
+) -> None:
+    """Provision a box, run one function on it, then always tear it down.
+
+    ``provision`` returns ``(target, port)``. ``teardown`` runs in a
+    ``finally`` and must be best-effort: it can never mask the real error from
+    the run, but a silent failure there is a billing leak, so it should shout.
+
+    Anything that raises after ``provision`` has been called leaks a paid box
+    unless teardown runs, which is why the try block opens *before* provision
+    rather than after it (issue #29).
+    """
+    with orchestrator_signal_cleanup(label):
+        provisioned = False
+        try:
+            target, port = provision()
+            provisioned = True
+            _wait_until_ssh_reachable(
+                target,
+                port=port,
+                max_wait_s=ssh_ready_wait_seconds,
+                refresh_callback=refresh_callback,
+            )
+            dispatch_to_target(
+                app=app,
+                function=function,
+                args=args,
+                kwargs=kwargs,
+                target=target,
+                backend=backend,
+                outputs_dir=outputs_dir,
+                use_docker=use_docker,
+                max_runtime_seconds=max_runtime_seconds,
+                port=port,
+            )
+        finally:
+            # Only tear down what we actually created. If provision() itself
+            # raised before allocating anything there is nothing to clean up,
+            # and calling teardown would emit a confusing failure.
+            if provisioned:
+                teardown()
