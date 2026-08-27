@@ -16,6 +16,8 @@ ssh wait until it times out.
 
 from runplz.backends.provisioning import (
     AWS_GPUS,
+    AWS_RETRY_POLICY,
+    AWS_TEARDOWN_POLICY,
     CloudCliError,
     apply_teardown,
     gpu_count,
@@ -82,6 +84,7 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
             ),
             label=f"aws ec2 run-instances ({name})",
             timeout=900,
+            policy=AWS_RETRY_POLICY,
             dry_run=cfg.dry_run,
             parse_json=True,
         )
@@ -186,6 +189,7 @@ def resolve_ami(cfg, function) -> str:
         ],
         label="aws ssm get-parameter (resolve AMI)",
         timeout=120,
+        policy=AWS_RETRY_POLICY,
         dry_run=cfg.dry_run,
     )
     if result is None:  # dry-run
@@ -218,6 +222,12 @@ def build_run_instances_command(
         cfg.key_name,
         "--count",
         "1",
+        # Makes RunInstances idempotent for 24h. Without it, a retry after a
+        # launch whose *response* was lost starts a second instance that
+        # nothing tears down — an extra p4d.24xlarge billing forever. The
+        # run name is unique per dispatch, which is exactly the scope wanted.
+        "--client-token",
+        name,
         # runplz tags every instance it makes so a leak is greppable in the
         # console and in Cost Explorer.
         "--tag-specifications",
@@ -318,6 +328,7 @@ def _public_ip(cfg, instance_id: str) -> str:
         ],
         label=f"aws ec2 describe-instances {instance_id}",
         timeout=120,
+        policy=AWS_RETRY_POLICY,
         dry_run=cfg.dry_run,
     )
     if result is None:  # dry-run
@@ -363,6 +374,9 @@ def apply_on_finish(cfg, instance_id, *, name: str) -> None:
             ],
             label=f"aws ec2 {action} {instance_id}",
             timeout=600,
+            # One quick retry for a blip; every second of backoff here is
+            # a second in which a Ctrl-C abandons the terminate.
+            policy=AWS_TEARDOWN_POLICY,
             dry_run=cfg.dry_run,
         )
 

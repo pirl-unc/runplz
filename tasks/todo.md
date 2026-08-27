@@ -1,3 +1,56 @@
+## 2026-08-27 PR Plan — Share the CLI retry loop (#81)
+
+Branch: `feat/shared-cli-retries` (off `main` @ `053ba33`)
+
+- [x] `run_with_retries` + `RetryPolicy`, used by brev, gcp and aws
+- [x] Per-provider transient/non-retriable tables stay per-provider
+- [x] gcp/aws gain retries on create, AMI lookup, describe and teardown
+- [x] Bump `runplz/version.py` to 3.19.0 (3.18.0 went to #82, which merged first)
+- [x] `./format.sh`, `./lint.sh`, `./test.sh`
+- [ ] Review, merge, deploy
+
+### Scope / design
+
+The loop is common; the classification is not. An unclassified failure is neither
+transient nor final — it stops immediately, because retrying an error we don't
+understand is a guess made at the user's expense.
+
+### Code review — 15 findings, all addressed
+
+Two could have cost real money:
+
+- **`run-instances` was retried with no `--client-token`.** A retry after a launch
+  whose *response* was lost starts a second instance that nothing ever tears down.
+  RunInstances is only idempotent with a client token; the run name is now sent as
+  one.
+- **A retried gcp create that already landed leaked the VM.** Attempt 2 returns
+  "already exists", which matched neither table, so `created["ok"]` stayed False and
+  teardown printed "was never created" while the box billed. Handled explicitly now.
+
+And the tables themselves were wrong — written from memory rather than from real CLI
+output. Verified against the actual strings: gcloud prints `Internal error. Please
+try again`, not `internalerror`, and `Quota 'NVIDIA_T4_GPUS' exceeded`, where the two
+words are never adjacent. **The GCP half retried essentially nothing.** Also missing:
+`InvalidInstanceID.NotFound`, the EC2 eventual-consistency error that is the single
+most likely `describe-instances` failure. And a bare `"503"` substring matched an
+instance name containing `503`.
+
+Also: no overall deadline (a hung create went 900s -> 2700s, a hung teardown held the
+process for 30 minutes in a `finally`); teardown backoff widened the window where a
+Ctrl-C abandons the delete (short teardown policy now); `run_cli` stopped printing the
+argv whenever a policy was passed, so the machine type and disk size vanished from the
+log of *successful* runs and appeared only on failure; an empty `waits` fell through to
+a bare `assert`; `retry_waits` was dead configuration; and the tests covered neither
+create path nor the non-retriable branch — the two things the issue's acceptance
+criteria actually named.
+
+### Review section
+
+- `./format.sh`, `./lint.sh` pass. `./test.sh` passes (`679 passed`), 27 in the new file.
+- Classification verified against real gcloud/aws error strings, not invented ones.
+- Suite runtime unchanged.
+- No live cloud calls.
+
 ## 2026-08-27 PR Plan — Thread ssh options, not just a port (#79)
 
 Branch: `feat/ssh-identity-file` (off `main` @ `053ba33`)

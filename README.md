@@ -750,6 +750,10 @@ has, or push to S3 at the end of the function.
   written its manifest.
 - Spot capacity (`spot=True`) is a plain passthrough on both clouds: if the
   provider reclaims the box mid-run, the run fails. No retry loop yet.
+- Provisioning calls retry transient control-plane failures (a 503, a
+  throttle) and give up immediately on the ones that never clear — an
+  exhausted quota, a missing key pair. An error runplz doesn't recognise is
+  treated as final rather than retried on a guess.
 
 ## Tests
 
