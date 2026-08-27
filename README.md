@@ -436,10 +436,7 @@ app = App("vision", aws_config=AwsConfig(region="us-east-1", key_name="my-key"))
 ```
 
 `key_name` is **required** — EC2 gives no way to reach a box without a key
-pair, so runplz refuses to provision one it cannot ssh to. The private half
-must be resolvable by ssh itself: `ssh-add ~/.ssh/my-key.pem`, a default
-`~/.ssh/id_*` name, or an `IdentityFile` entry. runplz takes no key path
-today (see Caveats).
+pair, so runplz refuses to provision one it cannot ssh to.
 
 Point `ssh_key_path` at the private half of that key pair and runplz passes
 it through as `-i` — to ssh *and* to rsync's transport — along with

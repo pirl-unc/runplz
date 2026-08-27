@@ -10,6 +10,7 @@ nothing we expose. If that ever changes (e.g. both grow a shared
 concept like per-App secrets), factor into a `BaseConfig` then.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -174,6 +175,7 @@ class SshConfig:
             raise ValueError(
                 f"SshConfig.port must be a valid TCP port (1-65535) or None; got {self.port!r}."
             )
+        _validate_ssh_key_path("SshConfig", self.ssh_key_path)
         if self.user is not None and not self.user.strip():
             raise ValueError("SshConfig.user must be a non-empty string (or None).")
         _validate_remote_common(
@@ -332,12 +334,34 @@ class AwsConfig:
 
     def __post_init__(self):
         _validate_remote_common("AwsConfig", self, valid_on_finish=_VALID_CLOUD_ON_FINISH)
+        _validate_ssh_key_path("AwsConfig", self.ssh_key_path)
         if not (self.region or "").strip():
             raise ValueError(
                 "AwsConfig.region is required, e.g. AwsConfig(region='us-east-1', "
                 "key_name='my-key'). GPU availability and pricing are "
                 "per-region, so there is no safe default."
             )
+
+
+def _validate_ssh_key_path(cls_name: str, path) -> None:
+    """Reject a key path that ssh will silently ignore.
+
+    `IdentitiesOnly=yes` accompanies `-i`, which is what stops a loaded agent
+    from offering its other keys first — but it also means a typo'd path
+    doesn't fall back to the agent, it just fails with `Permission denied`.
+    On a provisioning backend that surfaces as a 30-minute ssh wait on a
+    billed box, so catch it here instead.
+    """
+    if path is None:
+        return
+    if not str(path).strip():
+        raise ValueError(f"{cls_name}.ssh_key_path must be a non-empty path (or None).")
+    if not os.path.exists(os.path.expanduser(str(path))):
+        raise ValueError(
+            f"{cls_name}.ssh_key_path={path!r} does not exist. runplz passes it "
+            f"to ssh as `-i` with IdentitiesOnly=yes, so a wrong path fails "
+            f"authentication outright rather than falling back to your agent."
+        )
 
 
 def _validate_remote_common(

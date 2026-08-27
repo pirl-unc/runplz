@@ -322,7 +322,7 @@ def test_ps_cli_accepts_host_flag_3_15_1():
             with mock.patch.object(modal, "list_jobs", return_value=[]):
                 with mock.patch.object(ssh_backend, "list_jobs", return_value=[]) as ssh_mock:
                     _cli.main(["ps", "--host", "my.gpu.box"])
-    ssh_mock.assert_called_once_with(host="my.gpu.box")
+    ssh_mock.assert_called_once_with(host="my.gpu.box", port=None, ssh_key_path=None)
 
 
 def test_ps_cli_prints_no_jobs_when_some_backend_succeeds(capsys):
@@ -358,7 +358,7 @@ def test_ps_cli_back_compat_ssh_flag_still_works():
             with mock.patch.object(modal, "list_jobs", return_value=[]):
                 with mock.patch.object(ssh_backend, "list_jobs", return_value=[]) as ssh_mock:
                     _cli.main(["ps", "--ssh", "my.gpu.box"])
-    ssh_mock.assert_called_once_with(host="my.gpu.box")
+    ssh_mock.assert_called_once_with(host="my.gpu.box", port=None, ssh_key_path=None)
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ holds its own module-level reference to the imported function.
 """
 
 import contextlib
+import dataclasses
 import json
 import os
 import re
@@ -55,7 +56,10 @@ __all__ = [
     "rsync_up",
     "rsync_down",
     "rsync_ssh_transport",
+    "rsync_transport_flags",
     "SshOptions",
+    "read_local_ssh_options",
+    "write_local_ssh_options",
     # --- talking to the box ----------------------------------------------
     "ssh_exec",
     "ssh_capture",
@@ -158,6 +162,14 @@ _RSYNC_NOISE_EXCLUDES = (
 # individual session alive during idle stretches (docker image pulls,
 # data downloads, between-epoch pauses).
 SSH_OPTS = [
+    # Ephemeral cloud boxes are a new host key every time, and every probe
+    # runs with BatchMode=yes — which cannot answer OpenSSH's default
+    # "are you sure?" prompt. Without this, a fresh EC2 IP fails host-key
+    # verification on every attempt for the full ssh_ready_wait_seconds
+    # while the instance bills. `accept-new` trusts a *first* sighting only;
+    # a key that later *changes* still fails, which is the point.
+    "-o",
+    "StrictHostKeyChecking=accept-new",
     "-o",
     "ControlMaster=no",
     "-o",
@@ -191,8 +203,6 @@ class SshOptions:
     # agent-loaded or named in a Host block — and a Host block cannot be
     # written in advance because the instance IP does not exist yet.
     identity_file: Optional[str] = None
-    # Escape hatch for anything else, e.g. ("-o", "ProxyJump=bastion").
-    extra_opts: tuple = ()
 
     @classmethod
     def coerce(cls, value) -> "SshOptions":
@@ -219,28 +229,25 @@ class SshOptions:
                 "-o",
                 "IdentitiesOnly=yes",
             ]
-        opts += [str(o) for o in self.extra_opts]
         return opts
 
-    def for_manifest(self) -> dict:
-        """The subset worth recording so `runplz tail/status/kill` can
-        reach the same box later. No secrets — a key *path*, not a key."""
+    def to_dict(self) -> dict:
+        """The subset worth recording so `runplz tail/status/kill` can reach
+        the same box later. Written to a *local* sidecar, never uploaded —
+        see :func:`write_local_ssh_options`."""
         out = {}
         if self.port:
             out["port"] = int(self.port)
         if self.identity_file:
             out["identity_file"] = str(self.identity_file)
-        if self.extra_opts:
-            out["extra_opts"] = [str(o) for o in self.extra_opts]
         return out
 
     @classmethod
-    def from_manifest(cls, data) -> "SshOptions":
+    def from_dict(cls, data) -> "SshOptions":
         data = data or {}
         return cls(
             port=data.get("port"),
             identity_file=data.get("identity_file"),
-            extra_opts=tuple(data.get("extra_opts") or ()),
         )
 
 
@@ -519,6 +526,44 @@ def select_source_paths(repo: Path) -> Optional[tuple[str, ...]]:
     return tuple(paths)
 
 
+LOCAL_SSH_OPTIONS_FILENAME = "ssh.json"
+
+
+def write_local_ssh_options(host_out: Path, ssh_opts=None) -> None:
+    """Record how to reach this box, in a file that never leaves this machine.
+
+    `runplz tail/status/kill` need the port and key to follow a run on a host
+    that isn't in your ssh config — an EC2 box whose IP didn't exist when you
+    wrote it. That belongs beside the run manifest, but *not* inside it: the
+    manifest is heredoc'd onto the remote box, and a key path there would
+    disclose the local username and key filename to a rented, possibly
+    multi-tenant host. The codebase already masks anything env-shaped whose
+    name contains KEY; this keeps the same promise.
+
+    rsync_down does not use --delete, so this survives the outputs sync.
+    """
+    options = SshOptions.coerce(ssh_opts)
+    meta = Path(host_out) / REMOTE_META_DIRNAME
+    meta.mkdir(parents=True, exist_ok=True)
+    path = meta / LOCAL_SSH_OPTIONS_FILENAME
+    recorded = options.to_dict()
+    if not recorded:
+        # Nothing worth saying; don't leave a stale file from an earlier run.
+        if path.exists():
+            path.unlink()
+        return
+    path.write_text(json.dumps(recorded, indent=2, sort_keys=True))
+
+
+def read_local_ssh_options(outputs_dir: Path) -> SshOptions:
+    """Read back what :func:`write_local_ssh_options` recorded, if anything."""
+    path = Path(outputs_dir) / REMOTE_META_DIRNAME / LOCAL_SSH_OPTIONS_FILENAME
+    try:
+        return SshOptions.from_dict(json.loads(path.read_text()))
+    except (OSError, ValueError):
+        return SshOptions()
+
+
 def build_remote_run_manifest(
     *,
     remote_run: RemoteRunContext,
@@ -527,7 +572,6 @@ def build_remote_run_manifest(
     args: list,
     kwargs: dict,
     env: dict[str, Any],
-    ssh_opts: Optional[SshOptions] = None,
 ) -> dict[str, Any]:
     git_state = inspect_local_repo(repo)
     return {
@@ -545,11 +589,6 @@ def build_remote_run_manifest(
         "args": args,
         "kwargs": kwargs,
         "env": _masked_env_for_manifest(env),
-        # How to reach this box again. `runplz tail/status/kill` read it so
-        # they can follow a run on a host that needs a port or a key — an
-        # EC2 box, say, whose IP didn't exist when you wrote your ssh config.
-        # A key *path*, never a key.
-        "ssh_options": SshOptions.coerce(ssh_opts).for_manifest(),
         "remote_paths": {
             "run_root": f"~/{remote_run.run_root_rel}",
             "repo": remote_run.repo_display,
@@ -684,6 +723,18 @@ def rsync_ssh_transport(ssh_opts=None) -> str:
     into argv correctly."""
     parts = ["ssh", *ssh_cmd_opts(ssh_opts)]
     return " ".join(shlex.quote(p) for p in parts)
+
+
+def rsync_transport_flags(ssh_opts=None) -> list:
+    """`-e <ssh ...>` for rsync, or nothing when there is nothing to say.
+
+    A bare `-e ssh ...` on every rsync would be churn with no effect, so the
+    override is only emitted when the options actually differ from ssh's own
+    defaults.
+    """
+    if SshOptions.coerce(ssh_opts) == SshOptions():
+        return []
+    return ["-e", rsync_ssh_transport(ssh_opts)]
 
 
 # --- low-level ssh / sh / rsync ------------------------------------------
@@ -885,12 +936,7 @@ def rsync_up(
     # wiped by the next run. Stale files on the remote are cheap; accidental
     # user-data loss is not.
     selected_paths = select_source_paths(repo)
-    cmd = ["rsync", "-az"]
-    transport = rsync_ssh_transport(ssh_opts)
-    if transport != rsync_ssh_transport(None):
-        # Only override rsync's transport when we actually have something to
-        # say — a port, an identity file, a ProxyJump.
-        cmd += ["-e", transport]
+    cmd = ["rsync", "-az", *rsync_transport_flags(ssh_opts)]
     if selected_paths is not None:
         # --files-from changes rsync's -a implication: recursion must be
         # requested explicitly. NUL delimiters preserve every valid Git path,
@@ -961,12 +1007,7 @@ def rsync_down(
     ssh_opts: Optional[SshOptions] = None,
 ):
     _record_remote_event(target, remote_run, "rsync_down_start", ssh_opts=ssh_opts)
-    cmd = ["rsync", "-az"]
-    transport = rsync_ssh_transport(ssh_opts)
-    if transport != rsync_ssh_transport(None):
-        # Only override rsync's transport when we actually have something to
-        # say — a port, an identity file, a ProxyJump.
-        cmd += ["-e", transport]
+    cmd = ["rsync", "-az", *rsync_transport_flags(ssh_opts)]
     cmd.extend([_remote_out_rsync(target, remote_run), f"{local_out}/"])
     run_local(cmd)
 
@@ -1089,8 +1130,6 @@ def _ensure_docker(target: str, timeout_s: int = 420, *, ssh_opts: Optional[SshO
             *ssh_cmd_opts(ssh_opts),
             "-o",
             "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
             target,
             wait_script,
         ],
@@ -2446,6 +2485,8 @@ def dispatch_to_target(
     host_out = (repo / outputs_dir).resolve()
     host_out.mkdir(parents=True, exist_ok=True)
 
+    write_local_ssh_options(host_out, ssh_opts)
+
     remote_run = make_remote_run_context(
         backend=backend,
         target=target,
@@ -2461,7 +2502,6 @@ def dispatch_to_target(
             args=args,
             kwargs=kwargs,
             env=function.env,
-            ssh_opts=ssh_opts,
         ),
         ssh_opts=ssh_opts,
     )
@@ -2611,7 +2651,15 @@ def run_on_provisioned_vm(
             # box (an EC2 public IP, say) returns them here; otherwise the
             # caller's options stand.
             if provisioned_opts is not None:
-                ssh_opts = SshOptions.coerce(provisioned_opts)
+                # Merge rather than replace: a caller-supplied option the
+                # driver knows nothing about must survive the box's own
+                # details being filled in.
+                learned = SshOptions.coerce(provisioned_opts)
+                base = SshOptions.coerce(ssh_opts)
+                ssh_opts = dataclasses.replace(
+                    base,
+                    **{k: v for k, v in learned.to_dict().items() if v is not None},
+                )
             wait_until_ssh_reachable(
                 target,
                 ssh_opts=ssh_opts,
