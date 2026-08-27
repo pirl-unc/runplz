@@ -1606,7 +1606,7 @@ def test_sigterm_during_dispatch_triggers_on_finish(tmp_path):
     def capture_finish(*, instance, cfg):
         finish_calls.append(instance)
 
-    def fake_stream(instance, container_name, max_runtime_seconds=None, port=None):
+    def fake_stream(instance, container_name, max_runtime_seconds=None, ssh_opts=None):
         # Simulate the orchestrator receiving SIGTERM while the remote
         # training is streaming. Raise the context manager's translated
         # exception — which is what signal.signal's handler would do.

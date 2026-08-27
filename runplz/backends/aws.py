@@ -5,9 +5,9 @@ profile, environment variables, or an SSO/instance role.
 
 EC2 has no `gcloud compute config-ssh` equivalent, so unlike the GCP
 backend there is no alias to lean on: `key_name` is required and the ssh
-target is built from the instance's public IP. The private half of that key
-must already be resolvable by ssh (agent, default name, or an IdentityFile
-entry) — see :class:`runplz.config.AwsConfig`.
+target is built from the instance's public IP. Point
+`AwsConfig.ssh_key_path` at the private half of that key pair; runplz passes
+it to ssh and to rsync's transport.
 
 Networking is pinned, never created. The security group in play must allow
 inbound TCP 22 from wherever runplz is running, or the run will sit in the
@@ -24,7 +24,7 @@ from runplz.backends.provisioning import (
     resolve_gpu_label,
     run_cli,
 )
-from runplz.backends.ssh_common import run_on_provisioned_vm
+from runplz.backends.ssh_common import SshOptions, run_on_provisioned_vm
 
 __all__ = ["run"]
 
@@ -52,9 +52,10 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
             "reach.\n"
             "  - List your key pairs: aws ec2 describe-key-pairs "
             f"--region {cfg.region or '<region>'}\n"
-            "  - Then: AwsConfig(region=..., key_name='my-key')\n"
-            "  - The private half must be loaded in your ssh agent "
-            "(`ssh-add ~/.ssh/my-key.pem`) or resolvable from ~/.ssh/config."
+            "  - Then: AwsConfig(region=..., key_name='my-key', "
+            "ssh_key_path='~/.ssh/my-key.pem')\n"
+            "  - ssh_key_path is optional if the key is already agent-loaded "
+            "or named in your ~/.ssh/config."
         )
 
     name = make_instance_name(app.name, function.name)
@@ -88,7 +89,9 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
         state["instance_id"] = instance_id
         _wait_running(cfg, instance_id)
         ip = _public_ip(cfg, instance_id)
-        return (f"{cfg.ssh_user}@{ip}", None)
+        # The target is only knowable after the box exists, so the options
+        # travel back with it.
+        return (f"{cfg.ssh_user}@{ip}", SshOptions(identity_file=cfg.ssh_key_path))
 
     def teardown():
         apply_on_finish(cfg, state["instance_id"], name=name)

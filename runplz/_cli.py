@@ -354,7 +354,17 @@ def _ps_main(argv):
             "host must be supplied. May be given multiple times (comma-separated)."
         ),
     )
+    p.add_argument(
+        "--ssh-key",
+        help=(
+            "[ssh] Private key for --ssh-host. Needed for a box that is not in "
+            "your ssh config — an EC2 instance, say."
+        ),
+    )
+    p.add_argument("--ssh-port", type=int, help="[ssh] Port for --ssh-host.")
     args = p.parse_args(argv)
+    if args.ssh_port is not None and not (0 < args.ssh_port < 65536):
+        p.error(f"--ssh-port must be a valid TCP port (1-65535); got {args.ssh_port}.")
 
     backends = [args.backend] if args.backend else list(_PS_BACKENDS)
     ssh_hosts = [h.strip() for h in (args.ssh_host or "").split(",") if h.strip()]
@@ -372,7 +382,9 @@ def _ps_main(argv):
         try:
             from runplz.backends import ssh as ssh_backend
 
-            rows.extend(ssh_backend.list_jobs(host=host))
+            rows.extend(
+                ssh_backend.list_jobs(host=host, port=args.ssh_port, ssh_key_path=args.ssh_key)
+            )
             successes += 1
         except Exception as exc:  # noqa: BLE001
             errors.append((f"ssh:{host}", exc))
@@ -435,6 +447,7 @@ def _tail_main(argv):
             outputs_dir=Path(args.outputs_dir).resolve(),
             host_override=args.host,
             run_id_override=args.run_id,
+            ssh_overrides=_ssh_overrides_from_args(args, p.error),
             lines=args.lines,
             follow=args.follow,
         )
@@ -460,6 +473,7 @@ def _status_main(argv):
             outputs_dir=Path(args.outputs_dir).resolve(),
             host_override=args.host,
             run_id_override=args.run_id,
+            ssh_overrides=_ssh_overrides_from_args(args, p.error),
         )
     except _runs.ManifestNotFound as exc:
         print(str(exc), file=sys.stderr)
@@ -513,6 +527,7 @@ def _kill_main(argv, *, prog="kill"):
             outputs_dir=Path(args.outputs_dir).resolve(),
             host_override=args.host,
             run_id_override=args.run_id,
+            ssh_overrides=_ssh_overrides_from_args(args, p.error),
             timeout_s=args.timeout,
             escalate=not args.no_escalate,
             first_signal=args.signal,
@@ -523,6 +538,25 @@ def _kill_main(argv, *, prog="kill"):
     except (RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
+
+
+def _ssh_overrides_from_args(args, fail):
+    """The ssh fields the user pinned on the command line, if any.
+
+    Returned per field rather than as a whole object: `--ssh-key` alone must
+    not discard the port the dispatch recorded, which is what "override"
+    means to anyone reading the help text.
+    """
+    key = getattr(args, "ssh_key", None)
+    port = getattr(args, "ssh_port", None)
+    if port is not None and not (0 < port < 65536):
+        fail(f"--ssh-port must be a valid TCP port (1-65535); got {port}.")
+    overrides = {}
+    if key:
+        overrides["identity_file"] = key
+    if port is not None:
+        overrides["port"] = port
+    return overrides
 
 
 def _add_run_lookup_args(parser):
@@ -538,6 +572,19 @@ def _add_run_lookup_args(parser):
     parser.add_argument(
         "--run-id",
         help="Pin to a specific remote run_id instead of the most recent. Requires --host.",
+    )
+    parser.add_argument(
+        "--ssh-key",
+        help=(
+            "Private key to authenticate with. Defaults to whatever the run's "
+            "manifest recorded, so this is only needed when following a run "
+            "by --host/--run-id with no local manifest."
+        ),
+    )
+    parser.add_argument(
+        "--ssh-port",
+        type=int,
+        help="SSH port. Defaults to the run manifest's, then ssh's own default.",
     )
 
 

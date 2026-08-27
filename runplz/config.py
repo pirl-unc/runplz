@@ -10,6 +10,7 @@ nothing we expose. If that ever changes (e.g. both grow a shared
 concept like per-App secrets), factor into a `BaseConfig` then.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -149,6 +150,10 @@ class SshConfig:
     # Optional ssh port. When None, ssh's default (22 or whatever the user's
     # config sets).
     port: Optional[int] = None
+    # Private key to authenticate with. None → ssh's own resolution (agent,
+    # ~/.ssh/id_*, or an IdentityFile entry). Set it when the box uses a
+    # key that ssh would not otherwise offer.
+    ssh_key_path: Optional[str] = None
     # True (default): build/pull a docker image on the remote and `docker
     # run` the bootstrap. Mirrors BrevConfig(mode="vm", use_docker=True).
     # False: install a python venv on the remote and run the bootstrap
@@ -170,6 +175,7 @@ class SshConfig:
             raise ValueError(
                 f"SshConfig.port must be a valid TCP port (1-65535) or None; got {self.port!r}."
             )
+        _validate_ssh_key_path("SshConfig", self.ssh_key_path)
         if self.user is not None and not self.user.strip():
             raise ValueError("SshConfig.user must be a non-empty string (or None).")
         _validate_remote_common(
@@ -282,13 +288,10 @@ class AwsConfig:
     alias for you, so `key_name` is required and the target is built from
     the instance's public IP.
 
-    The private half of that key pair must be resolvable by ssh itself —
-    loaded into your agent (`ssh-add ~/.ssh/my-key.pem`), named as one of
-    ssh's defaults, or given an `IdentityFile` entry in `~/.ssh/config`.
-    runplz does not take a key path today: `ssh_common` threads a port and
-    nothing else through its ~50 call sites, and plumbing an identity file
-    through all of them belongs in its own change, shared with the ssh,
-    brev and gcp backends rather than bolted on here.
+    Point `ssh_key_path` at the private half of that key pair; runplz passes
+    it as `-i` (with `IdentitiesOnly=yes`, so a loaded agent cannot offer its
+    other keys first and trip the server's MaxAuthTries). Leave it None if
+    the key is already agent-loaded or named in your ssh config.
 
     Networking is pinned, never created: pass an existing `subnet_id` /
     `security_group_id`. The security group must allow inbound TCP 22 from
@@ -309,6 +312,12 @@ class AwsConfig:
     key_name: Optional[str] = None
     # Login user for the AMI. Deep Learning AMIs are Ubuntu-based.
     ssh_user: str = "ubuntu"
+    # Private half of `key_name`, e.g. "~/.ssh/my-key.pem". None → ssh's own
+    # resolution (agent, default name, or an IdentityFile entry). EC2 keys
+    # are conventionally saved under a name ssh will not offer on its own,
+    # and no Host block can be written in advance because the instance IP
+    # does not exist yet — so setting this is usually what you want.
+    ssh_key_path: Optional[str] = None
     # Existing VPC bits to attach to. None → account default VPC.
     subnet_id: Optional[str] = None
     security_group_id: Optional[str] = None
@@ -325,12 +334,34 @@ class AwsConfig:
 
     def __post_init__(self):
         _validate_remote_common("AwsConfig", self, valid_on_finish=_VALID_CLOUD_ON_FINISH)
+        _validate_ssh_key_path("AwsConfig", self.ssh_key_path)
         if not (self.region or "").strip():
             raise ValueError(
                 "AwsConfig.region is required, e.g. AwsConfig(region='us-east-1', "
                 "key_name='my-key'). GPU availability and pricing are "
                 "per-region, so there is no safe default."
             )
+
+
+def _validate_ssh_key_path(cls_name: str, path) -> None:
+    """Reject a key path that ssh will silently ignore.
+
+    `IdentitiesOnly=yes` accompanies `-i`, which is what stops a loaded agent
+    from offering its other keys first — but it also means a typo'd path
+    doesn't fall back to the agent, it just fails with `Permission denied`.
+    On a provisioning backend that surfaces as a 30-minute ssh wait on a
+    billed box, so catch it here instead.
+    """
+    if path is None:
+        return
+    if not str(path).strip():
+        raise ValueError(f"{cls_name}.ssh_key_path must be a non-empty path (or None).")
+    if not os.path.exists(os.path.expanduser(str(path))):
+        raise ValueError(
+            f"{cls_name}.ssh_key_path={path!r} does not exist. runplz passes it "
+            f"to ssh as `-i` with IdentitiesOnly=yes, so a wrong path fails "
+            f"authentication outright rather than falling back to your agent."
+        )
 
 
 def _validate_remote_common(

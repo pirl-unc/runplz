@@ -16,6 +16,7 @@ holds its own module-level reference to the imported function.
 """
 
 import contextlib
+import dataclasses
 import json
 import os
 import re
@@ -55,6 +56,10 @@ __all__ = [
     "rsync_up",
     "rsync_down",
     "rsync_ssh_transport",
+    "rsync_transport_flags",
+    "SshOptions",
+    "read_local_ssh_options",
+    "write_local_ssh_options",
     # --- talking to the box ----------------------------------------------
     "ssh_exec",
     "ssh_capture",
@@ -157,6 +162,14 @@ _RSYNC_NOISE_EXCLUDES = (
 # individual session alive during idle stretches (docker image pulls,
 # data downloads, between-epoch pauses).
 SSH_OPTS = [
+    # Ephemeral cloud boxes are a new host key every time, and every probe
+    # runs with BatchMode=yes — which cannot answer OpenSSH's default
+    # "are you sure?" prompt. Without this, a fresh EC2 IP fails host-key
+    # verification on every attempt for the full ssh_ready_wait_seconds
+    # while the instance bills. `accept-new` trusts a *first* sighting only;
+    # a key that later *changes* still fails, which is the point.
+    "-o",
+    "StrictHostKeyChecking=accept-new",
     "-o",
     "ControlMaster=no",
     "-o",
@@ -168,6 +181,75 @@ SSH_OPTS = [
     "-o",
     "TCPKeepAlive=yes",
 ]
+
+
+@dataclass(frozen=True)
+class SshOptions:
+    """Everything that shapes how runplz reaches a box over ssh.
+
+    This exists as one object rather than a pile of parallel parameters
+    because the plumbing threads it through ~50 call sites: `port` alone was
+    already threaded that far, and adding a second scalar beside it would
+    have doubled that and made a third worse.
+
+    Backends that manage their own ssh config need none of it — brev writes
+    `~/.brev/ssh_config` and gcp's `config-ssh` writes an `IdentityFile`
+    entry — so the default is "whatever ssh would do on its own".
+    """
+
+    port: Optional[int] = None
+    # Private key to authenticate with. EC2 key pairs are conventionally
+    # saved as ~/.ssh/my-key.pem, which ssh will not offer unless it is
+    # agent-loaded or named in a Host block — and a Host block cannot be
+    # written in advance because the instance IP does not exist yet.
+    identity_file: Optional[str] = None
+
+    @classmethod
+    def coerce(cls, value) -> "SshOptions":
+        """Accept None, a bare port int, or an SshOptions."""
+        if value is None:
+            return cls()
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, int) and not isinstance(value, bool):
+            return cls(port=value)
+        raise TypeError(f"expected SshOptions, an int port, or None; got {value!r}")
+
+    def argv(self) -> list:
+        opts = list(SSH_OPTS)
+        if self.port:
+            opts += ["-p", str(int(self.port))]
+        if self.identity_file:
+            # IdentitiesOnly stops a loaded agent from offering its other
+            # keys first and tripping the server's MaxAuthTries before ours
+            # is ever tried.
+            opts += [
+                "-i",
+                os.path.expanduser(str(self.identity_file)),
+                "-o",
+                "IdentitiesOnly=yes",
+            ]
+        return opts
+
+    def to_dict(self) -> dict:
+        """The subset worth recording so `runplz tail/status/kill` can reach
+        the same box later. Written to a *local* sidecar, never uploaded —
+        see :func:`write_local_ssh_options`."""
+        out = {}
+        if self.port:
+            out["port"] = int(self.port)
+        if self.identity_file:
+            out["identity_file"] = str(self.identity_file)
+        return out
+
+    @classmethod
+    def from_dict(cls, data) -> "SshOptions":
+        data = data or {}
+        return cls(
+            port=data.get("port"),
+            identity_file=data.get("identity_file"),
+        )
+
 
 _NATIVE_VENV = "$HOME/runplz-venv"
 _REMOTE_SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -444,6 +526,44 @@ def select_source_paths(repo: Path) -> Optional[tuple[str, ...]]:
     return tuple(paths)
 
 
+LOCAL_SSH_OPTIONS_FILENAME = "ssh.json"
+
+
+def write_local_ssh_options(host_out: Path, ssh_opts=None) -> None:
+    """Record how to reach this box, in a file that never leaves this machine.
+
+    `runplz tail/status/kill` need the port and key to follow a run on a host
+    that isn't in your ssh config — an EC2 box whose IP didn't exist when you
+    wrote it. That belongs beside the run manifest, but *not* inside it: the
+    manifest is heredoc'd onto the remote box, and a key path there would
+    disclose the local username and key filename to a rented, possibly
+    multi-tenant host. The codebase already masks anything env-shaped whose
+    name contains KEY; this keeps the same promise.
+
+    rsync_down does not use --delete, so this survives the outputs sync.
+    """
+    options = SshOptions.coerce(ssh_opts)
+    meta = Path(host_out) / REMOTE_META_DIRNAME
+    meta.mkdir(parents=True, exist_ok=True)
+    path = meta / LOCAL_SSH_OPTIONS_FILENAME
+    recorded = options.to_dict()
+    if not recorded:
+        # Nothing worth saying; don't leave a stale file from an earlier run.
+        if path.exists():
+            path.unlink()
+        return
+    path.write_text(json.dumps(recorded, indent=2, sort_keys=True))
+
+
+def read_local_ssh_options(outputs_dir: Path) -> SshOptions:
+    """Read back what :func:`write_local_ssh_options` recorded, if anything."""
+    path = Path(outputs_dir) / REMOTE_META_DIRNAME / LOCAL_SSH_OPTIONS_FILENAME
+    try:
+        return SshOptions.from_dict(json.loads(path.read_text()))
+    except (OSError, ValueError):
+        return SshOptions()
+
+
 def build_remote_run_manifest(
     *,
     remote_run: RemoteRunContext,
@@ -484,7 +604,7 @@ def _prepare_remote_run(
     remote_run: RemoteRunContext,
     *,
     manifest: dict[str, Any],
-    port: Optional[int] = None,
+    ssh_opts: Optional[SshOptions] = None,
 ) -> None:
     print(
         f"+ remote run {remote_run.run_id}: "
@@ -510,7 +630,7 @@ def _prepare_remote_run(
         f': > "{remote_run.heartbeat_shell}"\n'
         f': > "{remote_run.last_log_shell}"\n'
     )
-    ssh_exec(target, remote, port=port)
+    ssh_exec(target, remote, ssh_opts=ssh_opts)
 
 
 def _record_remote_event(
@@ -518,7 +638,7 @@ def _record_remote_event(
     remote_run: Optional[RemoteRunContext],
     event: str,
     *,
-    port: Optional[int] = None,
+    ssh_opts: Optional[SshOptions] = None,
     **fields: Any,
 ) -> None:
     if remote_run is None:
@@ -532,7 +652,7 @@ def _record_remote_event(
         f"printf '%s\\n' {shlex.quote(line)} >> \"{remote_run.events_shell}\""
     )
     try:
-        ssh_exec(target, remote, port=port)
+        ssh_exec(target, remote, ssh_opts=ssh_opts)
     except Exception as exc:  # noqa: BLE001
         print(
             f"+ warning: failed to record remote lifecycle event "
@@ -592,19 +712,29 @@ def _wrap_remote_command_for_logging(command: str, remote_run: RemoteRunContext)
 # --- ssh-opts / rsync-transport builders --------------------------------
 
 
-def ssh_cmd_opts(port: Optional[int] = None) -> list:
-    """Return SSH_OPTS plus `-p <port>` when a non-default port is pinned."""
-    if port:
-        return [*SSH_OPTS, "-p", str(int(port))]
-    return list(SSH_OPTS)
+def ssh_cmd_opts(ssh_opts=None) -> list:
+    """Return the ssh flags for `ssh_opts` (an SshOptions, a port, or None)."""
+    return SshOptions.coerce(ssh_opts).argv()
 
 
-def rsync_ssh_transport(port: Optional[int] = None) -> str:
+def rsync_ssh_transport(ssh_opts=None) -> str:
     """Build the argument rsync expects behind `-e`: the ssh invocation
     it should use for the transport. Shell-quoted so rsync splits it back
     into argv correctly."""
-    parts = ["ssh", *ssh_cmd_opts(port)]
+    parts = ["ssh", *ssh_cmd_opts(ssh_opts)]
     return " ".join(shlex.quote(p) for p in parts)
+
+
+def rsync_transport_flags(ssh_opts=None) -> list:
+    """`-e <ssh ...>` for rsync, or nothing when there is nothing to say.
+
+    A bare `-e ssh ...` on every rsync would be churn with no effect, so the
+    override is only emitted when the options actually differ from ssh's own
+    defaults.
+    """
+    if SshOptions.coerce(ssh_opts) == SshOptions():
+        return []
+    return ["-e", rsync_ssh_transport(ssh_opts)]
 
 
 # --- low-level ssh / sh / rsync ------------------------------------------
@@ -615,7 +745,7 @@ def run_local(cmd, *, stdin: Optional[bytes] = None):
     subprocess.run(cmd, check=True, input=stdin)
 
 
-def ssh_exec(target: str, remote_cmd: str, *, port: Optional[int] = None):
+def ssh_exec(target: str, remote_cmd: str, *, ssh_opts: Optional[SshOptions] = None):
     # Pass the whole pipeline as a SINGLE arg to ssh. If we pass
     # ["ssh", host, "bash", "-lc", cmd] instead, ssh space-joins the trailing
     # argv before sending to the remote shell, which then re-parses — turning
@@ -623,12 +753,12 @@ def ssh_exec(target: str, remote_cmd: str, *, port: Optional[int] = None):
     # (i.e. `set` runs with no args as the -c command, X runs in the outer
     # shell without errexit). Quoting with shlex.quote around the whole
     # command string avoids that.
-    run_local(["ssh", *ssh_cmd_opts(port), target, f"bash -lc {shlex.quote(remote_cmd)}"])
+    run_local(["ssh", *ssh_cmd_opts(ssh_opts), target, f"bash -lc {shlex.quote(remote_cmd)}"])
 
 
-def ssh_capture(target: str, remote_cmd: str, *, port: Optional[int] = None) -> str:
+def ssh_capture(target: str, remote_cmd: str, *, ssh_opts: Optional[SshOptions] = None) -> str:
     r = subprocess.run(
-        ["ssh", *ssh_cmd_opts(port), target, remote_cmd],
+        ["ssh", *ssh_cmd_opts(ssh_opts), target, remote_cmd],
         capture_output=True,
         text=True,
         timeout=60,
@@ -646,7 +776,9 @@ class PreconditionFailed(RuntimeError):
 _PRECONDITION_FAIL_FRACTION = 0.5
 
 
-def _check_preconditions(target: str, preconditions: dict, *, port: Optional[int] = None) -> None:
+def _check_preconditions(
+    target: str, preconditions: dict, *, ssh_opts: Optional[SshOptions] = None
+) -> None:
     """Probe declared preconditions on the remote box and warn-or-fail.
 
     No-op when ``preconditions`` is empty. Fires a single ssh round-trip
@@ -668,7 +800,7 @@ def _check_preconditions(target: str, preconditions: dict, *, port: Optional[int
         "2>/dev/null | sort -n | head -n 1 || echo 0; "
         "echo '---END---'"
     )
-    out = ssh_capture(target, probe, port=port)
+    out = ssh_capture(target, probe, ssh_opts=ssh_opts)
     sections = parse_probe_sections(out)
 
     failures: list[str] = []
@@ -797,16 +929,14 @@ def rsync_up(
     *,
     outputs_dir: Optional[str] = None,
     remote_run: Optional[RemoteRunContext] = None,
-    port: Optional[int] = None,
+    ssh_opts: Optional[SshOptions] = None,
 ):
     # Intentionally no --delete: a user who sshes in and leaves files under
     # ~/runplz-repo/ (logs, probe scripts, local edits) shouldn't have those
     # wiped by the next run. Stale files on the remote are cheap; accidental
     # user-data loss is not.
     selected_paths = select_source_paths(repo)
-    cmd = ["rsync", "-az"]
-    if port:
-        cmd += ["-e", rsync_ssh_transport(port)]
+    cmd = ["rsync", "-az", *rsync_transport_flags(ssh_opts)]
     if selected_paths is not None:
         # --files-from changes rsync's -a implication: recursion must be
         # requested explicitly. NUL delimiters preserve every valid Git path,
@@ -832,7 +962,7 @@ def rsync_up(
         run_local(cmd)
     else:
         run_local(cmd, stdin=stdin)
-    _record_remote_event(target, remote_run, "rsync_up_done", port=port)
+    _record_remote_event(target, remote_run, "rsync_up_done", ssh_opts=ssh_opts)
 
 
 def _outputs_dir_excludes(outputs_dir: Optional[str], repo: Path) -> list[str]:
@@ -874,12 +1004,10 @@ def rsync_down(
     local_out: Path,
     *,
     remote_run: Optional[RemoteRunContext] = None,
-    port: Optional[int] = None,
+    ssh_opts: Optional[SshOptions] = None,
 ):
-    _record_remote_event(target, remote_run, "rsync_down_start", port=port)
-    cmd = ["rsync", "-az"]
-    if port:
-        cmd += ["-e", rsync_ssh_transport(port)]
+    _record_remote_event(target, remote_run, "rsync_down_start", ssh_opts=ssh_opts)
+    cmd = ["rsync", "-az", *rsync_transport_flags(ssh_opts)]
     cmd.extend([_remote_out_rsync(target, remote_run), f"{local_out}/"])
     run_local(cmd)
 
@@ -893,7 +1021,7 @@ def wait_until_ssh_reachable(
     max_wait_s: int = 1800,
     probe_interval_s: int = 15,
     refresh_callback: Optional[Callable[[], None]] = None,
-    port: Optional[int] = None,
+    ssh_opts: Optional[SshOptions] = None,
 ) -> None:
     """Block until an SSH session to `target` succeeds, or raise.
 
@@ -926,7 +1054,7 @@ def wait_until_ssh_reachable(
                 "BatchMode=yes",
                 "-o",
                 f"ConnectTimeout={probe_interval_s}",
-                *ssh_cmd_opts(port),
+                *ssh_cmd_opts(ssh_opts),
                 target,
                 "true",
             ],
@@ -971,7 +1099,7 @@ def wait_until_ssh_reachable(
     )
 
 
-def _ensure_remote_rsync(target: str, *, port: Optional[int] = None):
+def _ensure_remote_rsync(target: str, *, ssh_opts: Optional[SshOptions] = None):
     """Install rsync on the remote if missing (slim container images
     often don't ship with rsync)."""
     cmd = (
@@ -980,10 +1108,10 @@ def _ensure_remote_rsync(target: str, *, port: Optional[int] = None):
         "sudo apt-get update -qq && "
         "sudo apt-get install -y -qq --no-install-recommends rsync"
     )
-    ssh_exec(target, cmd, port=port)
+    ssh_exec(target, cmd, ssh_opts=ssh_opts)
 
 
-def _ensure_docker(target: str, timeout_s: int = 420, *, port: Optional[int] = None):
+def _ensure_docker(target: str, timeout_s: int = 420, *, ssh_opts: Optional[SshOptions] = None):
     """Wait for docker daemon to be reachable on the remote, installing
     docker via get.docker.com as a fallback if the daemon never appears."""
     print(f"+ waiting for docker daemon on {target} (up to {timeout_s}s)", flush=True)
@@ -999,11 +1127,9 @@ def _ensure_docker(target: str, timeout_s: int = 420, *, port: Optional[int] = N
     r = subprocess.run(
         [
             "ssh",
-            *ssh_cmd_opts(port),
+            *ssh_cmd_opts(ssh_opts),
             "-o",
             "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
             target,
             wait_script,
         ],
@@ -1016,18 +1142,18 @@ def _ensure_docker(target: str, timeout_s: int = 420, *, port: Optional[int] = N
             flush=True,
         )
         run_local(
-            ["ssh", *ssh_cmd_opts(port), target, "curl -fsSL https://get.docker.com | sudo sh"]
+            ["ssh", *ssh_cmd_opts(ssh_opts), target, "curl -fsSL https://get.docker.com | sudo sh"]
         )
 
 
-def _remote_has_nvidia(target: str, *, port: Optional[int] = None) -> bool:
+def _remote_has_nvidia(target: str, *, ssh_opts: Optional[SshOptions] = None) -> bool:
     # nvidia-smi is often pre-installed without a real GPU; the reliable
     # signal is /proc/driver/nvidia, which only exists when the kernel
     # module is loaded against real hardware.
     r = subprocess.run(
         [
             "ssh",
-            *ssh_cmd_opts(port),
+            *ssh_cmd_opts(ssh_opts),
             target,
             "test -d /proc/driver/nvidia && echo y || echo n",
         ],
@@ -1098,7 +1224,7 @@ def _run_container_mode(
     kwargs,
     remote_run: Optional[RemoteRunContext] = None,
     max_runtime_seconds=None,
-    port=None,
+    ssh_opts=None,
 ):
     """Container-mode dispatch: the box IS the user's image. Apply Image
     DSL ops inline over ssh, then invoke the bootstrap. No docker-in-
@@ -1112,7 +1238,7 @@ def _run_container_mode(
     """
     ops_script = render_image_ops_script(function.image, remote_run=remote_run)
     if ops_script:
-        ssh_exec(target, ops_script, port=port)
+        ssh_exec(target, ops_script, ssh_opts=ssh_opts)
 
     user_env_exports = " ".join(
         f"export {k}={shlex.quote(str(v))};" for k, v in function.env.items()
@@ -1143,7 +1269,7 @@ def _run_container_mode(
         wrapped_command=wrapped,
         remote_run=remote_run,
         max_runtime_seconds=max_runtime_seconds,
-        port=port,
+        ssh_opts=ssh_opts,
     )
 
 
@@ -1157,7 +1283,7 @@ def _run_native(
     has_nvidia,
     remote_run: Optional[RemoteRunContext] = None,
     max_runtime_seconds=None,
-    port=None,
+    ssh_opts=None,
 ):
     """Native dispatch: install python+torch+user code in a venv on the
     remote and run the bootstrap directly (no docker)."""
@@ -1182,7 +1308,7 @@ def _run_native(
         f"pip install --quiet torch --index-url {torch_index}; "
         f"pip install --quiet -e {_remote_repo_shell(remote_run)}"
     )
-    ssh_exec(target, setup, port=port)
+    ssh_exec(target, setup, ssh_opts=ssh_opts)
 
     user_env_exports = " ".join(
         f"export {k}={shlex.quote(str(v))};" for k, v in function.env.items()
@@ -1209,7 +1335,7 @@ def _run_native(
         wrapped_command=wrapped,
         remote_run=remote_run,
         max_runtime_seconds=max_runtime_seconds,
-        port=port,
+        ssh_opts=ssh_opts,
     )
 
 
@@ -1218,12 +1344,12 @@ def _build_image(
     image,
     *,
     remote_run: Optional[RemoteRunContext] = None,
-    port: Optional[int] = None,
+    ssh_opts: Optional[SshOptions] = None,
 ):
     """Build a docker image on the remote — either from the user's
     Dockerfile or from a synthesized one (Image.from_registry + DSL ops)."""
     remote_repo = _remote_repo_shell(remote_run)
-    _record_remote_event(target, remote_run, "build_image_start", port=port)
+    _record_remote_event(target, remote_run, "build_image_start", ssh_opts=ssh_opts)
     if image.dockerfile is not None:
         context = image.context or "."
         build = (
@@ -1241,8 +1367,8 @@ def _build_image(
             f"{df}\n"
             f"__EOF__"
         )
-    ssh_exec(target, build, port=port)
-    _record_remote_event(target, remote_run, "build_image_done", port=port)
+    ssh_exec(target, build, ssh_opts=ssh_opts)
+    _record_remote_event(target, remote_run, "build_image_done", ssh_opts=ssh_opts)
 
 
 def _run_container_detached(
@@ -1256,7 +1382,7 @@ def _run_container_detached(
     gpu_flag,
     app_name: Optional[str] = None,
     remote_run: Optional[RemoteRunContext] = None,
-    port=None,
+    ssh_opts=None,
 ):
     env_flags = " ".join(f"-e {shlex.quote(f'{k}={v}')}" for k, v in function.env.items())
     label_flags = docker.label_flags(app_name, function.name)
@@ -1307,7 +1433,7 @@ def _run_container_detached(
         f"{REMOTE_IMAGE_TAG} python -m runplz._bootstrap >/dev/null; "
         f"{monitor}"
     )
-    ssh_exec(target, start, port=port)
+    ssh_exec(target, start, ssh_opts=ssh_opts)
 
 
 def build_detached_launcher(remote_run: RemoteRunContext, wrapped_command: str) -> str:
@@ -1660,14 +1786,14 @@ def inspect_detached_run(
     pid_file: str,
     *,
     events_file: Optional[str] = None,
-    port: Optional[int] = None,
+    ssh_opts: Optional[SshOptions] = None,
 ) -> DetachedRunStatus:
     """Inspect one detached run without conflating zombies with live jobs."""
 
     probe = build_detached_status_probe(pid_file, events_file)
     try:
         result = subprocess.run(
-            ["ssh", *ssh_cmd_opts(port), target, probe],
+            ["ssh", *ssh_cmd_opts(ssh_opts), target, probe],
             capture_output=True,
             text=True,
             timeout=30,
@@ -1707,7 +1833,7 @@ def wait_for_detached_start(
     *,
     timeout_s: float = DETACHED_START_TIMEOUT_S,
     poll_interval_s: float = DETACHED_START_POLL_INTERVAL_S,
-    port: Optional[int] = None,
+    ssh_opts: Optional[SshOptions] = None,
 ) -> DetachedRunStatus:
     """Wait for the bootstrap's first lifecycle event or a terminal PID state."""
 
@@ -1718,7 +1844,7 @@ def wait_for_detached_start(
             target,
             pid_file,
             events_file=events_file,
-            port=port,
+            ssh_opts=ssh_opts,
         )
         if last.started or last.process_state in {
             DetachedProcessState.MISSING,
@@ -1735,7 +1861,7 @@ def detached_launch_diagnostics(
     target: str,
     remote_run: RemoteRunContext,
     *,
-    port: Optional[int] = None,
+    ssh_opts: Optional[SshOptions] = None,
 ) -> str:
     """Fetch compact process and lifecycle context for a failed startup."""
 
@@ -1756,7 +1882,7 @@ def detached_launch_diagnostics(
         "printf '%s\\n' 'driver log:'; "
         f'tail -n {FAILURE_TAIL_LINES} "{driver_log}" 2>/dev/null || true'
     )
-    return ssh_capture(target, command, port=port).rstrip()
+    return ssh_capture(target, command, ssh_opts=ssh_opts).rstrip()
 
 
 def build_detached_log_command(pid_file: str, log_file: str) -> str:
@@ -1791,7 +1917,7 @@ def launch_detached_and_wait(
     wrapped_command: str,
     remote_run: Optional["RemoteRunContext"] = None,
     max_runtime_seconds: Optional[int] = None,
-    port: Optional[int] = None,
+    ssh_opts: Optional[SshOptions] = None,
     max_reconnects: int = 20,
 ) -> int:
     """Launch a nohup-protected bash command and stream/wait locally.
@@ -1825,7 +1951,12 @@ def launch_detached_and_wait(
         # meta-dir it provides for PID / exit-code bookkeeping.
         try:
             r = subprocess.run(
-                ["ssh", *ssh_cmd_opts(port), target, f"bash -lc {shlex.quote(wrapped_command)}"],
+                [
+                    "ssh",
+                    *ssh_cmd_opts(ssh_opts),
+                    target,
+                    f"bash -lc {shlex.quote(wrapped_command)}",
+                ],
                 timeout=max_runtime_seconds,
             )
         except subprocess.TimeoutExpired:
@@ -1833,7 +1964,7 @@ def launch_detached_and_wait(
                 target,
                 max_runtime_seconds,
                 container_name=None,
-                port=port,
+                ssh_opts=ssh_opts,
                 remote_run=remote_run,
             )
         return r.returncode
@@ -1845,13 +1976,13 @@ def launch_detached_and_wait(
     launcher = build_detached_launcher(remote_run, wrapped_command)
     # Launch ssh returns quickly once the detached job is running + PID
     # recorded. Anything that follows in this function is local polling.
-    ssh_exec(target, launcher, port=port)
+    ssh_exec(target, launcher, ssh_opts=ssh_opts)
 
     startup = wait_for_detached_start(
         target,
         pid_file,
         events_file,
-        port=port,
+        ssh_opts=ssh_opts,
     )
     terminal_startup_failure = startup.process_state in {
         DetachedProcessState.MISSING,
@@ -1863,11 +1994,11 @@ def launch_detached_and_wait(
             target,
             remote_run,
             "bootstrap_launch_failed",
-            port=port,
+            ssh_opts=ssh_opts,
             process_state=startup.process_state.value,
             pid=startup.pid,
         )
-        diagnostics = detached_launch_diagnostics(target, remote_run, port=port)
+        diagnostics = detached_launch_diagnostics(target, remote_run, ssh_opts=ssh_opts)
         print(
             f"+ detached bootstrap failed to start on {target} "
             f"(state={startup.process_state.value})\n{diagnostics}",
@@ -1888,7 +2019,7 @@ def launch_detached_and_wait(
         events_file=events_file,
         max_runtime_seconds=max_runtime_seconds,
         max_reconnects=max_reconnects,
-        port=port,
+        ssh_opts=ssh_opts,
         # So a runtime-cap timeout stops this run precisely instead of
         # pkill-ing every runplz bootstrap on the box.
         remote_run=remote_run,
@@ -1903,7 +2034,7 @@ def tail_and_wait_for_detached(
     events_file: str,
     max_runtime_seconds: Optional[int] = None,
     max_reconnects: int = 20,
-    port: Optional[int] = None,
+    ssh_opts: Optional[SshOptions] = None,
     remote_run: Optional[RemoteRunContext] = None,
 ) -> int:
     """Stream log_file via ssh ``tail -F`` and return remote exit code.
@@ -1933,7 +2064,7 @@ def tail_and_wait_for_detached(
         cmd = build_detached_log_command(pid_file, log_file)
         try:
             r = subprocess.run(
-                ["ssh", *ssh_cmd_opts(port), target, cmd],
+                ["ssh", *ssh_cmd_opts(ssh_opts), target, cmd],
                 timeout=_remaining_s(),
             )
         except subprocess.TimeoutExpired:
@@ -1941,17 +2072,17 @@ def tail_and_wait_for_detached(
                 target,
                 max_runtime_seconds,
                 container_name=None,
-                port=port,
+                ssh_opts=ssh_opts,
                 remote_run=remote_run,
             )
-        if not remote_pid_alive(target, pid_file, port=port):
+        if not remote_pid_alive(target, pid_file, ssh_opts=ssh_opts):
             break
         if max_runtime_seconds is not None and (time.monotonic() - started) >= max_runtime_seconds:
             raise_for_runtime_cap(
                 target,
                 max_runtime_seconds,
                 container_name=None,
-                port=port,
+                ssh_opts=ssh_opts,
                 remote_run=remote_run,
             )
         reconnects += 1
@@ -1974,21 +2105,21 @@ def tail_and_wait_for_detached(
     # If we gave up streaming while the remote was still alive, block
     # here until the pid file clears (so the caller sees the real exit
     # code, not a premature "unknown").
-    while remote_pid_alive(target, pid_file, port=port):
+    while remote_pid_alive(target, pid_file, ssh_opts=ssh_opts):
         if max_runtime_seconds is not None and (time.monotonic() - started) >= max_runtime_seconds:
             raise_for_runtime_cap(
                 target,
                 max_runtime_seconds,
                 container_name=None,
-                port=port,
+                ssh_opts=ssh_opts,
                 remote_run=remote_run,
             )
         time.sleep(min(30, HEARTBEAT_INTERVAL_S))
 
-    return read_remote_exit_code(target, events_file, port=port)
+    return read_remote_exit_code(target, events_file, ssh_opts=ssh_opts)
 
 
-def remote_pid_alive(target: str, pid_file: str, *, port: Optional[int] = None) -> bool:
+def remote_pid_alive(target: str, pid_file: str, *, ssh_opts: Optional[SshOptions] = None) -> bool:
     """Return True if a PID is live, treating zombies as completed.
 
     Conservative on ssh errors: if we can't reach the box right now,
@@ -1996,11 +2127,13 @@ def remote_pid_alive(target: str, pid_file: str, *, port: Optional[int] = None) 
     of prematurely declaring the job done. A real dead job will surface
     next poll once ssh recovers.
     """
-    state = inspect_detached_run(target, pid_file, port=port).process_state
+    state = inspect_detached_run(target, pid_file, ssh_opts=ssh_opts).process_state
     return state in {DetachedProcessState.RUNNING, DetachedProcessState.UNKNOWN}
 
 
-def read_remote_exit_code(target: str, events_file: str, *, port: Optional[int] = None) -> int:
+def read_remote_exit_code(
+    target: str, events_file: str, *, ssh_opts: Optional[SshOptions] = None
+) -> int:
     """Parse the last ``remote_command_exit`` entry from events.ndjson.
 
     Returns 1 when the events file is missing, unreadable, or has no
@@ -2011,7 +2144,7 @@ def read_remote_exit_code(target: str, events_file: str, *, port: Optional[int] 
     probe = f"grep -F 'remote_command_exit' \"{events_file}\" 2>/dev/null | tail -n 1 || true"
     try:
         r = subprocess.run(
-            ["ssh", *ssh_cmd_opts(port), target, probe],
+            ["ssh", *ssh_cmd_opts(ssh_opts), target, probe],
             capture_output=True,
             text=True,
             timeout=30,
@@ -2045,7 +2178,7 @@ def _stream_and_wait(
     container_name: str,
     max_reconnects: int = 20,
     max_runtime_seconds: Optional[int] = None,
-    port: Optional[int] = None,
+    ssh_opts: Optional[SshOptions] = None,
 ) -> int:
     """Stream container logs and return its exit code.
 
@@ -2070,19 +2203,19 @@ def _stream_and_wait(
         cmd = f"sudo docker logs -f --tail {tail} {container_name}"
         try:
             r = subprocess.run(
-                ["ssh", *ssh_cmd_opts(port), target, cmd],
+                ["ssh", *ssh_cmd_opts(ssh_opts), target, cmd],
                 timeout=_remaining_s(),
             )
         except subprocess.TimeoutExpired:
             raise_for_runtime_cap(
-                target, max_runtime_seconds, container_name=container_name, port=port
+                target, max_runtime_seconds, container_name=container_name, ssh_opts=ssh_opts
             )
-        running = container_running(target, container_name, port=port)
+        running = container_running(target, container_name, ssh_opts=ssh_opts)
         if not running:
             break
         if max_runtime_seconds is not None and (time.monotonic() - started) >= max_runtime_seconds:
             raise_for_runtime_cap(
-                target, max_runtime_seconds, container_name=container_name, port=port
+                target, max_runtime_seconds, container_name=container_name, ssh_opts=ssh_opts
             )
         reconnects += 1
         if reconnects > max_reconnects:
@@ -2104,27 +2237,31 @@ def _stream_and_wait(
         time.sleep(2)
     try:
         r = subprocess.run(
-            ["ssh", *ssh_cmd_opts(port), target, f"sudo docker wait {container_name}"],
+            ["ssh", *ssh_cmd_opts(ssh_opts), target, f"sudo docker wait {container_name}"],
             capture_output=True,
             text=True,
             timeout=_remaining_s(),
         )
     except subprocess.TimeoutExpired:
-        raise_for_runtime_cap(target, max_runtime_seconds, container_name=container_name, port=port)
+        raise_for_runtime_cap(
+            target, max_runtime_seconds, container_name=container_name, ssh_opts=ssh_opts
+        )
     try:
         return int(r.stdout.strip() or "1")
     except ValueError:
         return 1
 
 
-def container_running(target: str, container_name: str, *, port: Optional[int] = None) -> bool:
+def container_running(
+    target: str, container_name: str, *, ssh_opts: Optional[SshOptions] = None
+) -> bool:
     # Treat ssh hangs / errors as "assume still running" so the caller keeps
     # retrying the log stream instead of giving up.
     try:
         r = subprocess.run(
             [
                 "ssh",
-                *ssh_cmd_opts(port),
+                *ssh_cmd_opts(ssh_opts),
                 target,
                 f"sudo docker inspect --format '{{{{.State.Running}}}}' {container_name}",
             ],
@@ -2147,7 +2284,7 @@ def _fetch_failure_tail(
     target: str,
     container_name: Optional[str],
     remote_run: Optional[RemoteRunContext] = None,
-    port: Optional[int] = None,
+    ssh_opts: Optional[SshOptions] = None,
 ) -> str:
     """Fetch the last N lines of remote output for a failed run.
 
@@ -2178,7 +2315,7 @@ def _fetch_failure_tail(
                     f'tail -n {FAILURE_TAIL_LINES} "{remote_run.last_log_shell}" '
                     "2>/dev/null || true"
                 )
-        out = ssh_capture(target, cmd, port=port)
+        out = ssh_capture(target, cmd, ssh_opts=ssh_opts)
         return (out or "").rstrip()
     except Exception as exc:  # noqa: BLE001
         return f"[runplz: could not fetch remote log tail — {type(exc).__name__}: {exc}]"
@@ -2189,7 +2326,7 @@ def raise_for_runtime_cap(
     cap_s,
     container_name,
     *,
-    port: Optional[int] = None,
+    ssh_opts: Optional[SshOptions] = None,
     remote_run: Optional[RemoteRunContext] = None,
 ):
     """Shared timeout-path cleanup + raise for issue #16.
@@ -2217,7 +2354,7 @@ def raise_for_runtime_cap(
         cleanup = "pkill -f 'runplz._bootstrap' || true"
     try:
         subprocess.run(
-            ["ssh", *ssh_cmd_opts(port), target, cleanup],
+            ["ssh", *ssh_cmd_opts(ssh_opts), target, cleanup],
             check=False,
             capture_output=True,
             text=True,
@@ -2321,7 +2458,7 @@ def dispatch_to_target(
     outputs_dir: str = "out",
     mode: str = "docker",
     max_runtime_seconds: Optional[int] = None,
-    port: Optional[int] = None,
+    ssh_opts: Optional[SshOptions] = None,
 ) -> DispatchResult:
     """Run one function on an already-reachable box, start to finish.
 
@@ -2348,6 +2485,8 @@ def dispatch_to_target(
     host_out = (repo / outputs_dir).resolve()
     host_out.mkdir(parents=True, exist_ok=True)
 
+    write_local_ssh_options(host_out, ssh_opts)
+
     remote_run = make_remote_run_context(
         backend=backend,
         target=target,
@@ -2364,16 +2503,16 @@ def dispatch_to_target(
             kwargs=kwargs,
             env=function.env,
         ),
-        port=port,
+        ssh_opts=ssh_opts,
     )
 
     # Pre-built images (and minimal cloud images) need not ship rsync.
-    _ensure_remote_rsync(target, port=port)
-    rsync_up(repo, target, outputs_dir=outputs_dir, remote_run=remote_run, port=port)
+    _ensure_remote_rsync(target, ssh_opts=ssh_opts)
+    rsync_up(repo, target, outputs_dir=outputs_dir, remote_run=remote_run, ssh_opts=ssh_opts)
 
     # Probe declared preconditions (issue #56) before bootstrap, so a
     # misprovisioned box fails fast instead of burning paid GPU minutes.
-    _check_preconditions(target, function.preconditions, port=port)
+    _check_preconditions(target, function.preconditions, ssh_opts=ssh_opts)
 
     rel_script = Path(function.module_file).resolve().relative_to(repo)
 
@@ -2393,13 +2532,13 @@ def dispatch_to_target(
                 kwargs=kwargs,
                 remote_run=remote_run,
                 max_runtime_seconds=max_runtime_seconds,
-                port=port,
+                ssh_opts=ssh_opts,
             )
         elif mode == "docker":
-            _ensure_docker(target, port=port)
-            gpu_flag = "--gpus all" if _remote_has_nvidia(target, port=port) else ""
+            _ensure_docker(target, ssh_opts=ssh_opts)
+            gpu_flag = "--gpus all" if _remote_has_nvidia(target, ssh_opts=ssh_opts) else ""
             container_name = make_container_name(function.name)
-            _build_image(target, function.image, remote_run=remote_run, port=port)
+            _build_image(target, function.image, remote_run=remote_run, ssh_opts=ssh_opts)
             _run_container_detached(
                 target=target,
                 container_name=container_name,
@@ -2410,13 +2549,13 @@ def dispatch_to_target(
                 gpu_flag=gpu_flag,
                 app_name=app.name,
                 remote_run=remote_run,
-                port=port,
+                ssh_opts=ssh_opts,
             )
             exit_code = _stream_and_wait(
                 target,
                 container_name,
                 max_runtime_seconds=max_runtime_seconds,
-                port=port,
+                ssh_opts=ssh_opts,
             )
         else:
             exit_code = _run_native(
@@ -2425,12 +2564,12 @@ def dispatch_to_target(
                 rel_script=str(rel_script),
                 args=args,
                 kwargs=kwargs,
-                has_nvidia=_remote_has_nvidia(target, port=port),
+                has_nvidia=_remote_has_nvidia(target, ssh_opts=ssh_opts),
                 remote_run=remote_run,
                 max_runtime_seconds=max_runtime_seconds,
-                port=port,
+                ssh_opts=ssh_opts,
             )
-        rsync_down(target, host_out, remote_run=remote_run, port=port)
+        rsync_down(target, host_out, remote_run=remote_run, ssh_opts=ssh_opts)
     finally:
         # Grab the log tail before the container goes away — `docker rm`
         # wipes it, and a provisioning caller is about to delete the box.
@@ -2439,14 +2578,14 @@ def dispatch_to_target(
                 target=target,
                 container_name=container_name,
                 remote_run=remote_run,
-                port=port,
+                ssh_opts=ssh_opts,
             )
         if container_name is not None:
             try:
                 ssh_capture(
                     target,
                     f"sudo docker rm -f {container_name} >/dev/null 2>&1 || true",
-                    port=port,
+                    ssh_opts=ssh_opts,
                 )
             except Exception as exc:  # noqa: BLE001
                 print(
@@ -2491,10 +2630,12 @@ def run_on_provisioned_vm(
     max_runtime_seconds: Optional[int] = None,
     ssh_ready_wait_seconds: int = 1800,
     refresh_callback: Optional[Callable[[], None]] = None,
+    ssh_opts: Optional[SshOptions] = None,
 ) -> None:
     """Provision a box, run one function on it, then always tear it down.
 
-    ``provision`` returns ``(target, port)``. ``teardown`` runs in a
+    ``provision`` returns ``(target, ssh_opts_or_None)`` — the second slot
+    is for details a driver only learns after creating the box. ``teardown`` runs in a
     ``finally`` and must be best-effort: it can never mask the real error from
     the run, but a silent failure there is a billing leak, so it should shout.
 
@@ -2505,10 +2646,23 @@ def run_on_provisioned_vm(
     """
     with orchestrator_signal_cleanup(label):
         try:
-            target, port = provision()
+            target, provisioned_opts = provision()
+            # A driver that learns its ssh details only after creating the
+            # box (an EC2 public IP, say) returns them here; otherwise the
+            # caller's options stand.
+            if provisioned_opts is not None:
+                # Merge rather than replace: a caller-supplied option the
+                # driver knows nothing about must survive the box's own
+                # details being filled in.
+                learned = SshOptions.coerce(provisioned_opts)
+                base = SshOptions.coerce(ssh_opts)
+                ssh_opts = dataclasses.replace(
+                    base,
+                    **{k: v for k, v in learned.to_dict().items() if v is not None},
+                )
             wait_until_ssh_reachable(
                 target,
-                port=port,
+                ssh_opts=ssh_opts,
                 max_wait_s=ssh_ready_wait_seconds,
                 refresh_callback=refresh_callback,
             )
@@ -2522,7 +2676,7 @@ def run_on_provisioned_vm(
                 outputs_dir=outputs_dir,
                 mode=mode,
                 max_runtime_seconds=max_runtime_seconds,
-                port=port,
+                ssh_opts=ssh_opts,
             )
         finally:
             # Unconditional, including when provision() itself raised

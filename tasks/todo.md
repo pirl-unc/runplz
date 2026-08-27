@@ -1,3 +1,64 @@
+## 2026-08-27 PR Plan — Thread ssh options, not just a port (#79)
+
+Branch: `feat/ssh-identity-file` (off `main` @ `053ba33`)
+
+- [x] `SshOptions` replaces the bare `port` threaded through ~50 call sites
+- [x] `SshConfig.ssh_key_path` / `AwsConfig.ssh_key_path`
+- [x] Follow-up commands (`tail`/`status`/`kill`/`ps`) can reach a keyed box
+- [x] Bump `runplz/version.py` to 3.18.0
+- [x] `./format.sh`, `./lint.sh`, `./test.sh`
+- [ ] Review, merge, deploy
+
+### Scope / design
+
+- One object, not a second scalar. `port` alone was already threaded through ~50
+  sites; adding `identity_file` beside it would have doubled that and made a third
+  worse. `ssh_cmd_opts` / `rsync_ssh_transport` coerce None / int / SshOptions.
+- `provision()` returns `(target, ssh_opts)` now — aws only learns its target after
+  the box exists, so the options travel back with it.
+- The key reaches rsync too, via its `-e` transport, and only when the options
+  actually differ from ssh's defaults.
+
+### Code review — 15 findings, all addressed
+
+Two were expensive:
+
+- **No host-key policy in `SSH_OPTS`.** Every probe runs `BatchMode=yes`, which
+  can't answer OpenSSH's default prompt, so a brand-new EC2 IP would fail
+  verification on every attempt for the full 1800s wait *on a billed GPU box*.
+  Only `_ensure_docker` had been passing `accept-new`; it is shared now.
+- **The key path was written into the manifest uploaded to the remote box** — the
+  same document where the codebase already masks anything env-shaped containing
+  "KEY". It disclosed the local username and key filename to a rented, possibly
+  multi-tenant host. Moved to a local-only sidecar (`.runplz/ssh.json`), which
+  survives `rsync_down` because that has no `--delete`.
+
+Also: `--ssh-key` alone silently discarded the recorded port (merged per field now);
+`IdentitiesOnly=yes` plus a typo'd path disabled the agent fallback with no
+diagnostic (both configs validate the path exists); `runplz ps` had no way to
+authenticate to the box this PR enables; `run_on_provisioned_vm` replaced rather
+than merged caller options; `extra_opts` was unreachable from every public surface
+(dropped rather than surfaced on a guess); `--ssh-port` had no range check; the
+rsync default-transport check built and string-compared two full command lines,
+twice; README contradicted itself and `aws.py` still steered users to `ssh-add`.
+
+And one embarrassing one: `test_aws_hands_its_key_back_with_the_target` asserted
+`... or True` and could never fail — the exact regression the PR describes catching
+would have shipped green. It drives `provision()` now.
+
+**Breaking change, called out rather than papered over:** the keyword-only `port=`
+parameter on the public ssh helpers is now `ssh_opts=`. `ssh_cmd_opts(2222)` still
+works positionally, but `ssh_exec(target, cmd, port=2222)` does not. Those names went
+public one day ago in 3.17.0; carrying permanent aliases for a one-day-old surface
+costs more than it saves.
+
+### Review section
+
+- `./format.sh`, `./lint.sh` pass. `./test.sh` passes (`678 passed`), 32 new.
+- Verified the identity reaches the ssh argv, the rsync transport, and a follow-up
+  `runplz kill` reconstructed from the sidecar.
+- No live cloud calls.
+
 ## 2026-08-26 PR Plan — Direct GCP / AWS provisioning backends (#25)
 
 Branch: `feat/gcp-aws-backends` (off `main` @ `27fd9c5`)

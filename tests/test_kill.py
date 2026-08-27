@@ -411,7 +411,7 @@ def test_launcher_rejects_an_unsafe_run_id():
 def test_container_mode_records_container_name_for_kill():
     recorded = {}
 
-    def fake_ssh(target, command, port=None):
+    def fake_ssh(target, command, ssh_opts=None):
         recorded["command"] = command
 
     function = mock.Mock(env={})
