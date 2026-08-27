@@ -163,11 +163,17 @@ class RetryPolicy:
 NO_RETRIES = RetryPolicy()
 
 
-def retry_budget_spent(policy: RetryPolicy, started_all: float) -> bool:
-    """True once the policy's overall wall-clock budget is spent."""
+def retry_budget_spent(policy: RetryPolicy, started_all: float, now: float = None) -> bool:
+    """True once the policy's overall wall-clock budget is spent.
+
+    `now` lets a caller supply its own clock, so a loop that measures elapsed
+    time with one clock does not compare it against another's.
+    """
     if policy.deadline_s is None:
         return False
-    if time.monotonic() - started_all < policy.deadline_s:
+    if now is None:
+        now = time.monotonic()
+    if now - started_all < policy.deadline_s:
         return False
     print(f"+ giving up: retry budget of {policy.deadline_s}s is spent", flush=True)
     return True

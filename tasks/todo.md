@@ -74,9 +74,41 @@ teardown-side budget; container-mode's image ops and native setup were left
 unretried while their siblings were retried; and the `no_sleep` fixture patched
 `time.sleep` process-wide when the loop already exposes a `sleep=` seam.
 
+### Code review round 2 — 15 findings, all addressed
+
+The round-1 fixes were themselves incomplete:
+
+- **`container_exists` could hang out of the retry loop.** Its `subprocess.run(timeout=60)`
+  raises `TimeoutExpired` from inside `can_retry`, escaping the loop and destroying the
+  transport error the user needed. `container_running` — the near-identical probe 850
+  lines away — already handled that. They share one `_docker_inspect` helper now.
+- **"any non-zero docker exit means absent"** was wrong: a dockerd hiccup or a sudo
+  refusal read as "nothing landed" and unblocked the retry. Only docker's own
+  *no such object* counts as absence.
+- **The launcher had a race the guard could not see.** The pid file is written *after*
+  the spawn, so a probe in that window reads "nothing here" and permits a second
+  bootstrap. The launcher now claims the run *before* spawning, and the probe asks
+  about the claim marker as well as the pid and the start event.
+- **rsync exit 12 was wrong to exclude.** Round 1 dropped it as "too broad", but it is
+  the only code a mid-transfer drop produces — 30 needs a `--timeout` we never pass and
+  35 is daemon-mode only. Without it the rsync retry covered nothing it existed for.
+- **Two probes read a transport failure as data.** `_remote_has_nvidia` returned "no
+  GPU" on a blip, silently dropping `--gpus all` — a multi-hour job on CPU on a paid GPU
+  box. `_ensure_docker` read it as "daemon unreachable" and piped `get.docker.com | sudo
+  sh` onto a box with working docker.
+- **The dpkg repair reached one of four apt call sites**, and the `fuser` it waits with
+  is absent from exactly the slim images the code exists for. One `apt_lock_wait_shell`
+  helper now, with a fuser-free fallback.
+- **The loop diverged from the `RetryPolicy` contract** it claimed to share: it skipped
+  `waits[0]` and checked the budget after burning the backoff.
+- **`fast_sleep` still patched `time.sleep` process-wide** — `ssh_common.time` *is* the
+  time module — and `deadline_s` had no test at all, because every test faked sleep so
+  the clock never advanced. That also surfaced a real bug: the budget was measured on
+  ssh_common's clock but compared against provisioning's.
+
 ### Review section
 
-- `./format.sh`, `./lint.sh` pass. `./test.sh` passes (`733 passed`), 28 new, and
+- `./format.sh`, `./lint.sh` pass. `./test.sh` passes (`738 passed`), 33 new, and
   no existing test needed changing.
 - Reproduced the issue's exact stderr against the exact call that failed, and
   proved the no-duplicate guarantee across every marker state including the
