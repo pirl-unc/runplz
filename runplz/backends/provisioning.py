@@ -46,6 +46,7 @@ __all__ = [
     "GCP_TEARDOWN_POLICY",
     "GCP_RETRY_POLICY",
     "run_with_retries",
+    "retry_budget_spent",
     "NO_RETRIES",
     "RetryPolicy",
 ]
@@ -162,8 +163,8 @@ class RetryPolicy:
 NO_RETRIES = RetryPolicy()
 
 
-def _past(policy: RetryPolicy, started_all: float) -> bool:
-    """True once the policy's overall budget is spent."""
+def retry_budget_spent(policy: RetryPolicy, started_all: float) -> bool:
+    """True once the policy's overall wall-clock budget is spent."""
     if policy.deadline_s is None:
         return False
     if time.monotonic() - started_all < policy.deadline_s:
@@ -217,7 +218,11 @@ def run_with_retries(
                 f"after {elapsed_s:.1f}s (timeout={timeout}s)",
                 flush=True,
             )
-            if attempt < total and policy.retry_timeouts and not _past(policy, started_all):
+            if (
+                attempt < total
+                and policy.retry_timeouts
+                and not retry_budget_spent(policy, started_all)
+            ):
                 print(f"+ {label} attempt {attempt}/{total} will retry", flush=True)
                 continue
             raise CloudCliError(
@@ -249,7 +254,11 @@ def run_with_retries(
                 flush=True,
             )
             return last
-        if policy.transient(err) and attempt < total and not _past(policy, started_all):
+        if (
+            policy.transient(err)
+            and attempt < total
+            and not retry_budget_spent(policy, started_all)
+        ):
             print(
                 f"+ {label} attempt {attempt}/{total} hit transient error; retrying",
                 flush=True,

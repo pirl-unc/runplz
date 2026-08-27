@@ -43,9 +43,40 @@ preparation.
   "exists": declining costs one failed run, a wrong retry costs a second training
   job on the same GPU.
 
+### Code review — 14 findings, all addressed
+
+Two broke the guarantee this PR is *about*:
+
+- **`container_exists` failed open.** `ssh_capture` does not raise on ssh's exit 255,
+  so my try/except was dead and an unreachable probe returned empty stdout — which
+  read as "no container" and would have let a retry start a second one. It reads the
+  return code now.
+- **The probe fired before the backoff.** Order was `attempt, PROBE, sleep` — so
+  during a real blip the probe hit the same broken link, answered "can't tell", and
+  (failing closed) vetoed every retry. The guarded launch paths therefore never
+  retried at all. The two bugs pointed opposite ways: container fail-open, detached
+  fail-closed-always.
+
+And the tests certified a guarantee they never exercised: they rebuilt the
+`retry_on_transport_failure(..., can_retry=...)` call inline, so inverting the guard
+in the source left every test green. They drive `launch_detached_and_wait` and
+`_run_container_detached` now, and four deliberate mutations of the guards are each
+caught by a failing test.
+
+Also: the "255 means nothing ran remotely" claim was wrong — ssh returns 255 for a
+session that drops *mid-command* too, so `_ensure_remote_rsync` now waits out an
+interrupted dpkg lock rather than retrying into it; rsync's exit 12 was dropped from
+the retriable set (it also means "no remote rsync binary", a deterministic failure
+that would burn the budget before showing the real error); the loop now uses
+`provisioning.RetryPolicy` and its shared budget helper, so it has a wall-clock
+deadline and the empty-schedule guard it was missing; `rsync_down` takes the short
+teardown-side budget; container-mode's image ops and native setup were left
+unretried while their siblings were retried; and the `no_sleep` fixture patched
+`time.sleep` process-wide when the loop already exposes a `sleep=` seam.
+
 ### Review section
 
-- `./format.sh`, `./lint.sh` pass. `./test.sh` passes (`729 passed`), 24 new, and
+- `./format.sh`, `./lint.sh` pass. `./test.sh` passes (`733 passed`), 28 new, and
   no existing test needed changing.
 - Reproduced the issue's exact stderr against the exact call that failed, and
   proved the no-duplicate guarantee across every marker state including the

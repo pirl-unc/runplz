@@ -755,11 +755,13 @@ has, or push to S3 at the end of the function.
   exhausted quota, a missing key pair. An error runplz doesn't recognise is
   treated as final rather than retried on a guess.
 - SSH transport blips during run *preparation* (staging, image build, rsync)
-  are retried with bounded backoff — ssh reserves exit 255 for its own
-  failures, so nothing ran remotely and repeating is safe. Launching is
-  different: a dropped connection there is ambiguous, so runplz asks the box
-  whether a bootstrap already exists and refuses the retry if one does. It
-  will never start a second training job on the same GPU.
+  are retried with bounded backoff. ssh reserves exit 255 for its own
+  failures, which tells you the command did not *complete* — not that it
+  never started — so only steps that converge on the same state when
+  repeated are retried. Launching is different: a dropped connection there
+  is ambiguous, so runplz asks the box whether a bootstrap already exists
+  and refuses the retry if one does, or if it cannot get an answer. It will
+  never start a second training job on the same GPU.
 
 ## Tests
 

@@ -33,6 +33,7 @@ from typing import Any, Callable, Optional
 
 from runplz._excludes import DEFAULT_TRANSFER_EXCLUDES
 from runplz.backends import docker
+from runplz.backends.provisioning import RetryPolicy, retry_budget_spent
 
 __all__ = [
     # --- running one function on a reachable box -------------------------
@@ -65,6 +66,8 @@ __all__ = [
     "retry_on_transport_failure",
     "is_ssh_transport_failure",
     "SSH_TRANSPORT_EXIT",
+    "SSH_RESULTS_POLICY",
+    "SSH_PREP_POLICY",
     "ssh_capture",
     "ssh_cmd_opts",
     "run_local",
@@ -755,15 +758,24 @@ def rsync_transport_flags(ssh_opts=None) -> list:
 # nothing staged, no bootstrap — and the identical command succeeded on the
 # next try. The transport blinked; the run did not have to die.
 
-# ssh reserves 255 for its *own* failures, as distinct from the remote
-# command's exit code, which makes it a precise signal that nothing ran
-# remotely. Retrying it is safe for any operation that can run twice.
+# ssh reserves 255 for its own failures, as distinct from the remote
+# command's exit code. That covers both "never connected" and "the session
+# dropped mid-command", so it is a signal that the command did not *complete*
+# — not that it never started. Retrying is therefore safe for steps that
+# converge on the same state when repeated, and the steps below are chosen on
+# that basis rather than on any claim of atomicity.
 SSH_TRANSPORT_EXIT = 255
-# rsync's transport-layer codes: protocol stream error, and its two timeouts.
-RSYNC_TRANSPORT_EXITS = (12, 30, 35, SSH_TRANSPORT_EXIT)
-# Pre-bootstrap staging is cheap to repeat, so back off gently and give the
-# network a real chance rather than failing a job that took minutes to reach.
-SSH_PREP_RETRY_WAITS = (0, 2, 5, 10)
+# rsync's own transport-layer codes. Deliberately *not* 12: that is rsync's
+# generic protocol-stream error, which it also returns for a missing remote
+# rsync binary and for permission failures — deterministic problems that
+# would burn the whole budget before showing the user the real error.
+RSYNC_TRANSPORT_EXITS = (30, 35, SSH_TRANSPORT_EXIT)
+# Staging is cheap to repeat and the job already spent minutes getting here.
+SSH_PREP_POLICY = RetryPolicy(waits=(0, 2, 5, 10), deadline_s=300)
+# Pulling results back runs on the teardown side, often just before a paid
+# box is stopped. Same reasoning as the cloud teardown policies: keep it
+# short so a box that has already gone away costs seconds, not half a minute.
+SSH_RESULTS_POLICY = RetryPolicy(waits=(0, 2), deadline_s=60)
 
 
 def is_ssh_transport_failure(returncode: Optional[int]) -> bool:
@@ -775,30 +787,40 @@ def retry_on_transport_failure(
     action: Callable[[], Any],
     *,
     label: str,
-    waits: tuple = SSH_PREP_RETRY_WAITS,
+    policy: RetryPolicy = SSH_PREP_POLICY,
     retriable_exits: tuple = (SSH_TRANSPORT_EXIT,),
     can_retry: Optional[Callable[[], bool]] = None,
     sleep=None,
 ):
     """Run `action`, retrying it when the *transport* fails.
 
-    Only for operations that can run twice with the same result. `can_retry`
-    is the escape hatch for the ones that cannot be known safe in advance: a
-    launch whose delivery is ambiguous asks the remote whether a bootstrap
-    marker exists, and declines the retry if one does (issue #84).
+    Only for operations that converge on the same state when repeated.
+    `can_retry` is the guard for the ones that do not: a launch whose delivery
+    is ambiguous asks the remote whether a bootstrap marker exists, and
+    declines the retry if one does (issue #84).
+
+    That question is asked *after* the backoff, never before — a probe issued
+    the instant the transport failed would hit the same broken link, answer
+    "can't tell", and (failing closed) veto every retry.
     """
+    if not policy.waits:
+        raise ValueError(f"{label}: retry policy must contain at least one attempt")
     nap = sleep or time.sleep
+    started_all = time.monotonic()
     last = None
-    for attempt, wait_s in enumerate(waits, start=1):
-        if wait_s:
-            nap(wait_s)
+    for attempt, wait_s in enumerate(policy.waits, start=1):
         try:
             return action()
         except subprocess.CalledProcessError as exc:
             last = exc
             if exc.returncode not in retriable_exits:
                 raise
-            if attempt >= len(waits):
+            if attempt >= len(policy.waits):
+                break
+            next_wait = policy.waits[attempt]
+            if next_wait:
+                nap(next_wait)
+            if retry_budget_spent(policy, started_all):
                 break
             if can_retry is not None and not can_retry():
                 print(
@@ -809,9 +831,11 @@ def retry_on_transport_failure(
                 raise
             print(
                 f"+ {label} hit a transient ssh transport failure "
-                f"(exit {exc.returncode}); retrying {attempt}/{len(waits) - 1}",
+                f"(exit {exc.returncode}); retrying "
+                f"{attempt}/{len(policy.waits) - 1}",
                 flush=True,
             )
+    assert last is not None  # the loop only exits here after a failure
     raise last
 
 
@@ -1104,6 +1128,7 @@ def rsync_down(
         lambda: run_local(cmd),
         label=f"rsync down from {target}",
         retriable_exits=RSYNC_TRANSPORT_EXITS,
+        policy=SSH_RESULTS_POLICY,
     )
 
 
@@ -1197,9 +1222,17 @@ def wait_until_ssh_reachable(
 def _ensure_remote_rsync(target: str, *, ssh_opts: Optional[SshOptions] = None):
     """Install rsync on the remote if missing (slim container images
     often don't ship with rsync)."""
+    # A transport drop mid-install leaves dpkg holding its lock, so the retry
+    # would hit "dpkg was interrupted" rather than the blip it is retrying.
+    # Wait the lock out and repair, the same way _run_native already does.
     cmd = (
         "command -v rsync >/dev/null 2>&1 && exit 0; "
         "export DEBIAN_FRONTEND=noninteractive; "
+        "for i in $(seq 1 30); do "
+        "  sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break; "
+        "  echo 'apt busy, waiting'; sleep 2; "
+        "done; "
+        "sudo dpkg --configure -a >/dev/null 2>&1 || true; "
         "sudo apt-get update -qq && "
         "sudo apt-get install -y -qq --no-install-recommends rsync"
     )
@@ -1336,7 +1369,14 @@ def _run_container_mode(
     """
     ops_script = render_image_ops_script(function.image, remote_run=remote_run)
     if ops_script:
-        ssh_exec(target, ops_script, ssh_opts=ssh_opts)
+        # Container mode's equivalent of _build_image: apt/pip layers applied
+        # inline. brev's container mode never reaches _build_image, so without
+        # this the mode where the box *is* the user's image had no cover at
+        # all for a #84-shaped blip.
+        retry_on_transport_failure(
+            lambda: ssh_exec(target, ops_script, ssh_opts=ssh_opts),
+            label=f"apply image ops on {target}",
+        )
 
     user_env_exports = " ".join(
         f"export {k}={shlex.quote(str(v))};" for k, v in function.env.items()
@@ -1406,7 +1446,12 @@ def _run_native(
         f"pip install --quiet torch --index-url {torch_index}; "
         f"pip install --quiet -e {_remote_repo_shell(remote_run)}"
     )
-    ssh_exec(target, setup, ssh_opts=ssh_opts)
+    # A superset of _ensure_remote_rsync's apt-get, which is retried — the
+    # two adjacent calls should not behave differently for the same failure.
+    retry_on_transport_failure(
+        lambda: ssh_exec(target, setup, ssh_opts=ssh_opts),
+        label=f"prepare native environment on {target}",
+    )
 
     user_env_exports = " ".join(
         f"export {k}={shlex.quote(str(v))};" for k, v in function.env.items()
@@ -1573,18 +1618,29 @@ def container_exists(
 ) -> bool:
     """True when a container of this name is already present on the remote.
 
-    Unreachable probe counts as "exists", for the same reason as
-    :func:`detached_run_started`.
+    Reads the *return code*, not just stdout. `ssh_capture` does not raise on
+    ssh's exit 255, so a probe over a still-broken link came back with empty
+    stdout — which read as "no container" and would have let a retry start a
+    second one. An unreachable probe counts as "exists" instead, for the same
+    reason as :func:`detached_run_started`.
     """
-    try:
-        out = ssh_capture(
+    r = subprocess.run(
+        [
+            "ssh",
+            *ssh_cmd_opts(ssh_opts),
             target,
-            f"sudo docker inspect --format '{{{{.Name}}}}' {container_name} 2>/dev/null || true",
-            ssh_opts=ssh_opts,
-        )
-    except Exception:  # noqa: BLE001
+            f"sudo docker inspect --format '{{{{.Name}}}}' {container_name}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if is_ssh_transport_failure(r.returncode):
+        # Could not ask. Not proof of absence.
         return True
-    return bool((out or "").strip())
+    # docker exits non-zero for "no such object", which *is* an answer.
+    return r.returncode == 0 and bool((r.stdout or "").strip())
 
 
 def build_detached_launcher(remote_run: RemoteRunContext, wrapped_command: str) -> str:
