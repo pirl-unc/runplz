@@ -435,6 +435,7 @@ def _tail_main(argv):
             outputs_dir=Path(args.outputs_dir).resolve(),
             host_override=args.host,
             run_id_override=args.run_id,
+            ssh_opts=_ssh_opts_from_args(args),
             lines=args.lines,
             follow=args.follow,
         )
@@ -460,6 +461,7 @@ def _status_main(argv):
             outputs_dir=Path(args.outputs_dir).resolve(),
             host_override=args.host,
             run_id_override=args.run_id,
+            ssh_opts=_ssh_opts_from_args(args),
         )
     except _runs.ManifestNotFound as exc:
         print(str(exc), file=sys.stderr)
@@ -513,6 +515,7 @@ def _kill_main(argv, *, prog="kill"):
             outputs_dir=Path(args.outputs_dir).resolve(),
             host_override=args.host,
             run_id_override=args.run_id,
+            ssh_opts=_ssh_opts_from_args(args),
             timeout_s=args.timeout,
             escalate=not args.no_escalate,
             first_signal=args.signal,
@@ -523,6 +526,17 @@ def _kill_main(argv, *, prog="kill"):
     except (RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
+
+
+def _ssh_opts_from_args(args):
+    """Explicit --ssh-key / --ssh-port, or None to fall back to the manifest."""
+    from runplz.backends.ssh_common import SshOptions
+
+    key = getattr(args, "ssh_key", None)
+    port = getattr(args, "ssh_port", None)
+    if not key and not port:
+        return None
+    return SshOptions(port=port, identity_file=key)
 
 
 def _add_run_lookup_args(parser):
@@ -538,6 +552,19 @@ def _add_run_lookup_args(parser):
     parser.add_argument(
         "--run-id",
         help="Pin to a specific remote run_id instead of the most recent. Requires --host.",
+    )
+    parser.add_argument(
+        "--ssh-key",
+        help=(
+            "Private key to authenticate with. Defaults to whatever the run's "
+            "manifest recorded, so this is only needed when following a run "
+            "by --host/--run-id with no local manifest."
+        ),
+    )
+    parser.add_argument(
+        "--ssh-port",
+        type=int,
+        help="SSH port. Defaults to the run manifest's, then ssh's own default.",
     )
 
 

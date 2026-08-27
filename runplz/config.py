@@ -149,6 +149,10 @@ class SshConfig:
     # Optional ssh port. When None, ssh's default (22 or whatever the user's
     # config sets).
     port: Optional[int] = None
+    # Private key to authenticate with. None → ssh's own resolution (agent,
+    # ~/.ssh/id_*, or an IdentityFile entry). Set it when the box uses a
+    # key that ssh would not otherwise offer.
+    ssh_key_path: Optional[str] = None
     # True (default): build/pull a docker image on the remote and `docker
     # run` the bootstrap. Mirrors BrevConfig(mode="vm", use_docker=True).
     # False: install a python venv on the remote and run the bootstrap
@@ -282,13 +286,10 @@ class AwsConfig:
     alias for you, so `key_name` is required and the target is built from
     the instance's public IP.
 
-    The private half of that key pair must be resolvable by ssh itself —
-    loaded into your agent (`ssh-add ~/.ssh/my-key.pem`), named as one of
-    ssh's defaults, or given an `IdentityFile` entry in `~/.ssh/config`.
-    runplz does not take a key path today: `ssh_common` threads a port and
-    nothing else through its ~50 call sites, and plumbing an identity file
-    through all of them belongs in its own change, shared with the ssh,
-    brev and gcp backends rather than bolted on here.
+    Point `ssh_key_path` at the private half of that key pair; runplz passes
+    it as `-i` (with `IdentitiesOnly=yes`, so a loaded agent cannot offer its
+    other keys first and trip the server's MaxAuthTries). Leave it None if
+    the key is already agent-loaded or named in your ssh config.
 
     Networking is pinned, never created: pass an existing `subnet_id` /
     `security_group_id`. The security group must allow inbound TCP 22 from
@@ -309,6 +310,12 @@ class AwsConfig:
     key_name: Optional[str] = None
     # Login user for the AMI. Deep Learning AMIs are Ubuntu-based.
     ssh_user: str = "ubuntu"
+    # Private half of `key_name`, e.g. "~/.ssh/my-key.pem". None → ssh's own
+    # resolution (agent, default name, or an IdentityFile entry). EC2 keys
+    # are conventionally saved under a name ssh will not offer on its own,
+    # and no Host block can be written in advance because the instance IP
+    # does not exist yet — so setting this is usually what you want.
+    ssh_key_path: Optional[str] = None
     # Existing VPC bits to attach to. None → account default VPC.
     subnet_id: Optional[str] = None
     security_group_id: Optional[str] = None

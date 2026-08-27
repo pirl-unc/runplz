@@ -11,6 +11,7 @@ import pytest
 
 from runplz import App, Image, SshConfig
 from runplz.backends import ssh  # noqa: I001
+from runplz.backends.ssh_common import SshOptions
 
 # --- helpers -------------------------------------------------------------
 
@@ -117,7 +118,10 @@ def test_build_ssh_target_cfg_user_overrides_url_user():
 
 def test_build_ssh_target_config_port_threads_through():
     """3.7.1: SshConfig.port is actually wired into ssh/rsync now."""
-    assert ssh._build_ssh_target("my-box", user=None, port=2222) == ("my-box", 2222)
+    assert ssh._build_ssh_target("my-box", user=None, port=2222) == (
+        "my-box",
+        2222,
+    )
 
 
 def test_build_ssh_target_port_parsed_from_url():
@@ -126,7 +130,10 @@ def test_build_ssh_target_port_parsed_from_url():
 
 def test_build_ssh_target_config_port_overrides_url_port():
     # Explicit SshConfig.port beats whatever the URL happened to inline.
-    assert ssh._build_ssh_target("my-box:9999", user=None, port=2222) == ("my-box", 2222)
+    assert ssh._build_ssh_target("my-box:9999", user=None, port=2222) == (
+        "my-box",
+        2222,
+    )
 
 
 def test_build_ssh_target_non_numeric_colon_suffix_kept_as_host():
@@ -143,7 +150,7 @@ def test_build_ssh_target_non_numeric_colon_suffix_kept_as_host():
 def test_ssh_cmd_opts_includes_dash_p_when_port_set():
     from runplz.backends import ssh_common
 
-    opts = ssh_common.ssh_cmd_opts(port=2222)
+    opts = ssh_common.ssh_cmd_opts(ssh_opts=SshOptions(port=2222))
     assert opts[-2:] == ["-p", "2222"]
     # Base opts are preserved.
     assert "ControlMaster=no" in opts
@@ -152,13 +159,13 @@ def test_ssh_cmd_opts_includes_dash_p_when_port_set():
 def test_ssh_cmd_opts_omits_dash_p_when_port_none():
     from runplz.backends import ssh_common
 
-    assert "-p" not in ssh_common.ssh_cmd_opts(port=None)
+    assert "-p" not in ssh_common.ssh_cmd_opts(ssh_opts=None)
 
 
 def test_rsync_ssh_transport_includes_port():
     from runplz.backends import ssh_common
 
-    transport = ssh_common.rsync_ssh_transport(port=2222)
+    transport = ssh_common.rsync_ssh_transport(ssh_opts=SshOptions(port=2222))
     # -e string must survive shell parsing as ["ssh", ..., "-p", "2222"].
     import shlex as _shlex
 
@@ -173,7 +180,7 @@ def test_rsync_up_threads_port_into_transport(tmp_path):
 
     recorded = {}
     with mock.patch("runplz.backends.ssh_common.run_local", lambda c: recorded.setdefault("c", c)):
-        ssh_common.rsync_up(tmp_path, "my-box", port=2222)
+        ssh_common.rsync_up(tmp_path, "my-box", ssh_opts=SshOptions(port=2222))
 
     cmd = recorded["c"]
     assert cmd[:2] == ["rsync", "-az"]
@@ -189,7 +196,7 @@ def test_rsync_up_omits_transport_flag_when_no_port(tmp_path):
 
     recorded = {}
     with mock.patch("runplz.backends.ssh_common.run_local", lambda c: recorded.setdefault("c", c)):
-        ssh_common.rsync_up(tmp_path, "my-box", port=None)
+        ssh_common.rsync_up(tmp_path, "my-box", ssh_opts=None)
 
     # Without a port we don't set -e — rsync uses the system's default ssh.
     assert "-e" not in recorded["c"]
@@ -200,7 +207,7 @@ def test_ssh_helper_threads_port(tmp_path):
 
     recorded = {}
     with mock.patch("runplz.backends.ssh_common.run_local", lambda c: recorded.setdefault("c", c)):
-        ssh_common.ssh_exec("my-box", "echo hi", port=2222)
+        ssh_common.ssh_exec("my-box", "echo hi", ssh_opts=SshOptions(port=2222))
 
     cmd = recorded["c"]
     assert cmd[0] == "ssh"
@@ -224,17 +231,20 @@ def test_ssh_run_end_to_end_passes_port_through_to_helpers(tmp_path):
 
     seen_ports = {"reachable": None, "rsync_up": None, "build": None, "stream": None}
 
-    def fake_wait(target, *, port=None, **kw):
-        seen_ports["reachable"] = port
+    def _port_of(ssh_opts):
+        return ssh_opts.port if ssh_opts is not None else None
 
-    def fake_rsync_up(repo, target, *, remote_run=None, port=None, **_):
-        seen_ports["rsync_up"] = port
+    def fake_wait(target, *, ssh_opts=None, **kw):
+        seen_ports["reachable"] = _port_of(ssh_opts)
 
-    def fake_build(target, image, *, remote_run=None, port=None):
-        seen_ports["build"] = port
+    def fake_rsync_up(repo, target, *, remote_run=None, ssh_opts=None, **_):
+        seen_ports["rsync_up"] = _port_of(ssh_opts)
 
-    def fake_stream(target, container_name, *, port=None, **kw):
-        seen_ports["stream"] = port
+    def fake_build(target, image, *, remote_run=None, ssh_opts=None):
+        seen_ports["build"] = _port_of(ssh_opts)
+
+    def fake_stream(target, container_name, *, ssh_opts=None, **kw):
+        seen_ports["stream"] = _port_of(ssh_opts)
         return 0
 
     with (

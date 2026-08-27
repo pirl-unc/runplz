@@ -24,7 +24,7 @@ from runplz.backends.provisioning import (
     resolve_gpu_label,
     run_cli,
 )
-from runplz.backends.ssh_common import run_on_provisioned_vm
+from runplz.backends.ssh_common import SshOptions, run_on_provisioned_vm
 
 __all__ = ["run"]
 
@@ -88,7 +88,9 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
         state["instance_id"] = instance_id
         _wait_running(cfg, instance_id)
         ip = _public_ip(cfg, instance_id)
-        return (f"{cfg.ssh_user}@{ip}", None)
+        # The target is only knowable after the box exists, so the options
+        # travel back with it.
+        return (f"{cfg.ssh_user}@{ip}", SshOptions(identity_file=cfg.ssh_key_path))
 
     def teardown():
         apply_on_finish(cfg, state["instance_id"], name=name)

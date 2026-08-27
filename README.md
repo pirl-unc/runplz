@@ -256,6 +256,11 @@ runplz kill --no-escalate          # SIGTERM only; report whatever survives
 runplz cancel                      # alias for kill
 ```
 
+`runplz tail` / `status` / `kill` reuse whatever ssh port and key the
+dispatch recorded in the run manifest, so following a run on a box that
+needed one just works. `--ssh-key` / `--ssh-port` override that, which is
+what you want when targeting `--host`/`--run-id` with no local manifest.
+
 `tail`, `status` and `kill` default to "most recent run in `./out/`" by
 reading the local `out/.runplz/run.json` manifest the dispatch path
 writes. Pass `--outputs-dir <path>` to point at a different one, or
@@ -366,6 +371,9 @@ where `nvidia-smi` reports a T4 (or no GPUs at all). Warnings only — the
 job still runs; the user may know something we don't (MIG slicing,
 overcommit, etc.).
 
+`SshConfig(ssh_key_path=...)` pins the private key for a box whose key
+ssh would not otherwise offer — the same plumbing the AWS backend uses.
+
 ### What runplz does NOT ship to the remote
 
 For Brev and SSH launches from a Git worktree, runplz stages the files Git knows about plus
@@ -433,6 +441,12 @@ must be resolvable by ssh itself: `ssh-add ~/.ssh/my-key.pem`, a default
 `~/.ssh/id_*` name, or an `IdentityFile` entry. runplz takes no key path
 today (see Caveats).
 
+Point `ssh_key_path` at the private half of that key pair and runplz passes
+it through as `-i` — to ssh *and* to rsync's transport — along with
+`IdentitiesOnly=yes`, so a loaded agent can't offer its other keys first and
+trip the server's `MaxAuthTries`. Leave it `None` if the key is already
+agent-loaded or named in your ssh config.
+
 The security group in play must allow inbound TCP 22 from wherever you run
 runplz, or the run will sit in the ssh wait until it times out.
 
@@ -442,6 +456,7 @@ runplz, or the run will sit in the ssh wait until it times out.
 | `instance_type` | derived | from `gpu=` / `min_gpus`; `g5.12xlarge`, `p5.48xlarge`, … |
 | `ami` | resolved from SSM | Deep Learning AMI. Ids are region-specific and roll monthly, so runplz looks the current one up rather than pinning a stale id |
 | `ssh_user` | `"ubuntu"` | DLAMIs are Ubuntu-based |
+| `ssh_key_path` | `None` | private half of `key_name`, e.g. `~/.ssh/my-key.pem` |
 | `subnet_id`, `security_group_id` | account default VPC | pinned, never created |
 | `volume_gb` | `Function.min_disk` | always sent with `DeleteOnTermination`, so `on_finish="delete"` takes the disk too |
 | `spot` | `False` | cheaper, reclaimable. No retry-on-reclaim yet |
@@ -733,10 +748,6 @@ has, or push to S3 at the end of the function.
   package), so it can live anywhere in the repo.
 - One `App` per script. Multiple `App`s in one file is ambiguous for the
   CLI loader and errors.
-- `AwsConfig` takes no key path. The EC2 key pair's private half must be
-  loaded in your ssh agent or resolvable from `~/.ssh/config`. Threading an
-  identity file through `ssh_common` touches ~50 call sites and belongs in
-  its own change, shared with the ssh/brev/gcp backends.
 - `runplz ps` does not list `gcp` / `aws` jobs yet — that needs a per-cloud
   query. `runplz tail` / `status` / `kill` work as usual once a run has
   written its manifest.

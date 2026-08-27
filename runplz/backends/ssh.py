@@ -20,6 +20,7 @@ from typing import Optional
 
 from runplz.backends import docker
 from runplz.backends.ssh_common import (
+    SshOptions,
     dispatch_to_target,
     parse_probe_sections,
     ssh_capture,
@@ -33,9 +34,10 @@ __all__ = ["run", "list_jobs"]
 def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
     cfg = app.ssh_config
     target, port = _build_ssh_target(host, user=cfg.user, port=cfg.port)
+    ssh_opts = SshOptions(port=port, identity_file=cfg.ssh_key_path)
 
-    wait_until_ssh_reachable(target, port=port, max_wait_s=cfg.ssh_ready_wait_seconds)
-    _warn_on_spec_mismatch(target, function, port=port)
+    wait_until_ssh_reachable(target, ssh_opts=ssh_opts, max_wait_s=cfg.ssh_ready_wait_seconds)
+    _warn_on_spec_mismatch(target, function, ssh_opts=ssh_opts)
 
     # No teardown: the user owns this box's lifecycle, which is the whole
     # point of the ssh backend. Everything else is the shared dispatch.
@@ -49,20 +51,27 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
         outputs_dir=outputs_dir,
         mode="docker" if cfg.use_docker else "native",
         max_runtime_seconds=cfg.max_runtime_seconds,
-        port=port,
+        ssh_opts=ssh_opts,
     )
 
 
-def list_jobs(*, host: str, user: Optional[str] = None, port: Optional[int] = None) -> list[dict]:
+def list_jobs(
+    *,
+    host: str,
+    user: Optional[str] = None,
+    port: Optional[int] = None,
+    ssh_key_path: Optional[str] = None,
+) -> list[dict]:
     """Return runplz jobs currently running on the SSH target ``host``.
 
     SSH has no registry of hosts, so the caller must supply one. Filters on
     the ``runplz=1`` label — the same label stamped by :func:`_run_container_detached`.
     """
     target, resolved_port = _build_ssh_target(host, user=user, port=port)
+    ssh_opts = SshOptions(port=resolved_port, identity_file=ssh_key_path)
     cmd = [
         "ssh",
-        *ssh_cmd_opts(resolved_port),
+        *ssh_cmd_opts(ssh_opts),
         target,
         f"sudo docker ps --filter {docker.PS_FILTER} "
         f"--format '{docker.PS_FORMAT}' 2>/dev/null || true",
@@ -116,7 +125,7 @@ _MEMINFO_LINE = re.compile(r"^MemTotal:\s+(\d+)\s+kB", re.MULTILINE)
 _NVIDIA_LINE = re.compile(r"^([^,]+),\s*(\d+)\s*MiB$", re.MULTILINE)
 
 
-def _warn_on_spec_mismatch(target: str, function, *, port: Optional[int] = None) -> None:
+def _warn_on_spec_mismatch(target: str, function, *, ssh_opts: Optional[SshOptions] = None) -> None:
     """Probe the remote box and warn when its specs don't meet the function's
     constraints. Best-effort — never raises. The user may know something we
     don't (overcommitting a dev box, MIG-partitioned GPUs, etc.).
@@ -132,7 +141,7 @@ def _warn_on_spec_mismatch(target: str, function, *, port: Optional[int] = None)
             "echo '---NVIDIA---'; "
             "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null; "
             "echo '---END---'",
-            port=port,
+            ssh_opts=ssh_opts,
         )
     except Exception as exc:  # noqa: BLE001
         print(

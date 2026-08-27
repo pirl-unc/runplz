@@ -23,6 +23,7 @@ from runplz.backends.ssh_common import (
     KILL_SETTLE_S,
     REMOTE_META_DIRNAME,
     REMOTE_RUNS_DIR,
+    SshOptions,
     build_kill_command,
     is_safe_run_id,
     remote_shell_path,
@@ -98,6 +99,16 @@ def resolve_target_and_meta(
     return (target, meta, manifest)
 
 
+def _ssh_opts_from(manifest: dict) -> SshOptions:
+    """Rebuild the ssh options the dispatch recorded for this run.
+
+    Without this, following a run on a box that needs a port or a key (an
+    EC2 instance whose IP didn't exist when you wrote your ssh config) would
+    fail to authenticate even though the dispatch itself worked.
+    """
+    return SshOptions.from_manifest((manifest or {}).get("ssh_options"))
+
+
 def tail(
     *,
     outputs_dir: Path,
@@ -105,10 +116,10 @@ def tail(
     run_id_override: Optional[str],
     lines: int,
     follow: bool,
-    port: Optional[int] = None,
+    ssh_opts: Optional[SshOptions] = None,
 ) -> int:
     """Stream the remote ``last.log`` to stdout. Returns ssh's exit code."""
-    target, meta, _ = resolve_target_and_meta(
+    target, meta, manifest = resolve_target_and_meta(
         outputs_dir=outputs_dir,
         host_override=host_override,
         run_id_override=run_id_override,
@@ -116,7 +127,7 @@ def tail(
     log_path = remote_shell_path(f"{meta}/last.log")
     flags = "-F" if follow else f"-n {int(lines)}"
     remote_cmd = f'tail {flags} "{log_path}"'
-    cmd = ["ssh", *ssh_cmd_opts(port), target, remote_cmd]
+    cmd = ["ssh", *ssh_cmd_opts(ssh_opts or _ssh_opts_from(manifest)), target, remote_cmd]
     return subprocess.run(cmd).returncode
 
 
@@ -125,7 +136,7 @@ def status(
     outputs_dir: Path,
     host_override: Optional[str],
     run_id_override: Optional[str],
-    port: Optional[int] = None,
+    ssh_opts: Optional[SshOptions] = None,
 ) -> int:
     """Print a one-screen summary of the most recent run's state."""
     target, meta, manifest = resolve_target_and_meta(
@@ -143,7 +154,7 @@ def status(
         f"echo '---EVENT_COUNT---'; wc -l < {ev_q} 2>/dev/null || echo 0; "
         f"echo '---END---'"
     )
-    cmd = ["ssh", *ssh_cmd_opts(port), target, remote_cmd]
+    cmd = ["ssh", *ssh_cmd_opts(ssh_opts or _ssh_opts_from(manifest)), target, remote_cmd]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         print(f"ssh to {target} failed (rc={r.returncode})")
@@ -163,7 +174,7 @@ def kill(
     timeout_s: int = DEFAULT_KILL_TIMEOUT_S,
     escalate: bool = True,
     first_signal: str = "TERM",
-    port: Optional[int] = None,
+    ssh_opts: Optional[SshOptions] = None,
 ) -> int:
     """Stop a detached run and report what happened to it.
 
@@ -188,7 +199,7 @@ def kill(
         escalate=escalate,
         first_signal=first_signal,
     )
-    cmd = ["ssh", *ssh_cmd_opts(port), target, remote_cmd]
+    cmd = ["ssh", *ssh_cmd_opts(ssh_opts or _ssh_opts_from(manifest)), target, remote_cmd]
     # The remote side owns the signal/poll/escalate clock; give ssh enough
     # headroom to outlive the worst case rather than cutting it off mid-dance.
     ssh_timeout = timeout_s + KILL_SETTLE_S + 60
