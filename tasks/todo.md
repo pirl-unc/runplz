@@ -5,7 +5,7 @@ Branch: `feat/shared-cli-retries` (off `main` @ `053ba33`)
 - [x] `run_with_retries` + `RetryPolicy`, used by brev, gcp and aws
 - [x] Per-provider transient/non-retriable tables stay per-provider
 - [x] gcp/aws gain retries on create, AMI lookup, describe and teardown
-- [x] Bump `runplz/version.py` to 3.18.0
+- [x] Bump `runplz/version.py` to 3.19.0 (3.18.0 went to #82, which merged first)
 - [x] `./format.sh`, `./lint.sh`, `./test.sh`
 - [ ] Review, merge, deploy
 
