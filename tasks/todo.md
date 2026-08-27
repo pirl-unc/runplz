@@ -1,3 +1,57 @@
+## 2026-08-27 PR Plan — Retry idempotent SSH preparation (#84)
+
+Branch: `fix/retry-ssh-preparation` (off `main` @ `1182715`)
+
+- [x] Classify ssh transport failure (exit 255) and rsync's transport codes
+- [x] Retry the idempotent pre-bootstrap steps with bounded backoff
+- [x] Guard both launch paths with a remote marker check
+- [x] Bump `runplz/version.py` to 3.19.1
+- [x] `./format.sh`, `./lint.sh`, `./test.sh`
+- [ ] Review, merge, deploy
+
+### The failure
+
+Reported against 3.17.0, Brev backend, existing running instance with auto-create
+disabled. SSH readiness succeeded; the next call died:
+
+    Read from remote host ...: Can't assign requested address
+    client_loop: send disconnect: Broken pipe
+
+Traceback: `brev.run -> run_on_provisioned_vm -> dispatch_to_target ->
+_prepare_remote_run -> ssh_exec -> run_local`. The remote afterwards held only
+`run.json` and a `launch_prepared` event — nothing staged, no bootstrap, no training
+process. The identical command then succeeded.
+
+### Scope / design
+
+Not the same problem as #81. That is the vendor CLI attempt loop, before the box is
+reachable. This is the transport dropping *after* readiness, inside shared SSH
+preparation.
+
+- **What makes retrying safe:** ssh reserves exit 255 for its *own* failures, as
+  distinct from the remote command's exit code. A 255 means nothing ran remotely,
+  so repeating an idempotent step converges on the same state. A remote command
+  that genuinely failed (exit 1, no disk) is surfaced immediately — retrying it
+  would only delay the error the user needs to see.
+- **Retried:** `_prepare_remote_run` (writes/overwrites the run dir),
+  `_ensure_remote_rsync`, `_build_image`, `rsync_up`, `rsync_down`. rsync also gets
+  its own transport codes (12, 30, 35).
+- **Guarded, not retried:** the detached launcher and `docker run -d`. A transport
+  failure there is ambiguous — the launcher may have detached before the connection
+  dropped — so the retry asks the remote whether a bootstrap pid, a start event or a
+  container already exists, and declines if so. An unreachable probe counts as
+  "exists": declining costs one failed run, a wrong retry costs a second training
+  job on the same GPU.
+
+### Review section
+
+- `./format.sh`, `./lint.sh` pass. `./test.sh` passes (`729 passed`), 24 new, and
+  no existing test needed changing.
+- Reproduced the issue's exact stderr against the exact call that failed, and
+  proved the no-duplicate guarantee across every marker state including the
+  ambiguous ones.
+- No live cloud calls.
+
 ## 2026-08-27 PR Plan — Share the CLI retry loop (#81)
 
 Branch: `feat/shared-cli-retries` (off `main` @ `053ba33`)

@@ -62,6 +62,9 @@ __all__ = [
     "write_local_ssh_options",
     # --- talking to the box ----------------------------------------------
     "ssh_exec",
+    "retry_on_transport_failure",
+    "is_ssh_transport_failure",
+    "SSH_TRANSPORT_EXIT",
     "ssh_capture",
     "ssh_cmd_opts",
     "run_local",
@@ -79,6 +82,8 @@ __all__ = [
     "launch_detached_and_wait",
     "tail_and_wait_for_detached",
     "remote_pid_alive",
+    "container_exists",
+    "detached_run_started",
     "read_remote_exit_code",
     "DetachedProcessState",
     "DetachedRunStatus",
@@ -630,7 +635,12 @@ def _prepare_remote_run(
         f': > "{remote_run.heartbeat_shell}"\n'
         f': > "{remote_run.last_log_shell}"\n'
     )
-    ssh_exec(target, remote, ssh_opts=ssh_opts)
+    # Writes the run dir and overwrites the manifest, so running it twice
+    # leaves the same state. This is the call that failed in issue #84.
+    retry_on_transport_failure(
+        lambda: ssh_exec(target, remote, ssh_opts=ssh_opts),
+        label=f"prepare remote run {remote_run.run_id}",
+    )
 
 
 def _record_remote_event(
@@ -735,6 +745,74 @@ def rsync_transport_flags(ssh_opts=None) -> list:
     if SshOptions.coerce(ssh_opts) == SshOptions():
         return []
     return ["-e", rsync_ssh_transport(ssh_opts)]
+
+
+# --- transient ssh transport failures -------------------------------------
+#
+# Issue #84: a run reached SSH readiness, then died in _prepare_remote_run
+# with `Can't assign requested address` / `client_loop: send disconnect:
+# Broken pipe`. The remote held only run.json and a launch_prepared event —
+# nothing staged, no bootstrap — and the identical command succeeded on the
+# next try. The transport blinked; the run did not have to die.
+
+# ssh reserves 255 for its *own* failures, as distinct from the remote
+# command's exit code, which makes it a precise signal that nothing ran
+# remotely. Retrying it is safe for any operation that can run twice.
+SSH_TRANSPORT_EXIT = 255
+# rsync's transport-layer codes: protocol stream error, and its two timeouts.
+RSYNC_TRANSPORT_EXITS = (12, 30, 35, SSH_TRANSPORT_EXIT)
+# Pre-bootstrap staging is cheap to repeat, so back off gently and give the
+# network a real chance rather than failing a job that took minutes to reach.
+SSH_PREP_RETRY_WAITS = (0, 2, 5, 10)
+
+
+def is_ssh_transport_failure(returncode: Optional[int]) -> bool:
+    """True when ssh itself failed rather than the remote command."""
+    return returncode == SSH_TRANSPORT_EXIT
+
+
+def retry_on_transport_failure(
+    action: Callable[[], Any],
+    *,
+    label: str,
+    waits: tuple = SSH_PREP_RETRY_WAITS,
+    retriable_exits: tuple = (SSH_TRANSPORT_EXIT,),
+    can_retry: Optional[Callable[[], bool]] = None,
+    sleep=None,
+):
+    """Run `action`, retrying it when the *transport* fails.
+
+    Only for operations that can run twice with the same result. `can_retry`
+    is the escape hatch for the ones that cannot be known safe in advance: a
+    launch whose delivery is ambiguous asks the remote whether a bootstrap
+    marker exists, and declines the retry if one does (issue #84).
+    """
+    nap = sleep or time.sleep
+    last = None
+    for attempt, wait_s in enumerate(waits, start=1):
+        if wait_s:
+            nap(wait_s)
+        try:
+            return action()
+        except subprocess.CalledProcessError as exc:
+            last = exc
+            if exc.returncode not in retriable_exits:
+                raise
+            if attempt >= len(waits):
+                break
+            if can_retry is not None and not can_retry():
+                print(
+                    f"+ {label} failed at the transport layer, but the remote "
+                    f"already shows work in progress — not retrying",
+                    flush=True,
+                )
+                raise
+            print(
+                f"+ {label} hit a transient ssh transport failure "
+                f"(exit {exc.returncode}); retrying {attempt}/{len(waits) - 1}",
+                flush=True,
+            )
+    raise last
 
 
 # --- low-level ssh / sh / rsync ------------------------------------------
@@ -958,10 +1036,22 @@ def rsync_up(
     stdin = None
     if selected_paths is not None:
         stdin = b"".join(os.fsencode(path) + b"\0" for path in selected_paths)
-    if stdin is None:
-        run_local(cmd)
-    else:
-        run_local(cmd, stdin=stdin)
+
+    # rsync is a sync: repeating it converges on the same result, and a
+    # half-transferred tree is exactly what a retry is for.
+    def _send():
+        # Keep the historical call shape: `stdin` is only passed when there
+        # is one, so anything that fakes run_local keeps working.
+        if stdin is None:
+            run_local(cmd)
+        else:
+            run_local(cmd, stdin=stdin)
+
+    retry_on_transport_failure(
+        _send,
+        label=f"rsync up to {target}",
+        retriable_exits=RSYNC_TRANSPORT_EXITS,
+    )
     _record_remote_event(target, remote_run, "rsync_up_done", ssh_opts=ssh_opts)
 
 
@@ -1009,7 +1099,12 @@ def rsync_down(
     _record_remote_event(target, remote_run, "rsync_down_start", ssh_opts=ssh_opts)
     cmd = ["rsync", "-az", *rsync_transport_flags(ssh_opts)]
     cmd.extend([_remote_out_rsync(target, remote_run), f"{local_out}/"])
-    run_local(cmd)
+    # rsync is a sync: repeating it converges on the same result.
+    retry_on_transport_failure(
+        lambda: run_local(cmd),
+        label=f"rsync down from {target}",
+        retriable_exits=RSYNC_TRANSPORT_EXITS,
+    )
 
 
 # --- connectivity helpers ------------------------------------------------
@@ -1108,7 +1203,10 @@ def _ensure_remote_rsync(target: str, *, ssh_opts: Optional[SshOptions] = None):
         "sudo apt-get update -qq && "
         "sudo apt-get install -y -qq --no-install-recommends rsync"
     )
-    ssh_exec(target, cmd, ssh_opts=ssh_opts)
+    retry_on_transport_failure(
+        lambda: ssh_exec(target, cmd, ssh_opts=ssh_opts),
+        label=f"ensure rsync on {target}",
+    )
 
 
 def _ensure_docker(target: str, timeout_s: int = 420, *, ssh_opts: Optional[SshOptions] = None):
@@ -1367,7 +1465,10 @@ def _build_image(
             f"{df}\n"
             f"__EOF__"
         )
-    ssh_exec(target, build, ssh_opts=ssh_opts)
+    retry_on_transport_failure(
+        lambda: ssh_exec(target, build, ssh_opts=ssh_opts),
+        label=f"build image on {target}",
+    )
     _record_remote_event(target, remote_run, "build_image_done", ssh_opts=ssh_opts)
 
 
@@ -1433,7 +1534,57 @@ def _run_container_detached(
         f"{REMOTE_IMAGE_TAG} python -m runplz._bootstrap >/dev/null; "
         f"{monitor}"
     )
-    ssh_exec(target, start, ssh_opts=ssh_opts)
+    # Same ambiguity as the detached launcher: `docker run -d` may have
+    # started the container before the transport dropped. Ask docker before
+    # retrying rather than starting a second one (issue #84).
+    retry_on_transport_failure(
+        lambda: ssh_exec(target, start, ssh_opts=ssh_opts),
+        label=f"start container {container_name}",
+        can_retry=lambda: not container_exists(target, container_name, ssh_opts=ssh_opts),
+    )
+
+
+def detached_run_started(
+    target: str,
+    pid_file: str,
+    events_file: str,
+    *,
+    ssh_opts: Optional[SshOptions] = None,
+) -> bool:
+    """True when a bootstrap for this run already exists on the remote.
+
+    The no-duplicate guarantee for issue #84: an ambiguous launch is only
+    retried when the remote can confirm nothing landed. If the probe itself
+    cannot be reached, that counts as "something may exist" — declining a
+    retry costs one failed run, and a wrong retry costs a second training
+    job on the same GPU.
+    """
+    try:
+        status = inspect_detached_run(target, pid_file, events_file=events_file, ssh_opts=ssh_opts)
+    except Exception:  # noqa: BLE001 - unreachable probe is not proof of absence
+        return True
+    if status.started or status.pid:
+        return True
+    return status.process_state not in {DetachedProcessState.MISSING}
+
+
+def container_exists(
+    target: str, container_name: str, *, ssh_opts: Optional[SshOptions] = None
+) -> bool:
+    """True when a container of this name is already present on the remote.
+
+    Unreachable probe counts as "exists", for the same reason as
+    :func:`detached_run_started`.
+    """
+    try:
+        out = ssh_capture(
+            target,
+            f"sudo docker inspect --format '{{{{.Name}}}}' {container_name} 2>/dev/null || true",
+            ssh_opts=ssh_opts,
+        )
+    except Exception:  # noqa: BLE001
+        return True
+    return bool((out or "").strip())
 
 
 def build_detached_launcher(remote_run: RemoteRunContext, wrapped_command: str) -> str:
@@ -1976,7 +2127,18 @@ def launch_detached_and_wait(
     launcher = build_detached_launcher(remote_run, wrapped_command)
     # Launch ssh returns quickly once the detached job is running + PID
     # recorded. Anything that follows in this function is local polling.
-    ssh_exec(target, launcher, ssh_opts=ssh_opts)
+    #
+    # A transport failure here is ambiguous: the launcher may have run and
+    # detached before the connection dropped. So the retry asks the remote
+    # first — if a bootstrap pid or a start event exists, the job is already
+    # running and a second launch would double it (issue #84).
+    retry_on_transport_failure(
+        lambda: ssh_exec(target, launcher, ssh_opts=ssh_opts),
+        label=f"launch detached run {remote_run.run_id}",
+        can_retry=lambda: (
+            not detached_run_started(target, pid_file, events_file, ssh_opts=ssh_opts)
+        ),
+    )
 
     startup = wait_for_detached_start(
         target,
