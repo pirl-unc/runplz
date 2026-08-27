@@ -18,6 +18,7 @@ from typing import Optional
 
 from runplz.backends.provisioning import (
     GCP_GPUS,
+    GCP_RETRY_POLICY,
     apply_teardown,
     gpu_count,
     make_instance_name,
@@ -56,6 +57,7 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
             label=f"gcloud compute instances create {name}",
             timeout=900,
             dry_run=cfg.dry_run,
+            policy=GCP_RETRY_POLICY,
         )
         created["ok"] = True
         _config_ssh(cfg)
@@ -259,6 +261,8 @@ def apply_on_finish(cfg, name: str) -> None:
             cmd,
             label=f"gcloud compute instances {verb} {name}",
             timeout=600,
+            # A teardown that gives up on a blip leaves a billed box.
+            policy=GCP_RETRY_POLICY,
             # Without this a dry run would really delete things — the one
             # thing dry-run exists to prevent.
             dry_run=cfg.dry_run,

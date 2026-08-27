@@ -16,6 +16,7 @@ ssh wait until it times out.
 
 from runplz.backends.provisioning import (
     AWS_GPUS,
+    AWS_RETRY_POLICY,
     CloudCliError,
     apply_teardown,
     gpu_count,
@@ -82,6 +83,7 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
             ),
             label=f"aws ec2 run-instances ({name})",
             timeout=900,
+            policy=AWS_RETRY_POLICY,
             dry_run=cfg.dry_run,
             parse_json=True,
         )
@@ -186,6 +188,7 @@ def resolve_ami(cfg, function) -> str:
         ],
         label="aws ssm get-parameter (resolve AMI)",
         timeout=120,
+        policy=AWS_RETRY_POLICY,
         dry_run=cfg.dry_run,
     )
     if result is None:  # dry-run
@@ -318,6 +321,7 @@ def _public_ip(cfg, instance_id: str) -> str:
         ],
         label=f"aws ec2 describe-instances {instance_id}",
         timeout=120,
+        policy=AWS_RETRY_POLICY,
         dry_run=cfg.dry_run,
     )
     if result is None:  # dry-run
@@ -363,6 +367,7 @@ def apply_on_finish(cfg, instance_id, *, name: str) -> None:
             ],
             label=f"aws ec2 {action} {instance_id}",
             timeout=600,
+            policy=AWS_RETRY_POLICY,
             dry_run=cfg.dry_run,
         )
 

@@ -21,8 +21,10 @@ from typing import Optional
 from runplz._selector import Candidate
 from runplz.backends.provisioning import (
     CloudCliError,
+    RetryPolicy,
     apply_teardown,
     make_instance_name,
+    run_with_retries,
     split_instance_name,
 )
 from runplz.backends.ssh_common import (
@@ -735,6 +737,13 @@ def _looks_already_exists(err: str) -> bool:
     return any(pat in low for pat in _BREV_ALREADY_EXISTS_PATTERNS)
 
 
+BREV_RETRY_POLICY = RetryPolicy(
+    waits=_BREV_DEFAULT_RETRIES,
+    is_transient=_looks_transient,
+    is_non_retriable=_looks_non_retriable,
+)
+
+
 def _brev_capture(
     cmd: list,
     *,
@@ -744,85 +753,22 @@ def _brev_capture(
 ) -> subprocess.CompletedProcess:
     """Run a `brev` subcommand with transient-error retries.
 
-    Transient error patterns are checked against combined stdout+stderr
-    (see _BREV_TRANSIENT_PATTERNS). Non-transient failures terminate
-    immediately with the CompletedProcess returned for caller inspection.
-    A transient failure on the final attempt returns the last
-    CompletedProcess too — the caller can decide whether that's fatal.
+    The attempt loop is shared (see
+    :func:`runplz.backends.provisioning.run_with_retries`); what stays here
+    is Brev's own classification — which API strings are worth another try,
+    and which org/config gaps retrying can never fix (issue #62).
 
-    `subprocess.TimeoutExpired` is always treated as transient.
+    Non-transient failures return the CompletedProcess for caller
+    inspection; a non-zero exit is not always fatal to the caller.
+    `subprocess.TimeoutExpired` on every attempt raises.
     """
     label = label or " ".join(str(c) for c in cmd[:3])
-    last: Optional[subprocess.CompletedProcess] = None
-    total_attempts = len(retry_waits)
-    for attempt, wait_s in enumerate(retry_waits, start=1):
-        if wait_s:
-            time.sleep(wait_s)
-        started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        started = time.monotonic()
-        print(
-            f"+ {label} attempt {attempt}/{total_attempts} started {started_at}",
-            flush=True,
-        )
-        try:
-            last = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            elapsed_s = time.monotonic() - started
-            print(
-                f"+ {label} attempt {attempt}/{total_attempts} timed out "
-                f"after {elapsed_s:.1f}s (timeout={timeout}s)",
-                flush=True,
-            )
-            if attempt < total_attempts:
-                print(
-                    f"+ {label} attempt {attempt}/{total_attempts} will retry",
-                    flush=True,
-                )
-                continue
-            raise RuntimeError(
-                f"`{label}` timed out after {timeout}s on all {total_attempts} attempts."
-            ) from None
-        elapsed_s = time.monotonic() - started
-        stdout = str(last.stdout or "")
-        stderr = str(last.stderr or "")
-        print(
-            f"+ {label} attempt {attempt}/{total_attempts} finished "
-            f"rc={last.returncode} elapsed={elapsed_s:.1f}s",
-            flush=True,
-        )
-        if (last.returncode != 0 or attempt > 1) and stdout.strip():
-            print(f"+ {label} attempt {attempt} stdout:\n{stdout.rstrip()}", flush=True)
-        if (last.returncode != 0 or attempt > 1) and stderr.strip():
-            print(f"+ {label} attempt {attempt} stderr:\n{stderr.rstrip()}", flush=True)
-        if last.returncode == 0:
-            if attempt > 1:
-                print(f"+ {label} succeeded on attempt {attempt}", flush=True)
-            return last
-        # Coerce to str in case stderr/stdout are Mocks (test harness) or
-        # None (some subprocess configurations) — we only want the text.
-        err = stderr + stdout
-        # Early-bail on org/config-gap errors that retrying can never fix —
-        # otherwise we burn the full retry budget on guaranteed-fail attempts
-        # and delay the real failure (issue #62). Caller still gets the
-        # CompletedProcess so it can produce a reframed message.
-        if _looks_non_retriable(err):
-            print(
-                f"+ {label} attempt {attempt}/{total_attempts} hit "
-                f"non-retriable error; bailing out (no point retrying org/config gaps)",
-                flush=True,
-            )
-            return last
-        if _looks_transient(err) and attempt < total_attempts:
-            print(
-                f"+ {label} attempt {attempt}/{total_attempts} hit transient error; retrying",
-                flush=True,
-            )
-            continue
-        # Non-transient, or final attempt of a transient: return for caller.
-        return last
-    # Unreachable — the loop either returns or raises.
-    assert last is not None  # for type checkers
-    return last
+    policy = (
+        BREV_RETRY_POLICY
+        if retry_waits == _BREV_DEFAULT_RETRIES
+        else dataclasses.replace(BREV_RETRY_POLICY, waits=retry_waits)
+    )
+    return run_with_retries(cmd, label=label, timeout=timeout, policy=policy)
 
 
 def _brev_sh(

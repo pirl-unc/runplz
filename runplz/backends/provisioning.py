@@ -17,8 +17,10 @@ import json
 import re
 import shlex
 import subprocess
+import time
 import uuid
-from typing import NamedTuple, Optional
+from dataclasses import dataclass
+from typing import Callable, NamedTuple, Optional
 
 __all__ = [
     "CloudCliError",
@@ -38,6 +40,11 @@ __all__ = [
     "pick_shape",
     # Giving the machine back.
     "apply_teardown",
+    "AWS_RETRY_POLICY",
+    "GCP_RETRY_POLICY",
+    "run_with_retries",
+    "NO_RETRIES",
+    "RetryPolicy",
 ]
 
 # Instance names have to be DNS-ish on both clouds: lowercase alphanumerics
@@ -102,6 +109,199 @@ def render_command(cmd: list) -> str:
     return " ".join(shlex.quote(str(part)) for part in cmd)
 
 
+# --- retrying a vendor CLI ------------------------------------------------
+#
+# Every provider's control plane is flaky in its own vocabulary. The attempt
+# loop is identical; the *classification* is not — Brev's org/config gaps,
+# GCP's ZONE_RESOURCE_POOL_EXHAUSTED and AWS's throttling look nothing like
+# each other. So the loop lives here and each backend brings its own tables.
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """When to try a vendor CLI again, and when not to bother.
+
+    `waits` is the sleep *before* each attempt, so its length is the attempt
+    count and its first entry is normally 0.
+
+    `is_non_retriable` matters as much as `is_transient`: without it a run
+    burns the whole budget on guaranteed-fail attempts and delays the real
+    error by minutes (issue #62). An unclassified failure is neither — it
+    stops immediately, because retrying an error we don't understand is a
+    guess made at the user's expense.
+    """
+
+    waits: tuple = (0,)
+    is_transient: Optional[Callable[[str], bool]] = None
+    is_non_retriable: Optional[Callable[[str], bool]] = None
+
+    @property
+    def attempts(self) -> int:
+        return len(self.waits)
+
+    def transient(self, err: str) -> bool:
+        return bool(self.is_transient and self.is_transient(err))
+
+    def non_retriable(self, err: str) -> bool:
+        return bool(self.is_non_retriable and self.is_non_retriable(err))
+
+
+NO_RETRIES = RetryPolicy()
+
+
+def run_with_retries(
+    cmd: list,
+    *,
+    label: str,
+    timeout: int,
+    policy: RetryPolicy = NO_RETRIES,
+    sleep=None,
+):
+    """Run a vendor CLI with `policy`, returning the last CompletedProcess.
+
+    Does not raise on a non-zero exit — some callers treat that as data (a
+    `brev ls` that lists nothing is not an error). It raises only when every
+    attempt timed out, because there is no CompletedProcess to hand back.
+    """
+    last = None
+    total = policy.attempts
+    # Resolved per call, not bound as a default: a default would capture
+    # time.sleep at import and quietly ignore any later patch of it, which
+    # is how a mocked test suite ends up really sleeping.
+    nap = sleep or time.sleep
+    for attempt, wait_s in enumerate(policy.waits, start=1):
+        if wait_s:
+            nap(wait_s)
+        started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        started = time.monotonic()
+        print(f"+ {label} attempt {attempt}/{total} started {started_at}", flush=True)
+        try:
+            last = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            elapsed_s = time.monotonic() - started
+            print(
+                f"+ {label} attempt {attempt}/{total} timed out "
+                f"after {elapsed_s:.1f}s (timeout={timeout}s)",
+                flush=True,
+            )
+            if attempt < total:
+                print(f"+ {label} attempt {attempt}/{total} will retry", flush=True)
+                continue
+            raise CloudCliError(
+                f"`{label}` timed out after {timeout}s on all {total} attempts."
+            ) from None
+        elapsed_s = time.monotonic() - started
+        # Coerce in case stdout/stderr are Mocks (test harness) or None.
+        stdout = str(last.stdout or "")
+        stderr = str(last.stderr or "")
+        print(
+            f"+ {label} attempt {attempt}/{total} finished "
+            f"rc={last.returncode} elapsed={elapsed_s:.1f}s",
+            flush=True,
+        )
+        if (last.returncode != 0 or attempt > 1) and stdout.strip():
+            print(f"+ {label} attempt {attempt} stdout:\n{stdout.rstrip()}", flush=True)
+        if (last.returncode != 0 or attempt > 1) and stderr.strip():
+            print(f"+ {label} attempt {attempt} stderr:\n{stderr.rstrip()}", flush=True)
+        if last.returncode == 0:
+            if attempt > 1:
+                print(f"+ {label} succeeded on attempt {attempt}", flush=True)
+            return last
+        err = stderr + stdout
+        if policy.non_retriable(err):
+            print(
+                f"+ {label} attempt {attempt}/{total} hit a non-retriable "
+                f"error; bailing out rather than burning the retry budget",
+                flush=True,
+            )
+            return last
+        if policy.transient(err) and attempt < total:
+            print(
+                f"+ {label} attempt {attempt}/{total} hit transient error; retrying",
+                flush=True,
+            )
+            continue
+        return last
+    assert last is not None  # for type checkers; the loop returns or raises
+    return last
+
+
+# Cloud control planes fail in ways that clear on their own — a 503 from the
+# API, a throttle, a lock on a resource still settling — and in ways that
+# never will. Retrying the first costs seconds; retrying the second costs
+# minutes of a user's time before showing them the error that mattered.
+
+GCP_TRANSIENT = (
+    "backenderror",
+    "internalerror",
+    "service unavailable",
+    "503",
+    "try again later",
+    "rate limit",
+    "resource is not ready",
+    "operation is already in progress",
+    "connection reset",
+    "i/o timeout",
+    "deadline exceeded",
+)
+GCP_NON_RETRIABLE = (
+    "quota_exceeded",
+    "quota exceeded",
+    "zone_resource_pool_exhausted",
+    "does not exist",
+    "not found",
+    "invalid value",
+    "permission denied",
+    "required 'compute.instances.create' permission",
+    "billing account",
+)
+
+AWS_TRANSIENT = (
+    "throttling",
+    "rate exceeded",
+    "requestlimitexceeded",
+    "serviceunavailable",
+    "internalerror",
+    "internal error",
+    "503",
+    "please try again",
+    "connection reset",
+    "timed out",
+)
+AWS_NON_RETRIABLE = (
+    "insufficientinstancecapacity",
+    "unauthorizedoperation",
+    "authfailure",
+    "invalidkeypair.notfound",
+    "invalidami",
+    "invalidsubnetid",
+    "invalidgroup.notfound",
+    "vcpulimitexceeded",
+    "instancelimitexceeded",
+    "optinrequired",
+)
+
+
+def _matcher(patterns: tuple):
+    def matches(err: str) -> bool:
+        low = (err or "").lower()
+        return any(pat in low for pat in patterns)
+
+    return matches
+
+
+GCP_RETRY_POLICY = RetryPolicy(
+    waits=(0, 3, 8),
+    is_transient=_matcher(GCP_TRANSIENT),
+    is_non_retriable=_matcher(GCP_NON_RETRIABLE),
+)
+AWS_RETRY_POLICY = RetryPolicy(
+    waits=(0, 3, 8),
+    is_transient=_matcher(AWS_TRANSIENT),
+    is_non_retriable=_matcher(AWS_NON_RETRIABLE),
+)
+
+
 def run_cli(
     cmd: list,
     *,
@@ -110,8 +310,13 @@ def run_cli(
     dry_run: bool = False,
     parse_json: bool = False,
     check: bool = True,
+    policy: RetryPolicy = NO_RETRIES,
 ):
     """Invoke a vendor CLI, printing the command so runs are auditable.
+
+    A multi-attempt `policy` retries transient control-plane failures and
+    gives up immediately on the ones that will never clear — see
+    :class:`RetryPolicy`.
 
     On `dry_run` the command is printed and *not* executed, and the call
     returns None — the driver keeps walking its own logic so you can see the
@@ -127,9 +332,13 @@ def run_cli(
         print(f"+ [dry-run] {printable}", flush=True)
         return None
 
-    print(f"+ {printable}", flush=True)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if policy.attempts > 1:
+            # run_with_retries narrates its own attempts.
+            r = run_with_retries(cmd, label=label, timeout=timeout, policy=policy)
+        else:
+            print(f"+ {printable}", flush=True)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         raise CloudCliError(f"`{label}` timed out after {timeout}s.") from exc
     except FileNotFoundError as exc:
