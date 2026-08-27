@@ -17,6 +17,7 @@ ssh wait until it times out.
 from runplz.backends.provisioning import (
     AWS_GPUS,
     AWS_RETRY_POLICY,
+    AWS_TEARDOWN_POLICY,
     CloudCliError,
     apply_teardown,
     gpu_count,
@@ -221,6 +222,12 @@ def build_run_instances_command(
         cfg.key_name,
         "--count",
         "1",
+        # Makes RunInstances idempotent for 24h. Without it, a retry after a
+        # launch whose *response* was lost starts a second instance that
+        # nothing tears down — an extra p4d.24xlarge billing forever. The
+        # run name is unique per dispatch, which is exactly the scope wanted.
+        "--client-token",
+        name,
         # runplz tags every instance it makes so a leak is greppable in the
         # console and in Cost Explorer.
         "--tag-specifications",
@@ -367,7 +374,9 @@ def apply_on_finish(cfg, instance_id, *, name: str) -> None:
             ],
             label=f"aws ec2 {action} {instance_id}",
             timeout=600,
-            policy=AWS_RETRY_POLICY,
+            # One quick retry for a blip; every second of backoff here is
+            # a second in which a Ctrl-C abandons the terminate.
+            policy=AWS_TEARDOWN_POLICY,
             dry_run=cfg.dry_run,
         )
 

@@ -763,11 +763,7 @@ def _brev_capture(
     `subprocess.TimeoutExpired` on every attempt raises.
     """
     label = label or " ".join(str(c) for c in cmd[:3])
-    policy = (
-        BREV_RETRY_POLICY
-        if retry_waits == _BREV_DEFAULT_RETRIES
-        else dataclasses.replace(BREV_RETRY_POLICY, waits=retry_waits)
-    )
+    policy = dataclasses.replace(BREV_RETRY_POLICY, waits=retry_waits)
     return run_with_retries(cmd, label=label, timeout=timeout, policy=policy)
 
 

@@ -17,8 +17,11 @@ you, and a VPC with no inbound 22 will simply hang the ssh wait.
 from typing import Optional
 
 from runplz.backends.provisioning import (
+    ALREADY_EXISTS,
     GCP_GPUS,
     GCP_RETRY_POLICY,
+    GCP_TEARDOWN_POLICY,
+    CloudCliError,
     apply_teardown,
     gpu_count,
     make_instance_name,
@@ -46,19 +49,30 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
     created = {"ok": False}
 
     def provision():
-        run_cli(
-            build_create_command(
-                cfg,
-                function,
-                name=name,
-                machine_type=machine_type,
-                accelerator=accelerator,
-            ),
-            label=f"gcloud compute instances create {name}",
-            timeout=900,
-            dry_run=cfg.dry_run,
-            policy=GCP_RETRY_POLICY,
-        )
+        try:
+            run_cli(
+                build_create_command(
+                    cfg,
+                    function,
+                    name=name,
+                    machine_type=machine_type,
+                    accelerator=accelerator,
+                ),
+                label=f"gcloud compute instances create {name}",
+                timeout=900,
+                dry_run=cfg.dry_run,
+                policy=GCP_RETRY_POLICY,
+            )
+        except CloudCliError as exc:
+            if ALREADY_EXISTS not in str(exc).lower():
+                raise
+            # A retried create whose first attempt actually landed. The box
+            # exists and is billing, so it must be torn down — reporting
+            # "was never created" here would be actively wrong.
+            print(
+                f"+ gcp: {name} already exists — an earlier attempt landed; continuing with it",
+                flush=True,
+            )
         created["ok"] = True
         _config_ssh(cfg)
         return (ssh_alias(cfg, name), None)
@@ -261,8 +275,9 @@ def apply_on_finish(cfg, name: str) -> None:
             cmd,
             label=f"gcloud compute instances {verb} {name}",
             timeout=600,
-            # A teardown that gives up on a blip leaves a billed box.
-            policy=GCP_RETRY_POLICY,
+            # One quick retry for a blip; every second of backoff here is
+            # a second in which a Ctrl-C abandons the delete.
+            policy=GCP_TEARDOWN_POLICY,
             # Without this a dry run would really delete things — the one
             # thing dry-run exists to prevent.
             dry_run=cfg.dry_run,

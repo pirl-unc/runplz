@@ -150,7 +150,8 @@ def test_brev_keeps_its_own_classification():
 # the drivers actually ask for retries
 
 
-def _cfg_calls(monkeypatched_fn, *args, **kwargs):
+def _capture_policies():
+    """Record the `policy=` each run_cli call asks for."""
     seen = []
 
     def fake_run_cli(cmd, **kw):
@@ -160,24 +161,55 @@ def _cfg_calls(monkeypatched_fn, *args, **kwargs):
     return seen, fake_run_cli
 
 
-def test_gcp_retries_create_and_teardown():
+def test_gcp_teardown_retries_briefly():
+    """A teardown that gives up on a blip leaks a box — but long backoff in
+    a finally widens the window where a Ctrl-C abandons the delete."""
     from runplz.config import GcpConfig
 
-    cfg = GcpConfig(project="p", zone="z")
-    seen, fake = _cfg_calls(None)
+    seen, fake = _capture_policies()
     with mock.patch.object(gcp, "run_cli", fake):
-        gcp.apply_on_finish(cfg, "box-1")
-    assert prov.GCP_RETRY_POLICY in seen, "teardown giving up on a blip leaks a box"
+        gcp.apply_on_finish(GcpConfig(project="p", zone="z"), "box-1")
+    assert prov.GCP_TEARDOWN_POLICY in seen
+    assert prov.GCP_TEARDOWN_POLICY.deadline_s < prov.GCP_RETRY_POLICY.deadline_s
 
 
-def test_aws_retries_teardown():
+def test_aws_teardown_retries_briefly():
     from runplz.config import AwsConfig
 
-    cfg = AwsConfig(region="us-east-1", key_name="k")
-    seen, fake = _cfg_calls(None)
+    seen, fake = _capture_policies()
     with mock.patch.object(aws, "run_cli", fake):
-        aws.apply_on_finish(cfg, "i-123", name="box-1")
-    assert prov.AWS_RETRY_POLICY in seen
+        aws.apply_on_finish(AwsConfig(region="us-east-1", key_name="k"), "i-123", name="b")
+    assert prov.AWS_TEARDOWN_POLICY in seen
+
+
+def test_the_create_paths_ask_for_retries(tmp_path):
+    """The riskiest wiring in the PR, and what the issue actually asked for."""
+    from runplz.config import AwsConfig, GcpConfig
+
+    class App:
+        name = "vision"
+        gcp_config = GcpConfig(project="p", zone="us-central1-a")
+        aws_config = AwsConfig(region="us-east-1", key_name="k")
+        _repo_root = tmp_path
+
+    class Fn:
+        name = "train"
+        gpu = "T4"
+        min_gpus = 1
+        min_cpu = None
+        min_memory = None
+        min_gpu_memory = None
+        min_disk = None
+
+    for module, expected in ((gcp, prov.GCP_RETRY_POLICY), (aws, prov.AWS_RETRY_POLICY)):
+        seen, fake = _capture_policies()
+        with mock.patch.object(module, "run_cli", fake):
+            with mock.patch.object(module, "run_on_provisioned_vm", lambda **kw: kw["provision"]()):
+                try:
+                    module.run(App(), Fn(), [], {})
+                except Exception:  # noqa: BLE001 - the fakes stop short of a real run
+                    pass
+        assert expected in seen, f"{module.__name__} create is not retried"
 
 
 def test_run_cli_single_attempt_output_is_unchanged(capsys):
@@ -198,3 +230,125 @@ def test_run_cli_with_a_policy_narrates_attempts(capsys):
     out = capsys.readouterr().out
     assert "attempt 1/3" in out
     assert "succeeded on attempt 2" in out
+
+
+# ---------------------------------------------------------------------------
+# retrying a create must not create twice
+
+
+def test_aws_create_is_idempotent():
+    """Retrying a launch whose response was lost must not start a second
+    instance — nothing would ever tear the first one down."""
+    from runplz.config import AwsConfig
+
+    class Fn:
+        gpu = None
+        min_gpus = 1
+        min_cpu = None
+        min_memory = None
+        min_gpu_memory = None
+        min_disk = None
+
+    cmd = aws.build_run_instances_command(
+        AwsConfig(region="us-east-1", key_name="k"),
+        Fn(),
+        name="runplz-app-fn-ab12cd34",
+        instance_type="m6i.large",
+        ami="ami-1",
+    )
+    assert "--client-token" in cmd
+    assert cmd[cmd.index("--client-token") + 1] == "runplz-app-fn-ab12cd34"
+
+
+def test_gcp_treats_an_already_existing_box_as_created(tmp_path, capsys):
+    """A retried create whose first attempt landed: the box exists and bills,
+    so teardown must run rather than report 'was never created'."""
+    from runplz.config import GcpConfig
+
+    class App:
+        name = "vision"
+        gcp_config = GcpConfig(project="p", zone="us-central1-a")
+        _repo_root = tmp_path
+
+    class Fn:
+        name = "train"
+        gpu = "T4"
+        min_gpus = 1
+        min_cpu = None
+        min_memory = None
+        min_gpu_memory = None
+        min_disk = None
+
+    torn_down = []
+
+    def fake_run_cli(cmd, **kw):
+        if "create" in cmd:
+            raise prov.CloudCliError("The resource 'projects/p/...' already exists")
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    def fake_lifecycle(**kw):
+        kw["provision"]()
+        kw["teardown"]()
+
+    with mock.patch.object(gcp, "run_cli", fake_run_cli):
+        with mock.patch.object(gcp, "apply_on_finish", lambda cfg, n: torn_down.append(n)):
+            with mock.patch.object(gcp, "run_on_provisioned_vm", fake_lifecycle):
+                gcp.run(App(), Fn(), [], {})
+
+    assert torn_down, "an existing, billing box was left to run"
+    out = capsys.readouterr().out
+    assert "already exists" in out
+    assert "was never created" not in out
+
+
+# ---------------------------------------------------------------------------
+# loop guards
+
+
+def test_non_retriable_stops_after_exactly_one_attempt():
+    _r, attempts = _run(prov.GCP_RETRY_POLICY, [(1, "QUOTA_EXCEEDED")])
+    assert attempts == 1
+
+
+def test_a_spent_deadline_stops_further_attempts():
+    import dataclasses
+
+    policy = dataclasses.replace(prov.GCP_RETRY_POLICY, deadline_s=0)
+    _r, attempts = _run(policy, [(1, "Internal error. Please try again")])
+    assert attempts == 1, "the overall budget was ignored"
+
+
+def test_a_policy_with_no_attempts_is_refused():
+    """An empty schedule used to fall through to a bare assert."""
+    import dataclasses
+
+    with pytest.raises(prov.CloudCliError, match="at least one"):
+        prov.run_with_retries(
+            ["vendor", "x"],
+            label="x",
+            timeout=5,
+            policy=dataclasses.replace(prov.NO_RETRIES, waits=()),
+        )
+
+
+def test_timeouts_can_be_declared_non_idempotent():
+    import dataclasses
+
+    policy = dataclasses.replace(prov.GCP_RETRY_POLICY, retry_timeouts=False)
+    with mock.patch.object(prov.subprocess, "run", side_effect=subprocess.TimeoutExpired("x", 5)):
+        with mock.patch.object(prov.time, "sleep", lambda _s: None):
+            with pytest.raises(prov.CloudCliError):
+                prov.run_with_retries(["vendor", "x"], label="x", timeout=5, policy=policy)
+
+
+def test_run_cli_keeps_the_argv_in_the_log_even_when_retrying(capsys):
+    """The requested machine type belongs in the log of a *successful* run,
+    not only in the error message of a failed one."""
+    fake, _calls = _runner([(0, "")])
+    with mock.patch.object(prov.subprocess, "run", fake):
+        prov.run_cli(
+            ["gcloud", "compute", "instances", "create", "box", "--machine-type=a2-highgpu-8g"],
+            label="create box",
+            policy=prov.GCP_RETRY_POLICY,
+        )
+    assert "--machine-type=a2-highgpu-8g" in capsys.readouterr().out
