@@ -33,6 +33,7 @@ from typing import Any, Callable, Optional
 
 from runplz._excludes import DEFAULT_TRANSFER_EXCLUDES
 from runplz.backends import docker
+from runplz.backends.provisioning import RetryPolicy, retry_budget_spent
 
 __all__ = [
     # --- running one function on a reachable box -------------------------
@@ -62,6 +63,11 @@ __all__ = [
     "write_local_ssh_options",
     # --- talking to the box ----------------------------------------------
     "ssh_exec",
+    "retry_on_transport_failure",
+    "is_ssh_transport_failure",
+    "SSH_TRANSPORT_EXIT",
+    "SSH_RESULTS_POLICY",
+    "SSH_PREP_POLICY",
     "ssh_capture",
     "ssh_cmd_opts",
     "run_local",
@@ -79,6 +85,9 @@ __all__ = [
     "launch_detached_and_wait",
     "tail_and_wait_for_detached",
     "remote_pid_alive",
+    "LAUNCH_CLAIM_FILENAME",
+    "container_exists",
+    "detached_run_started",
     "read_remote_exit_code",
     "DetachedProcessState",
     "DetachedRunStatus",
@@ -106,6 +115,11 @@ REMOTE_IMAGE_TAG = "runplz-train:remote"
 # keys off; the container file names the docker container in VM+docker mode,
 # which is a child of dockerd and has to be signalled separately.
 BOOTSTRAP_PID_FILENAME = "bootstrap.pid"
+# Written *before* the bootstrap is spawned. The pid can only be recorded
+# after, which leaves a window in which a launch that already landed still
+# looks like "nothing here" — and a retry in that window starts a second
+# job. This marker closes it (issue #84).
+LAUNCH_CLAIM_FILENAME = "launch.claimed"
 CONTAINER_FILENAME = "container"
 
 # The bootstrap is exec'd with its run id in the environment, so every
@@ -630,7 +644,12 @@ def _prepare_remote_run(
         f': > "{remote_run.heartbeat_shell}"\n'
         f': > "{remote_run.last_log_shell}"\n'
     )
-    ssh_exec(target, remote, ssh_opts=ssh_opts)
+    # Writes the run dir and overwrites the manifest, so running it twice
+    # leaves the same state. This is the call that failed in issue #84.
+    retry_on_transport_failure(
+        lambda: ssh_exec(target, remote, ssh_opts=ssh_opts),
+        label=f"prepare remote run {remote_run.run_id}",
+    )
 
 
 def _record_remote_event(
@@ -735,6 +754,107 @@ def rsync_transport_flags(ssh_opts=None) -> list:
     if SshOptions.coerce(ssh_opts) == SshOptions():
         return []
     return ["-e", rsync_ssh_transport(ssh_opts)]
+
+
+# --- transient ssh transport failures -------------------------------------
+#
+# Issue #84: a run reached SSH readiness, then died in _prepare_remote_run
+# with `Can't assign requested address` / `client_loop: send disconnect:
+# Broken pipe`. The remote held only run.json and a launch_prepared event —
+# nothing staged, no bootstrap — and the identical command succeeded on the
+# next try. The transport blinked; the run did not have to die.
+
+# ssh reserves 255 for its own failures, as distinct from the remote
+# command's exit code. That covers both "never connected" and "the session
+# dropped mid-command", so it is a signal that the command did not *complete*
+# — not that it never started. Retrying is therefore safe for steps that
+# converge on the same state when repeated, and the steps below are chosen on
+# that basis rather than on any claim of atomicity.
+SSH_TRANSPORT_EXIT = 255
+# docker's wording for "that container is not here" — the only non-zero
+# `docker inspect` exit that actually answers the question.
+_DOCKER_NO_SUCH_RE = re.compile(r"no such (object|container)", re.I)
+# rsync's transport codes. 12 is the one a mid-transfer connection drop
+# actually produces ("error in rsync protocol data stream") — 30 needs a
+# --timeout we never pass and 35 is daemon-mode only, so without 12 the rsync
+# retry would do nothing for the failure it exists for. 12 is broader than
+# transport (a missing remote rsync binary reports it too), but
+# _ensure_remote_rsync runs first and the budget is bounded, so that
+# ambiguity costs seconds on an already-doomed run.
+RSYNC_TRANSPORT_EXITS = (12, 30, 35, SSH_TRANSPORT_EXIT)
+# Staging is cheap to repeat and the job already spent minutes getting here.
+SSH_PREP_POLICY = RetryPolicy(waits=(0, 2, 5, 10), deadline_s=300)
+# Pulling results back runs on the teardown side, often just before a paid
+# box is stopped. Same reasoning as the cloud teardown policies: keep it
+# short so a box that has already gone away costs seconds, not half a minute.
+SSH_RESULTS_POLICY = RetryPolicy(waits=(0, 2), deadline_s=60)
+
+
+def is_ssh_transport_failure(returncode: Optional[int]) -> bool:
+    """True when ssh itself failed rather than the remote command."""
+    return returncode == SSH_TRANSPORT_EXIT
+
+
+def retry_on_transport_failure(
+    action: Callable[[], Any],
+    *,
+    label: str,
+    policy: RetryPolicy = SSH_PREP_POLICY,
+    retriable_exits: tuple = (SSH_TRANSPORT_EXIT,),
+    can_retry: Optional[Callable[[], bool]] = None,
+    sleep=None,
+):
+    """Run `action`, retrying it when the *transport* fails.
+
+    Only for operations that converge on the same state when repeated.
+    `can_retry` is the guard for the ones that do not: a launch whose delivery
+    is ambiguous asks the remote whether a bootstrap marker exists, and
+    declines the retry if one does (issue #84).
+
+    `policy.waits` is the sleep *before* each attempt, matching
+    :class:`~runplz.backends.provisioning.RetryPolicy` and the loop in
+    `run_with_retries`, so a policy opening with a non-zero wait is honoured
+    here too. The `can_retry` question is asked after that backoff, never
+    before: a probe issued the instant the transport failed hits the same
+    broken link, answers "can't tell", and (failing closed) vetoes every
+    retry.
+    """
+    if not policy.waits:
+        raise ValueError(f"{label}: retry policy must contain at least one attempt")
+    nap = sleep or time.sleep
+    started_all = time.monotonic()
+    last = None
+    for attempt, wait_s in enumerate(policy.waits, start=1):
+        # Budget first, so an already-spent one does not burn the wait only
+        # to discover it should have stopped.
+        if attempt > 1 and retry_budget_spent(policy, started_all, time.monotonic()):
+            break
+        if wait_s:
+            nap(wait_s)
+        if attempt > 1:
+            # Asked *after* the backoff, never before: a probe issued the
+            # instant the transport failed hits the same broken link,
+            # answers "can't tell", and (failing closed) vetoes every retry.
+            if can_retry is not None and not can_retry():
+                print(
+                    f"+ {label} failed at the transport layer, but the remote "
+                    f"already shows work in progress — not retrying",
+                    flush=True,
+                )
+                break
+            print(
+                f"+ {label} retrying after a transient ssh transport failure "
+                f"(attempt {attempt}/{len(policy.waits)})",
+                flush=True,
+            )
+        try:
+            return action()
+        except subprocess.CalledProcessError as exc:
+            last = exc
+            if exc.returncode not in retriable_exits:
+                raise
+    assert last is not None  # the loop only exits here after a failure
+    raise last
 
 
 # --- low-level ssh / sh / rsync ------------------------------------------
@@ -958,10 +1078,22 @@ def rsync_up(
     stdin = None
     if selected_paths is not None:
         stdin = b"".join(os.fsencode(path) + b"\0" for path in selected_paths)
-    if stdin is None:
-        run_local(cmd)
-    else:
-        run_local(cmd, stdin=stdin)
+
+    # rsync is a sync: repeating it converges on the same result, and a
+    # half-transferred tree is exactly what a retry is for.
+    def _send():
+        # Keep the historical call shape: `stdin` is only passed when there
+        # is one, so anything that fakes run_local keeps working.
+        if stdin is None:
+            run_local(cmd)
+        else:
+            run_local(cmd, stdin=stdin)
+
+    retry_on_transport_failure(
+        _send,
+        label=f"rsync up to {target}",
+        retriable_exits=RSYNC_TRANSPORT_EXITS,
+    )
     _record_remote_event(target, remote_run, "rsync_up_done", ssh_opts=ssh_opts)
 
 
@@ -1009,7 +1141,13 @@ def rsync_down(
     _record_remote_event(target, remote_run, "rsync_down_start", ssh_opts=ssh_opts)
     cmd = ["rsync", "-az", *rsync_transport_flags(ssh_opts)]
     cmd.extend([_remote_out_rsync(target, remote_run), f"{local_out}/"])
-    run_local(cmd)
+    # rsync is a sync: repeating it converges on the same result.
+    retry_on_transport_failure(
+        lambda: run_local(cmd),
+        label=f"rsync down from {target}",
+        retriable_exits=RSYNC_TRANSPORT_EXITS,
+        policy=SSH_RESULTS_POLICY,
+    )
 
 
 # --- connectivity helpers ------------------------------------------------
@@ -1099,16 +1237,50 @@ def wait_until_ssh_reachable(
     )
 
 
+def apt_lock_wait_shell(iterations: int = 60, sleep_s: int = 5) -> str:
+    """Shell that waits out an apt/dpkg lock, then repairs an interrupted one.
+
+    Four copies of this loop had drifted apart with three different bounds,
+    and the `dpkg --configure -a` repair reached only one — which is how a
+    retried transport blip could land straight in "dpkg was interrupted"
+    (exit 100, not retriable) on the other three.
+
+    `fuser` ships in psmisc, which the slim images this code exists for do
+    not carry; its absence used to end the loop on its first iteration. The
+    lock is checked without it when it is missing.
+    """
+    return (
+        "export DEBIAN_FRONTEND=noninteractive; "
+        f"for _i in $(seq 1 {iterations}); do "
+        "  if command -v fuser >/dev/null 2>&1; then "
+        "    sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break; "
+        "  elif command -v lsof >/dev/null 2>&1; then "
+        "    sudo lsof /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break; "
+        "  else "
+        "    sudo flock -n /var/lib/dpkg/lock-frontend true >/dev/null 2>&1 && break; "
+        "  fi; "
+        "  echo 'apt busy, waiting'; "
+        f"  sleep {sleep_s}; "
+        "done; "
+        # An interrupted install leaves dpkg half-configured; without this the
+        # retry meets `dpkg was interrupted` instead of the blip it retries.
+        "sudo dpkg --configure -a >/dev/null 2>&1 || true; "
+    )
+
+
 def _ensure_remote_rsync(target: str, *, ssh_opts: Optional[SshOptions] = None):
     """Install rsync on the remote if missing (slim container images
     often don't ship with rsync)."""
     cmd = (
         "command -v rsync >/dev/null 2>&1 && exit 0; "
-        "export DEBIAN_FRONTEND=noninteractive; "
-        "sudo apt-get update -qq && "
+        + apt_lock_wait_shell(iterations=30, sleep_s=2)
+        + "sudo apt-get update -qq && "
         "sudo apt-get install -y -qq --no-install-recommends rsync"
     )
-    ssh_exec(target, cmd, ssh_opts=ssh_opts)
+    retry_on_transport_failure(
+        lambda: ssh_exec(target, cmd, ssh_opts=ssh_opts),
+        label=f"ensure rsync on {target}",
+    )
 
 
 def _ensure_docker(target: str, timeout_s: int = 420, *, ssh_opts: Optional[SshOptions] = None):
@@ -1135,14 +1307,27 @@ def _ensure_docker(target: str, timeout_s: int = 420, *, ssh_opts: Optional[SshO
         ],
         timeout=timeout_s,
     )
+    if is_ssh_transport_failure(r.returncode):
+        # The wait script never ran. Piping a remote installer onto a box
+        # that already has working docker because the link blinked is not a
+        # fallback, it is a second problem — surface the blip instead.
+        raise subprocess.CalledProcessError(r.returncode, "ssh")
     if r.returncode != 0:
         print(
             f"+ docker daemon not reachable on {target} after {timeout_s}s; "
             f"falling back to get-docker.sh",
             flush=True,
         )
-        run_local(
-            ["ssh", *ssh_cmd_opts(ssh_opts), target, "curl -fsSL https://get.docker.com | sudo sh"]
+        retry_on_transport_failure(
+            lambda: run_local(
+                [
+                    "ssh",
+                    *ssh_cmd_opts(ssh_opts),
+                    target,
+                    "curl -fsSL https://get.docker.com | sudo sh",
+                ]
+            ),
+            label=f"install docker on {target}",
         )
 
 
@@ -1150,17 +1335,26 @@ def _remote_has_nvidia(target: str, *, ssh_opts: Optional[SshOptions] = None) ->
     # nvidia-smi is often pre-installed without a real GPU; the reliable
     # signal is /proc/driver/nvidia, which only exists when the kernel
     # module is loaded against real hardware.
-    r = subprocess.run(
-        [
-            "ssh",
-            *ssh_cmd_opts(ssh_opts),
-            target,
-            "test -d /proc/driver/nvidia && echo y || echo n",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    def _probe():
+        r = subprocess.run(
+            [
+                "ssh",
+                *ssh_cmd_opts(ssh_opts),
+                target,
+                "test -d /proc/driver/nvidia && echo y || echo n",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if is_ssh_transport_failure(r.returncode):
+            # A blip here used to read as "no GPU", silently dropping
+            # `--gpus all` and running a multi-hour job on CPU on a paid GPU
+            # box. Make it a failure the retry can see instead.
+            raise subprocess.CalledProcessError(r.returncode, "ssh", r.stdout, r.stderr)
+        return r
+
+    r = retry_on_transport_failure(_probe, label=f"probe GPUs on {target}")
     return r.returncode == 0 and r.stdout.strip() == "y"
 
 
@@ -1178,13 +1372,8 @@ def render_image_ops_script(image, *, remote_run: Optional[RemoteRunContext] = N
     """
     remote_repo = _remote_repo_shell(remote_run)
     lines = ["set -euo pipefail"]
-    lines.append(
-        "for i in $(seq 1 60); do "
-        "  sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 "
-        "    && { echo waiting for apt; sleep 10; } "
-        "    || break; "
-        "done"
-    )
+    # Retried on a transport blip, so it needs the dpkg repair too.
+    lines.append(apt_lock_wait_shell(iterations=60, sleep_s=10).rstrip("; "))
     lines.append("export DEBIAN_FRONTEND=noninteractive")
     lines.append("export PATH=/opt/conda/bin:$PATH")
 
@@ -1238,7 +1427,14 @@ def _run_container_mode(
     """
     ops_script = render_image_ops_script(function.image, remote_run=remote_run)
     if ops_script:
-        ssh_exec(target, ops_script, ssh_opts=ssh_opts)
+        # Container mode's equivalent of _build_image: apt/pip layers applied
+        # inline. brev's container mode never reaches _build_image, so without
+        # this the mode where the box *is* the user's image had no cover at
+        # all for a #84-shaped blip.
+        retry_on_transport_failure(
+            lambda: ssh_exec(target, ops_script, ssh_opts=ssh_opts),
+            label=f"apply image ops on {target}",
+        )
 
     user_env_exports = " ".join(
         f"export {k}={shlex.quote(str(v))};" for k, v in function.env.items()
@@ -1294,12 +1490,8 @@ def _run_native(
     )
     setup = (
         "set -euo pipefail; "
-        "for i in $(seq 1 120); do "
-        "  sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 "
-        "    && { echo waiting for apt; sleep 10; } "
-        "    || break; "
-        "done; "
-        "sudo apt-get update -qq; "
+        + apt_lock_wait_shell(iterations=120, sleep_s=10)
+        + "sudo apt-get update -qq; "
         "sudo apt-get install -y -qq --no-install-recommends "
         "  python3 python3-venv python3-pip bzip2 wget rsync build-essential; "
         f"python3 -m venv {_NATIVE_VENV}; "
@@ -1308,7 +1500,12 @@ def _run_native(
         f"pip install --quiet torch --index-url {torch_index}; "
         f"pip install --quiet -e {_remote_repo_shell(remote_run)}"
     )
-    ssh_exec(target, setup, ssh_opts=ssh_opts)
+    # A superset of _ensure_remote_rsync's apt-get, which is retried — the
+    # two adjacent calls should not behave differently for the same failure.
+    retry_on_transport_failure(
+        lambda: ssh_exec(target, setup, ssh_opts=ssh_opts),
+        label=f"prepare native environment on {target}",
+    )
 
     user_env_exports = " ".join(
         f"export {k}={shlex.quote(str(v))};" for k, v in function.env.items()
@@ -1367,7 +1564,10 @@ def _build_image(
             f"{df}\n"
             f"__EOF__"
         )
-    ssh_exec(target, build, ssh_opts=ssh_opts)
+    retry_on_transport_failure(
+        lambda: ssh_exec(target, build, ssh_opts=ssh_opts),
+        label=f"build image on {target}",
+    )
     _record_remote_event(target, remote_run, "build_image_done", ssh_opts=ssh_opts)
 
 
@@ -1433,7 +1633,75 @@ def _run_container_detached(
         f"{REMOTE_IMAGE_TAG} python -m runplz._bootstrap >/dev/null; "
         f"{monitor}"
     )
-    ssh_exec(target, start, ssh_opts=ssh_opts)
+    # Same ambiguity as the detached launcher: `docker run -d` may have
+    # started the container before the transport dropped. Ask docker before
+    # retrying rather than starting a second one (issue #84).
+    retry_on_transport_failure(
+        lambda: ssh_exec(target, start, ssh_opts=ssh_opts),
+        label=f"start container {container_name}",
+        can_retry=lambda: not container_exists(target, container_name, ssh_opts=ssh_opts),
+    )
+
+
+def detached_run_started(
+    target: str,
+    pid_file: str,
+    events_file: str,
+    *,
+    ssh_opts: Optional[SshOptions] = None,
+) -> bool:
+    """True when a launch for this run has already been claimed remotely.
+
+    The no-duplicate guarantee for issue #84. Asks about the claim marker as
+    well as the pid file and the start event, because the launcher can only
+    record its pid *after* spawning — so between the spawn and that write, a
+    job that is already running looks like one that never started.
+
+    Anything other than a confirmed "clear" counts as landed. Declining a
+    retry costs one failed run; a wrong retry costs a second training job on
+    the same GPU.
+    """
+    claim_file = f"{os.path.dirname(pid_file)}/{LAUNCH_CLAIM_FILENAME}"
+    probe = (
+        f'if [ -e "{claim_file}" ] || [ -s "{pid_file}" ] || '
+        f"grep -Fq 'remote_command_start' \"{events_file}\" 2>/dev/null; "
+        f"then echo landed; else echo clear; fi"
+    )
+    try:
+        r = subprocess.run(
+            ["ssh", *ssh_cmd_opts(ssh_opts), target, probe],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return True
+    if r.returncode != 0:
+        return True
+    return (r.stdout or "").strip() != "clear"
+
+
+def container_exists(
+    target: str, container_name: str, *, ssh_opts: Optional[SshOptions] = None
+) -> bool:
+    """True when a container of this name is already present on the remote.
+
+    Only docker's own "no such object" counts as absence. Everything else —
+    an unreachable box, a hung probe, a dockerd hiccup, sudo refusing on a
+    non-interactive session — means the question was not answered, and an
+    unanswered question is not proof that nothing landed. Guessing "absent"
+    there is exactly what would let a retry start a second container.
+    """
+    probed = _docker_inspect(target, container_name, "{{.Name}}", ssh_opts=ssh_opts)
+    if probed is None:
+        return True
+    returncode, stdout, stderr = probed
+    if returncode == 0:
+        return bool(stdout.strip())
+    if _DOCKER_NO_SUCH_RE.search(stderr) or _DOCKER_NO_SUCH_RE.search(stdout):
+        return False
+    return True
 
 
 def build_detached_launcher(remote_run: RemoteRunContext, wrapped_command: str) -> str:
@@ -1450,6 +1718,7 @@ def build_detached_launcher(remote_run: RemoteRunContext, wrapped_command: str) 
     meta = remote_run.meta_shell
     pid_file = f"{meta}/{BOOTSTRAP_PID_FILENAME}"
     run_script = f"{meta}/run.sh"
+    claim_file = f"{meta}/{LAUNCH_CLAIM_FILENAME}"
     driver_log = f"{meta}/run_driver.log"
     delim = f"__RUNPLZ_CMD_{uuid.uuid4().hex}__"
     return (
@@ -1461,6 +1730,9 @@ def build_detached_launcher(remote_run: RemoteRunContext, wrapped_command: str) 
         f"{wrapped_command}\n"
         f"{delim}\n"
         f'chmod +x "{run_script}"\n'
+        # Claim the run before anything can be spawned, so an ambiguous
+        # launch is never mistaken for one that never happened.
+        f': > "{claim_file}"\n'
         f"{_run_id_env_assignment(remote_run.run_id)}"
         f'nohup bash "{run_script}" </dev/null >> "{driver_log}" 2>&1 &\n'
         f'echo $! > "{pid_file}"\n'
@@ -1976,7 +2248,18 @@ def launch_detached_and_wait(
     launcher = build_detached_launcher(remote_run, wrapped_command)
     # Launch ssh returns quickly once the detached job is running + PID
     # recorded. Anything that follows in this function is local polling.
-    ssh_exec(target, launcher, ssh_opts=ssh_opts)
+    #
+    # A transport failure here is ambiguous: the launcher may have run and
+    # detached before the connection dropped. So the retry asks the remote
+    # first — if a bootstrap pid or a start event exists, the job is already
+    # running and a second launch would double it (issue #84).
+    retry_on_transport_failure(
+        lambda: ssh_exec(target, launcher, ssh_opts=ssh_opts),
+        label=f"launch detached run {remote_run.run_id}",
+        can_retry=lambda: (
+            not detached_run_started(target, pid_file, events_file, ssh_opts=ssh_opts)
+        ),
+    )
 
     startup = wait_for_detached_start(
         target,
@@ -2252,28 +2535,52 @@ def _stream_and_wait(
         return 1
 
 
-def container_running(
-    target: str, container_name: str, *, ssh_opts: Optional[SshOptions] = None
-) -> bool:
-    # Treat ssh hangs / errors as "assume still running" so the caller keeps
-    # retrying the log stream instead of giving up.
+def _docker_inspect(
+    target: str,
+    container_name: str,
+    fmt: str,
+    *,
+    ssh_opts: Optional[SshOptions] = None,
+    timeout_s: int = 30,
+):
+    """Ask the remote docker about one container.
+
+    Returns ``(returncode, stdout, stderr)``, or ``None`` when the question
+    could not be asked at all — a hung ssh or a transport failure. Both
+    callers treat "could not ask" as the pessimistic answer.
+    """
     try:
         r = subprocess.run(
             [
                 "ssh",
                 *ssh_cmd_opts(ssh_opts),
                 target,
-                f"sudo docker inspect --format '{{{{.State.Running}}}}' {container_name}",
+                f"sudo docker inspect --format '{fmt}' {container_name}",
             ],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=timeout_s,
+            check=False,
         )
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if is_ssh_transport_failure(r.returncode):
+        return None
+    return (r.returncode, r.stdout or "", r.stderr or "")
+
+
+def container_running(
+    target: str, container_name: str, *, ssh_opts: Optional[SshOptions] = None
+) -> bool:
+    # Treat ssh hangs / errors as "assume still running" so the caller keeps
+    # retrying the log stream instead of giving up.
+    probed = _docker_inspect(target, container_name, "{{.State.Running}}", ssh_opts=ssh_opts)
+    if probed is None:
         return True
-    if r.returncode != 0:
+    returncode, stdout, _stderr = probed
+    if returncode != 0:
         return True
-    return r.stdout.strip() == "true"
+    return stdout.strip() == "true"
 
 
 # --- failure context -----------------------------------------------------

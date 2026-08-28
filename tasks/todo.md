@@ -1,3 +1,120 @@
+## 2026-08-27 PR Plan — Retry idempotent SSH preparation (#84)
+
+Branch: `fix/retry-ssh-preparation` (off `main` @ `1182715`)
+
+- [x] Classify ssh transport failure (exit 255) and rsync's transport codes
+- [x] Retry the idempotent pre-bootstrap steps with bounded backoff
+- [x] Guard both launch paths with a remote marker check
+- [x] Bump `runplz/version.py` to 3.19.1
+- [x] `./format.sh`, `./lint.sh`, `./test.sh`
+- [ ] Review, merge, deploy
+
+### The failure
+
+Reported against 3.17.0, Brev backend, existing running instance with auto-create
+disabled. SSH readiness succeeded; the next call died:
+
+    Read from remote host ...: Can't assign requested address
+    client_loop: send disconnect: Broken pipe
+
+Traceback: `brev.run -> run_on_provisioned_vm -> dispatch_to_target ->
+_prepare_remote_run -> ssh_exec -> run_local`. The remote afterwards held only
+`run.json` and a `launch_prepared` event — nothing staged, no bootstrap, no training
+process. The identical command then succeeded.
+
+### Scope / design
+
+Not the same problem as #81. That is the vendor CLI attempt loop, before the box is
+reachable. This is the transport dropping *after* readiness, inside shared SSH
+preparation.
+
+- **What makes retrying safe:** ssh reserves exit 255 for its *own* failures, as
+  distinct from the remote command's exit code. A 255 means nothing ran remotely,
+  so repeating an idempotent step converges on the same state. A remote command
+  that genuinely failed (exit 1, no disk) is surfaced immediately — retrying it
+  would only delay the error the user needs to see.
+- **Retried:** `_prepare_remote_run` (writes/overwrites the run dir),
+  `_ensure_remote_rsync`, `_build_image`, `rsync_up`, `rsync_down`. rsync also gets
+  its own transport codes (12, 30, 35).
+- **Guarded, not retried:** the detached launcher and `docker run -d`. A transport
+  failure there is ambiguous — the launcher may have detached before the connection
+  dropped — so the retry asks the remote whether a bootstrap pid, a start event or a
+  container already exists, and declines if so. An unreachable probe counts as
+  "exists": declining costs one failed run, a wrong retry costs a second training
+  job on the same GPU.
+
+### Code review — 14 findings, all addressed
+
+Two broke the guarantee this PR is *about*:
+
+- **`container_exists` failed open.** `ssh_capture` does not raise on ssh's exit 255,
+  so my try/except was dead and an unreachable probe returned empty stdout — which
+  read as "no container" and would have let a retry start a second one. It reads the
+  return code now.
+- **The probe fired before the backoff.** Order was `attempt, PROBE, sleep` — so
+  during a real blip the probe hit the same broken link, answered "can't tell", and
+  (failing closed) vetoed every retry. The guarded launch paths therefore never
+  retried at all. The two bugs pointed opposite ways: container fail-open, detached
+  fail-closed-always.
+
+And the tests certified a guarantee they never exercised: they rebuilt the
+`retry_on_transport_failure(..., can_retry=...)` call inline, so inverting the guard
+in the source left every test green. They drive `launch_detached_and_wait` and
+`_run_container_detached` now, and four deliberate mutations of the guards are each
+caught by a failing test.
+
+Also: the "255 means nothing ran remotely" claim was wrong — ssh returns 255 for a
+session that drops *mid-command* too, so `_ensure_remote_rsync` now waits out an
+interrupted dpkg lock rather than retrying into it; rsync's exit 12 was dropped from
+the retriable set (it also means "no remote rsync binary", a deterministic failure
+that would burn the budget before showing the real error); the loop now uses
+`provisioning.RetryPolicy` and its shared budget helper, so it has a wall-clock
+deadline and the empty-schedule guard it was missing; `rsync_down` takes the short
+teardown-side budget; container-mode's image ops and native setup were left
+unretried while their siblings were retried; and the `no_sleep` fixture patched
+`time.sleep` process-wide when the loop already exposes a `sleep=` seam.
+
+### Code review round 2 — 15 findings, all addressed
+
+The round-1 fixes were themselves incomplete:
+
+- **`container_exists` could hang out of the retry loop.** Its `subprocess.run(timeout=60)`
+  raises `TimeoutExpired` from inside `can_retry`, escaping the loop and destroying the
+  transport error the user needed. `container_running` — the near-identical probe 850
+  lines away — already handled that. They share one `_docker_inspect` helper now.
+- **"any non-zero docker exit means absent"** was wrong: a dockerd hiccup or a sudo
+  refusal read as "nothing landed" and unblocked the retry. Only docker's own
+  *no such object* counts as absence.
+- **The launcher had a race the guard could not see.** The pid file is written *after*
+  the spawn, so a probe in that window reads "nothing here" and permits a second
+  bootstrap. The launcher now claims the run *before* spawning, and the probe asks
+  about the claim marker as well as the pid and the start event.
+- **rsync exit 12 was wrong to exclude.** Round 1 dropped it as "too broad", but it is
+  the only code a mid-transfer drop produces — 30 needs a `--timeout` we never pass and
+  35 is daemon-mode only. Without it the rsync retry covered nothing it existed for.
+- **Two probes read a transport failure as data.** `_remote_has_nvidia` returned "no
+  GPU" on a blip, silently dropping `--gpus all` — a multi-hour job on CPU on a paid GPU
+  box. `_ensure_docker` read it as "daemon unreachable" and piped `get.docker.com | sudo
+  sh` onto a box with working docker.
+- **The dpkg repair reached one of four apt call sites**, and the `fuser` it waits with
+  is absent from exactly the slim images the code exists for. One `apt_lock_wait_shell`
+  helper now, with a fuser-free fallback.
+- **The loop diverged from the `RetryPolicy` contract** it claimed to share: it skipped
+  `waits[0]` and checked the budget after burning the backoff.
+- **`fast_sleep` still patched `time.sleep` process-wide** — `ssh_common.time` *is* the
+  time module — and `deadline_s` had no test at all, because every test faked sleep so
+  the clock never advanced. That also surfaced a real bug: the budget was measured on
+  ssh_common's clock but compared against provisioning's.
+
+### Review section
+
+- `./format.sh`, `./lint.sh` pass. `./test.sh` passes (`738 passed`), 33 new, and
+  no existing test needed changing.
+- Reproduced the issue's exact stderr against the exact call that failed, and
+  proved the no-duplicate guarantee across every marker state including the
+  ambiguous ones.
+- No live cloud calls.
+
 ## 2026-08-27 PR Plan — Share the CLI retry loop (#81)
 
 Branch: `feat/shared-cli-retries` (off `main` @ `053ba33`)
