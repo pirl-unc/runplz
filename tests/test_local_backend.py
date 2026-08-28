@@ -13,7 +13,7 @@ from runplz.backends import local
 def _app(tmp_path, repo_root=None):
     app = App("demo")
     # Simulate what the CLI sets up: attach a repo root.
-    app._repo_root = repo_root or tmp_path
+    app.repo_root = repo_root or tmp_path
     return app
 
 

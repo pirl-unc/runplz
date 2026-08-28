@@ -40,8 +40,9 @@ in this repo are:
 
 - The `App` / `Function` / `Image` / `BrevConfig` / `ModalConfig` surface.
 - Backend drivers under `runplz/backends/` (one per target: local, brev, modal).
-- The `_bootstrap.py` in-container loader.
-- The `runplz` CLI entry (`_cli.py`).
+- The `bootstrap.py` in-container loader (`_bootstrap.py` stays as the
+  legacy wire path backends emit; see that module's docstring).
+- The `runplz` CLI entry (`cli.py`).
 - Tests and offline examples.
 
 Anything domain-specific (ML-training details, scientific pipelines,

@@ -181,7 +181,7 @@ def test_cli_passes_log_file_flag_through(tmp_path):
     the header and Python prints to PATH."""
     import textwrap
 
-    from runplz import _cli
+    from runplz import cli
 
     script = tmp_path / "job.py"
     script.write_text(
@@ -203,7 +203,7 @@ def test_cli_passes_log_file_flag_through(tmp_path):
     )
     log = tmp_path / "custom.log"
     with mock.patch("runplz.backends.local.run", lambda *a, **kw: None):
-        _cli.main(["local", str(script), "--log-file", str(log)])
+        cli.main(["local", str(script), "--log-file", str(log)])
 
     body = log.read_text()
     assert "# runplz log" in body
@@ -215,7 +215,7 @@ def test_cli_no_log_file_flag_skips_capture(tmp_path):
     """--no-log-file → no runplz-*.log under outputs-dir."""
     import textwrap
 
-    from runplz import _cli
+    from runplz import cli
 
     script = tmp_path / "job.py"
     script.write_text(
@@ -232,7 +232,7 @@ def test_cli_no_log_file_flag_skips_capture(tmp_path):
         )
     )
     with mock.patch("runplz.backends.local.run", lambda *a, **kw: None):
-        _cli.main(
+        cli.main(
             [
                 "local",
                 str(script),
@@ -249,7 +249,7 @@ def test_cli_default_creates_log_under_outputs_dir(tmp_path, monkeypatch):
     """No flags → runplz writes a timestamped log under <outputs-dir>."""
     import textwrap
 
-    from runplz import _cli
+    from runplz import cli
 
     monkeypatch.chdir(tmp_path)
     script = tmp_path / "job.py"
@@ -267,7 +267,7 @@ def test_cli_default_creates_log_under_outputs_dir(tmp_path, monkeypatch):
         )
     )
     with mock.patch("runplz.backends.local.run", lambda *a, **kw: None):
-        _cli.main(["local", str(script), "--outputs-dir", "out"])
+        cli.main(["local", str(script), "--outputs-dir", "out"])
 
     logs = list((tmp_path / "out").glob("runplz-defaulted-*.log"))
     assert len(logs) == 1, f"expected 1 default log, got {logs}"
@@ -280,7 +280,7 @@ def test_cli_default_log_follows_repo_outputs_dir_when_invoked_outside_repo(tmp_
     the repo, not the caller's current working directory."""
     import textwrap
 
-    from runplz import _cli
+    from runplz import cli
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -304,7 +304,7 @@ def test_cli_default_log_follows_repo_outputs_dir_when_invoked_outside_repo(tmp_
     monkeypatch.chdir(outside)
 
     with mock.patch("runplz.backends.local.run", lambda *a, **kw: None):
-        _cli.main(["local", str(script), "--outputs-dir", "out"])
+        cli.main(["local", str(script), "--outputs-dir", "out"])
 
     repo_logs = list((repo / "out").glob("runplz-outside-*.log"))
     cwd_logs = list((outside / "out").glob("runplz-outside-*.log"))

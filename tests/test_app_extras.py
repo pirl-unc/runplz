@@ -93,16 +93,44 @@ def test_image_pip_install_local_dir_non_editable():
 # the backend registry is the single source of truth
 
 
-def test_registry_backs_every_parallel_backend_list():
-    """These used to be three hand-maintained tuples that had to agree."""
-    from runplz import _cli
-    from runplz.app import _VALID_BACKENDS
+def test_registry_is_the_only_backend_list():
+    """These used to be three hand-maintained tuples that had to agree.
+
+    `app._VALID_BACKENDS` and `cli._PS_BACKENDS` were pure aliases of the
+    registry, so they are gone: the CLI reads `registry.names()` and
+    `registry.ps_names()` directly and there is nothing left to drift.
+    """
+    import runplz.app
+    import runplz.cli
     from runplz.backends import registry
 
-    assert _VALID_BACKENDS == registry.names()
-    assert _cli._PS_BACKENDS == registry.ps_names()
+    assert not hasattr(runplz.app, "_VALID_BACKENDS")
+    assert not hasattr(runplz.cli, "_PS_BACKENDS")
     assert set(registry.ps_names()) <= set(registry.names())
     assert set(registry.provisioning_names()) <= set(registry.names())
+
+
+def test_cli_backend_choices_come_from_the_registry():
+    """argparse `choices` must track the registry, not a private copy.
+
+    Driven through the real CLI: an unknown backend makes argparse print the
+    permitted set, so if `choices` ever stopped reading the registry the
+    listed names would diverge from `registry.names()`.
+    """
+    import subprocess
+    import sys
+
+    from runplz.backends import registry
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "runplz.cli", "not-a-backend", "job.py"],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    message = proc.stderr + proc.stdout
+    for name in registry.names():
+        assert name in message, f"{name} missing from argparse choices: {message}"
 
 
 def test_every_registered_backend_is_importable_and_runnable():

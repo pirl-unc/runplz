@@ -11,7 +11,7 @@ from unittest import mock
 
 import pytest
 
-from runplz import AwsConfig, SshConfig, _cli, _runs
+from runplz import AwsConfig, SshConfig, cli, runs
 from runplz.backends import aws, ssh
 from runplz.backends.ssh_common import SSH_OPTS, SshOptions, rsync_ssh_transport, ssh_cmd_opts
 
@@ -81,7 +81,7 @@ def test_ssh_config_key_path_reaches_the_dispatch(tmp_path):
     class App:
         name = "t"
         ssh_config = cfg
-        _repo_root = tmp_path
+        repo_root = tmp_path
 
     class Fn:
         name = "train"
@@ -114,7 +114,7 @@ def test_aws_hands_its_key_back_with_the_target(tmp_path):
     class App:
         name = "vision"
         aws_config = cfg
-        _repo_root = tmp_path
+        repo_root = tmp_path
 
     class Fn:
         name = "train"
@@ -171,8 +171,8 @@ def test_follow_up_commands_reuse_the_recorded_options(tmp_path, command):
     stdout = "---SUMMARY---\nalive_after=0\n---END---\n"
     fake = mock.Mock(returncode=0, stdout=stdout, stderr="")
     kwargs = {"lines": 5, "follow": False} if command == "tail" else {}
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake) as run_mock:
-        getattr(_runs, command)(
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake) as run_mock:
+        getattr(runs, command)(
             outputs_dir=tmp_path, host_override=None, run_id_override=None, **kwargs
         )
     argv = run_mock.call_args.args[0]
@@ -183,8 +183,8 @@ def test_follow_up_commands_reuse_the_recorded_options(tmp_path, command):
 def test_explicit_ssh_key_flag_wins_over_the_manifest(tmp_path):
     _manifest(tmp_path, identity_file="/keys/from-manifest.pem")
     fake = mock.Mock(returncode=0, stdout="---SUMMARY---\nalive_after=0\n---END---\n", stderr="")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake) as run_mock:
-        _runs.kill(
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake) as run_mock:
+        runs.kill(
             outputs_dir=tmp_path,
             host_override=None,
             run_id_override=None,
@@ -197,8 +197,8 @@ def test_explicit_ssh_key_flag_wins_over_the_manifest(tmp_path):
 
 def test_cli_exposes_ssh_key_and_port(tmp_path):
     _manifest(tmp_path)
-    with mock.patch.object(_runs, "kill", return_value=0) as kill_mock:
-        _cli.main(
+    with mock.patch.object(runs, "kill", return_value=0) as kill_mock:
+        cli.main(
             ["kill", "--outputs-dir", str(tmp_path), "--ssh-key", "/k.pem", "--ssh-port", "2200"]
         )
     overrides = kill_mock.call_args.kwargs["ssh_overrides"]
@@ -207,8 +207,8 @@ def test_cli_exposes_ssh_key_and_port(tmp_path):
 
 def test_cli_without_ssh_flags_defers_to_the_manifest(tmp_path):
     _manifest(tmp_path)
-    with mock.patch.object(_runs, "kill", return_value=0) as kill_mock:
-        _cli.main(["kill", "--outputs-dir", str(tmp_path)])
+    with mock.patch.object(runs, "kill", return_value=0) as kill_mock:
+        cli.main(["kill", "--outputs-dir", str(tmp_path)])
     assert kill_mock.call_args.kwargs["ssh_overrides"] == {}
 
 
@@ -261,8 +261,8 @@ def test_one_cli_override_does_not_discard_the_other_field(tmp_path):
     """`--ssh-key` alone must not drop the port the dispatch recorded."""
     _manifest(tmp_path, identity_file="/keys/old.pem", port=2200)
     fake = mock.Mock(returncode=0, stdout="---SUMMARY---\nalive_after=0\n---END---\n", stderr="")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake) as run_mock:
-        _runs.kill(
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake) as run_mock:
+        runs.kill(
             outputs_dir=tmp_path,
             host_override=None,
             run_id_override=None,
@@ -277,7 +277,7 @@ def test_cli_rejects_an_out_of_range_ssh_port(tmp_path):
     _manifest(tmp_path)
     for bad in ("0", "70000"):
         with pytest.raises(SystemExit):
-            _cli.main(["kill", "--outputs-dir", str(tmp_path), "--ssh-port", bad])
+            cli.main(["kill", "--outputs-dir", str(tmp_path), "--ssh-port", bad])
 
 
 def test_ps_can_authenticate_to_a_host_that_needs_a_key(tmp_path):
@@ -285,7 +285,7 @@ def test_ps_can_authenticate_to_a_host_that_needs_a_key(tmp_path):
     from runplz.backends import ssh as ssh_backend
 
     with mock.patch.object(ssh_backend, "list_jobs", return_value=[]) as jobs:
-        _cli.main(["ps", "--host", "ubuntu@1.2.3.4", "--ssh-key", "/k.pem", "--ssh-port", "2200"])
+        cli.main(["ps", "--host", "ubuntu@1.2.3.4", "--ssh-key", "/k.pem", "--ssh-port", "2200"])
     kwargs = jobs.call_args.kwargs
     assert kwargs["ssh_key_path"] == "/k.pem"
     assert kwargs["port"] == 2200

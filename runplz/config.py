@@ -10,6 +10,15 @@ nothing we expose. If that ever changes (e.g. both grow a shared
 concept like per-App secrets), factor into a `BaseConfig` then.
 """
 
+__all__ = [
+    "BrevConfig",
+    "SshConfig",
+    "ModalConfig",
+    "GcpConfig",
+    "AwsConfig",
+]
+
+
 import os
 from dataclasses import dataclass
 from typing import Optional

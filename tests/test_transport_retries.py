@@ -1,6 +1,6 @@
 """Retrying idempotent SSH preparation after a transport blip (issue #84).
 
-A real run reached SSH readiness and then died inside `_prepare_remote_run`
+A real run reached SSH readiness and then died inside `prepare_remote_run`
 with `Can't assign requested address` / `client_loop: send disconnect: Broken
 pipe`. The remote held only `run.json` and a `launch_prepared` event — nothing
 staged, no bootstrap — and the identical command succeeded on the next try.
@@ -209,14 +209,14 @@ def test_prepare_remote_run_survives_the_blip_from_the_issue(fast_sleep, remote_
             raise _blip()
 
     with mock.patch.object(sc, "ssh_exec", flaky_ssh):
-        sc._prepare_remote_run("box", remote_run, manifest={"run_id": remote_run.run_id})
+        sc.prepare_remote_run("box", remote_run, manifest={"run_id": remote_run.run_id})
     assert calls["n"] == 2, "the run died on a transport blip it could have survived"
 
 
 def test_prepare_remote_run_still_fails_on_a_real_error(fast_sleep, remote_run):
     with mock.patch.object(sc, "ssh_exec", side_effect=_remote_failure()):
         with pytest.raises(subprocess.CalledProcessError):
-            sc._prepare_remote_run("box", remote_run, manifest={})
+            sc.prepare_remote_run("box", remote_run, manifest={})
 
 
 def test_ensure_remote_rsync_survives_a_blip(fast_sleep):
@@ -228,7 +228,7 @@ def test_ensure_remote_rsync_survives_a_blip(fast_sleep):
             raise _blip()
 
     with mock.patch.object(sc, "ssh_exec", flaky_ssh):
-        sc._ensure_remote_rsync("box")
+        sc.ensure_remote_rsync("box")
     assert calls["n"] == 2
 
 
@@ -349,7 +349,7 @@ def _container_start_attempts(probe_returncode, *, remote_run, stderr=""):
         with mock.patch.object(sc.subprocess, "run", return_value=probe):
             with mock.patch.object(sc, "time", _FakeClock()):
                 with pytest.raises(subprocess.CalledProcessError):
-                    sc._run_container_detached(
+                    sc.run_container_detached(
                         target="box",
                         container_name="runplz-train-abc",
                         function=function,
@@ -396,7 +396,7 @@ def test_brev_existing_instance_dispatch_survives_a_prepare_blip(fast_sleep, tmp
     from runplz.backends import brev
 
     app = App("vision", brev_config=BrevConfig(mode="vm", on_finish="leave"))
-    app._repo_root = tmp_path
+    app.repo_root = tmp_path
     (tmp_path / "job.py").write_text("# job\n")
 
     @app.function(image=Image.from_registry("ubuntu:22.04"))
@@ -405,7 +405,7 @@ def test_brev_existing_instance_dispatch_survives_a_prepare_blip(fast_sleep, tmp
 
     train.module_file = str(tmp_path / "job.py")
 
-    # Fail the ssh call *inside* _prepare_remote_run, not the function
+    # Fail the ssh call *inside* prepare_remote_run, not the function
     # itself — the retry being tested lives in there.
     # Count only the calls carrying the prepare payload: dispatch issues many
     # ssh_exec calls, and _record_remote_event swallows exceptions, so a bare
@@ -432,14 +432,14 @@ def test_brev_existing_instance_dispatch_survives_a_prepare_blip(fast_sleep, tmp
             "runplz.backends.ssh_common",
             wait_until_ssh_reachable=mock.DEFAULT,
             ssh_exec=flaky_ssh,
-            _ensure_remote_rsync=mock.DEFAULT,
+            ensure_remote_rsync=mock.DEFAULT,
             rsync_up=mock.DEFAULT,
-            _check_preconditions=mock.DEFAULT,
-            _ensure_docker=mock.DEFAULT,
-            _remote_has_nvidia=mock.Mock(return_value=False),
-            _build_image=mock.DEFAULT,
-            _run_container_detached=mock.DEFAULT,
-            _stream_and_wait=mock.Mock(return_value=0),
+            check_preconditions=mock.DEFAULT,
+            ensure_docker=mock.DEFAULT,
+            remote_has_nvidia=mock.Mock(return_value=False),
+            build_image=mock.DEFAULT,
+            run_container_detached=mock.DEFAULT,
+            stream_and_wait=mock.Mock(return_value=0),
             ssh_capture=mock.DEFAULT,
             rsync_down=mock.DEFAULT,
         ):

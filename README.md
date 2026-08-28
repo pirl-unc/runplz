@@ -307,6 +307,41 @@ GPU the first one still holds.
 Runs launched before 3.16 carry no marker; `kill` falls back to the
 recorded bootstrap pid alone and says so in its output.
 
+## Public API
+
+Everything below is importable and covered by semantic versioning. Each
+module declares an `__all__`; if a name is not in one, treat it as an
+internal that can move in a patch release.
+
+| Module | What it is |
+|---|---|
+| `runplz` | `App`, `Function`, `Image`, `ImageOp`, and the five backend configs. The only import most job scripts need. |
+| `runplz.cli` | The `runplz` console script (`main`). Also reachable as `python -m runplz.cli`. |
+| `runplz.runs` | The `tail` / `status` / `kill` verbs, plus the reader for the `run.json` manifest that `rsync_down` leaves in your outputs dir. |
+| `runplz.bootstrap` | The in-container loader and its **environment contract** — `RUNPLZ_SCRIPT`, `RUNPLZ_FUNCTION`, `RUNPLZ_OUT`, `RUNPLZ_ARGS`, `RUNPLZ_KWARGS`. |
+| `runplz.backends.registry` | What backends exist and what each accepts — the single source of truth behind the CLI's choices. |
+| `runplz.backends.ssh_common` | The shared layer every ssh-reachable backend runs on: `dispatch_to_target`, `run_on_provisioned_vm`, and the individual pipeline stages. |
+| `runplz.backends.provisioning` | Retry policy, GPU shape tables, instance naming, and teardown shared by the cloud drivers. |
+
+Writing a new backend means answering three questions — how do I create a
+box, what ssh target do I hand over, how do I tear it down — and passing
+the answers to `run_on_provisioned_vm`. See `runplz/backends/gcp.py`; it
+is about 150 lines end to end.
+
+### Two module paths are deliberately underscore-named
+
+`runplz._bootstrap` and `runplz._cli` are legacy entry points kept for
+compatibility, not internals.
+
+`runplz._bootstrap` is the load-bearing one. runplz does **not** ship
+itself to the remote — only your repo goes over the wire — so the
+container's runplz comes from PyPI or your base image and its version is
+independent of the orchestrator's. A 3.20 orchestrator routinely talks to
+a 3.19 container. That makes the invoked module path part of the wire
+format, so backends still emit `python -m runplz._bootstrap`, which older
+containers understand. For the same reason the `RUNPLZ_*` variables may
+only be added to, never renamed.
+
 ## Backend config
 
 `App(..., brev_config=BrevConfig(...), modal_config=ModalConfig(...),

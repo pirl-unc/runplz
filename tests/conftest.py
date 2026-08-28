@@ -86,12 +86,12 @@ class _GuardedSubprocessModule:
 _MODULES_TO_GUARD = (
     "runplz.backends.brev",
     "runplz.backends.provisioning",
-    "runplz._runs",
+    "runplz.runs",
     "runplz.backends.ssh_common",
     "runplz.backends.ssh",
     "runplz.backends.modal",
     "runplz.backends.local",
-    "runplz._cli",
+    "runplz.cli",
 )
 
 

@@ -9,6 +9,15 @@ Intentionally minimal:
 Args passed to .remote(...) must be JSON-serializable. No closures, no locals.
 """
 
+__all__ = [
+    "App",
+    "Function",
+    "repo_root_for",
+    "validate_image_vs_brev_mode",
+    "PRECONDITION_KEYS",
+]
+
+
 import inspect
 import json
 from pathlib import Path
@@ -17,11 +26,6 @@ from typing import Callable, Optional
 from runplz.backends import registry
 from runplz.config import AwsConfig, BrevConfig, GcpConfig, ModalConfig, SshConfig
 from runplz.image import Image
-
-# What backends exist, and what each accepts, is described once in
-# runplz.backends.registry. Kept as a module-level name because the CLI
-# imports it for argparse `choices`.
-_VALID_BACKENDS = registry.names()
 
 
 class Function:
@@ -94,7 +98,7 @@ class Function:
         # rsync_up but *before* bootstrap, so a misprovisioned box (small
         # /dev/shm, full disk, missing GPU) fails fast instead of wasting
         # paid GPU minutes on a doomed run. See runplz/backends/ssh_common.py
-        # `_check_preconditions`. v1 keys: shm_gb, disk_free_gb, gpu_count,
+        # `check_preconditions`. v1 keys: shm_gb, disk_free_gb, gpu_count,
         # gpu_memory_gb. Issue #56.
         self.preconditions = _normalize_preconditions(fn.__name__, preconditions)
         self.name = fn.__name__
@@ -146,12 +150,12 @@ class App:
         self.gcp_config = gcp_config
         self.aws_config = aws_config
         self.functions: dict[str, Function] = {}
-        self._entrypoint: Optional[Callable] = None
+        self.entrypoint: Optional[Callable] = None
 
         # Runtime-populated by the CLI before local_entrypoint fires.
         self._backend: Optional[str] = None
         self._backend_kwargs: dict = {}
-        self._repo_root: Optional[Path] = None
+        self.repo_root: Optional[Path] = None
 
     def function(
         self,
@@ -191,7 +195,7 @@ class App:
 
     def local_entrypoint(self):
         def decorator(fn: Callable) -> Callable:
-            self._entrypoint = fn
+            self.entrypoint = fn
             return fn
 
         return decorator
@@ -269,10 +273,10 @@ class App:
                 "can locate the script's repo root."
             )
         if repo_root is not None:
-            self._repo_root = repo_root
+            self.repo_root = repo_root
         else:
             any_fn = next(iter(self.functions.values()))
-            self._repo_root = _repo_root_for(Path(any_fn.module_file))
+            self.repo_root = repo_root_for(Path(any_fn.module_file))
         self._backend = backend
         self._backend_kwargs = {"outputs_dir": outputs_dir}
         # Which selector each backend takes comes from the registry too, so
@@ -309,7 +313,7 @@ def _ensure_json_safe(args, kwargs):
         ) from exc
 
 
-def _repo_root_for(script_path: Path) -> Path:
+def repo_root_for(script_path: Path) -> Path:
     for parent in [script_path.parent, *script_path.parents]:
         if (parent / ".git").exists():
             return parent
@@ -387,7 +391,7 @@ def _validate_resources(
 
 # Precondition keys we know how to probe. Adding a new key is a two-place
 # change: list it here so user-supplied values are validated, then teach
-# `_check_preconditions` how to probe and compare it.
+# `check_preconditions` how to probe and compare it.
 PRECONDITION_KEYS = ("shm_gb", "disk_free_gb", "gpu_count", "gpu_memory_gb")
 
 

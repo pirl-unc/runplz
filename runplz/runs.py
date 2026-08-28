@@ -10,6 +10,21 @@ of the data persisted by ``ssh_common`` so the CLI doesn't have to
 remember run IDs or reconstruct ssh commands by hand (issue #57).
 """
 
+__all__ = [
+    # the three CLI verbs this module implements
+    "tail",
+    "status",
+    "kill",
+    # reading the run manifest rsync_down leaves in the local outputs dir
+    "find_local_manifest",
+    "read_manifest",
+    "resolve_target_and_meta",
+    "ManifestNotFound",
+    "META_FILENAME",
+    "KILL_SURVIVED_RC",
+]
+
+
 import dataclasses
 import json
 import re

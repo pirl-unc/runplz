@@ -172,7 +172,7 @@ def test_extract_tar_rejects_path_traversal(tmp_path):
 
 def _app_with_job(tmp_path):
     app = App("pan-allele")
-    app._repo_root = tmp_path
+    app.repo_root = tmp_path
     (tmp_path / "jobs").mkdir()
     job = tmp_path / "jobs" / "train.py"
     job.write_text("# fake\n")
@@ -221,7 +221,7 @@ def test_run_requires_modal_package(tmp_path, monkeypatch):
 
 def test_run_requires_repo_root(tmp_path):
     app, fn = _app_with_job(tmp_path)
-    app._repo_root = None
+    app.repo_root = None
     with pytest.raises(RuntimeError, match="repo_root"):
         modal_backend.run(app, fn, [], {})
 
@@ -301,7 +301,7 @@ def test_run_memory_gb_to_mb_conversion(tmp_path):
 
 def test_run_min_gpu_memory_appends_suffix(tmp_path, capsys):
     app = App("x")
-    app._repo_root = tmp_path
+    app.repo_root = tmp_path
     (tmp_path / "jobs").mkdir()
     (tmp_path / "jobs" / "j.py").write_text("pass\n")
 
@@ -367,7 +367,7 @@ def test_run_min_disk_raises_on_modal(tmp_path):
     Now it's a hard ValueError at dispatch so users can't believe their
     disk request was honored."""
     app = App("x")
-    app._repo_root = tmp_path
+    app.repo_root = tmp_path
     (tmp_path / "jobs").mkdir()
     (tmp_path / "jobs" / "j.py").write_text("pass\n")
 
@@ -389,7 +389,7 @@ def test_run_min_disk_raises_on_modal(tmp_path):
 
 def test_run_no_memory_emits_none(tmp_path):
     app = App("x")
-    app._repo_root = tmp_path
+    app.repo_root = tmp_path
     (tmp_path / "jobs").mkdir()
     (tmp_path / "jobs" / "j.py").write_text("pass\n")
 

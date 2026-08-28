@@ -17,12 +17,12 @@ from runplz.backends import aws, gcp, provisioning
 
 def _app(tmp_path, **configs) -> App:
     app = App("vision-train", **configs)
-    app._repo_root = tmp_path
+    app.repo_root = tmp_path
     return app
 
 
 def _function(app, **spec):
-    job = tmp_job(app._repo_root)
+    job = tmp_job(app.repo_root)
 
     @app.function(image=Image.from_registry("ubuntu:22.04"), **spec)
     def train():
@@ -597,7 +597,7 @@ def test_min_memory_sizes_the_box_on_both_clouds(tmp_path):
     assert machine == "n2-standard-64", "n2-standard gives 4GB per vCPU"
 
     aapp = App("x", aws_config=_aws())
-    aapp._repo_root = tmp_path
+    aapp.repo_root = tmp_path
 
     @aapp.function(image=Image.from_registry("ubuntu:22.04"), min_memory=128)
     def big():

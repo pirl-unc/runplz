@@ -211,7 +211,7 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
             "Modal backend requires `pip install modal` and `modal setup` (run once)."
         ) from exc
 
-    repo = app._repo_root
+    repo = app.repo_root
     if repo is None:
         raise RuntimeError("App repo_root not set (CLI should have set this).")
 

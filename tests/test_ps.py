@@ -5,7 +5,7 @@ from unittest import mock
 
 import pytest
 
-from runplz import _cli
+from runplz import cli
 from runplz.backends import brev, local, modal, ssh
 
 # ---------------------------------------------------------------------------
@@ -106,7 +106,7 @@ def test_local_run_stamps_labels(tmp_path):
     from runplz import App, Image
 
     app = App("demo")
-    app._repo_root = tmp_path
+    app.repo_root = tmp_path
     jobdir = tmp_path / "jobs"
     jobdir.mkdir()
     job = jobdir / "job.py"
@@ -271,7 +271,7 @@ def test_ps_cli_fans_out_and_prints_rows(capsys):
     with mock.patch.object(local, "list_jobs", return_value=rows_local):
         with mock.patch.object(brev, "list_jobs", return_value=[]):
             with mock.patch.object(modal, "list_jobs", return_value=[]):
-                rc = _cli.main(["ps"])
+                rc = cli.main(["ps"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "BACKEND" in out
@@ -282,7 +282,7 @@ def test_ps_cli_reports_empty_when_no_jobs(capsys):
     with mock.patch.object(local, "list_jobs", return_value=[]):
         with mock.patch.object(brev, "list_jobs", return_value=[]):
             with mock.patch.object(modal, "list_jobs", return_value=[]):
-                rc = _cli.main(["ps"])
+                rc = cli.main(["ps"])
     assert rc == 0
     assert "no runplz jobs running" in capsys.readouterr().out
 
@@ -291,7 +291,7 @@ def test_ps_cli_single_backend_filter(capsys):
     with mock.patch.object(local, "list_jobs", return_value=[]) as local_mock:
         with mock.patch.object(brev, "list_jobs") as brev_mock:
             with mock.patch.object(modal, "list_jobs") as modal_mock:
-                _cli.main(["ps", "local"])
+                cli.main(["ps", "local"])
     local_mock.assert_called_once()
     brev_mock.assert_not_called()
     modal_mock.assert_not_called()
@@ -304,7 +304,7 @@ def test_ps_cli_surfaces_errors_as_warnings(capsys):
     with mock.patch.object(local, "list_jobs", side_effect=RuntimeError("no daemon")):
         with mock.patch.object(brev, "list_jobs", return_value=[]):
             with mock.patch.object(modal, "list_jobs", return_value=[]):
-                rc = _cli.main(["ps"])
+                rc = cli.main(["ps"])
     err = capsys.readouterr().err
     assert "local listing failed" in err
     # Two backends succeeded (with empty results) so rc=0 — partial failures
@@ -321,7 +321,7 @@ def test_ps_cli_accepts_host_flag_3_15_1():
         with mock.patch.object(brev, "list_jobs", return_value=[]):
             with mock.patch.object(modal, "list_jobs", return_value=[]):
                 with mock.patch.object(ssh_backend, "list_jobs", return_value=[]) as ssh_mock:
-                    _cli.main(["ps", "--host", "my.gpu.box"])
+                    cli.main(["ps", "--host", "my.gpu.box"])
     ssh_mock.assert_called_once_with(host="my.gpu.box", port=None, ssh_key_path=None)
 
 
@@ -332,7 +332,7 @@ def test_ps_cli_prints_no_jobs_when_some_backend_succeeds(capsys):
     with mock.patch.object(local, "list_jobs", side_effect=RuntimeError("docker missing")):
         with mock.patch.object(brev, "list_jobs", return_value=[]):
             with mock.patch.object(modal, "list_jobs", return_value=[]):
-                rc = _cli.main(["ps"])
+                rc = cli.main(["ps"])
     out = capsys.readouterr()
     assert "no runplz jobs running" in out.out
     assert "local listing failed" in out.err
@@ -344,7 +344,7 @@ def test_ps_cli_returns_1_only_when_all_backends_fail(capsys):
     with mock.patch.object(local, "list_jobs", side_effect=RuntimeError("a")):
         with mock.patch.object(brev, "list_jobs", side_effect=RuntimeError("b")):
             with mock.patch.object(modal, "list_jobs", side_effect=RuntimeError("c")):
-                rc = _cli.main(["ps"])
+                rc = cli.main(["ps"])
     out = capsys.readouterr()
     assert "no runplz jobs running" not in out.out
     assert rc == 1
@@ -357,7 +357,7 @@ def test_ps_cli_back_compat_ssh_flag_still_works():
         with mock.patch.object(brev, "list_jobs", return_value=[]):
             with mock.patch.object(modal, "list_jobs", return_value=[]):
                 with mock.patch.object(ssh_backend, "list_jobs", return_value=[]) as ssh_mock:
-                    _cli.main(["ps", "--ssh", "my.gpu.box"])
+                    cli.main(["ps", "--ssh", "my.gpu.box"])
     ssh_mock.assert_called_once_with(host="my.gpu.box", port=None, ssh_key_path=None)
 
 

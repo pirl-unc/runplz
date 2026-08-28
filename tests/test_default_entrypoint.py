@@ -6,9 +6,9 @@ from unittest import mock
 import pytest
 
 from runplz import App, Image
-from runplz._cli import _install_default_entrypoint_or_error
 from runplz.backends import brev as brev_backend
 from runplz.backends.modal import _modal_default_gpu_for_vram, _modal_gpu_string
+from runplz.cli import _install_default_entrypoint_or_error
 
 # ---------------------------------------------------------------------------
 # Default entrypoint synthesis
@@ -29,7 +29,7 @@ def test_default_entrypoint_synthesizes_for_single_function():
     # The synthesized entrypoint forwards kwargs to .remote(); patch it
     # so we don't actually dispatch.
     with mock.patch.object(app.functions["train"], "remote") as remote_mock:
-        app._entrypoint()
+        app.entrypoint()
     remote_mock.assert_called_once_with()
 
 
@@ -45,7 +45,7 @@ def test_default_entrypoint_signature_mirrors_function():
         pass
 
     _install_default_entrypoint_or_error(app, "/x.py", _failer)
-    sig = _inspect.signature(app._entrypoint)
+    sig = _inspect.signature(app.entrypoint)
     assert list(sig.parameters) == ["steps", "dataset"]
     assert sig.parameters["steps"].annotation is int
     assert sig.parameters["dataset"].default == "small"

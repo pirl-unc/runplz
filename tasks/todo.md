@@ -857,3 +857,105 @@ New tests per issue, landed alongside code:
 ## Review section
 
 _Filled in after implementation._
+
+---
+
+## Public API surface: minimize private names (3.20.0)
+
+**Rule applied:** a module or name typed by anything outside its own file is
+public. Underscores are reserved for genuinely file-local helpers.
+
+**Constraint:** no compat aliases for names that get patched. `_old = new` and
+`__getattr__` module shims are read-safe but patch-unsafe — patching the alias
+sets an attribute nothing reads, so the test passes without testing. Rename
+outright, update every call site.
+
+### Phase 1 — `ssh_common.py` dispatch pipeline goes public
+The module was made public at 3.15.3 but its 11 pipeline stages stayed
+underscore-private while being imported by `brev.py`. Promote them and give the
+module an `__all__`.
+
+- [x] `_prepare_remote_run` → `prepare_remote_run`
+- [x] `_ensure_remote_rsync` → `ensure_remote_rsync`
+- [x] `_check_preconditions` → `check_preconditions`
+- [x] `_ensure_docker` → `ensure_docker`
+- [x] `_build_image` → `build_image`
+- [x] `_run_container_detached` → `run_container_detached`
+- [x] `_run_container_mode` → `run_container_mode`
+- [x] `_run_native` → `run_native`
+- [x] `_stream_and_wait` → `stream_and_wait`
+- [x] `_fetch_failure_tail` → `fetch_failure_tail`
+- [x] `_remote_has_nvidia` → `remote_has_nvidia`
+- [x] update `brev.py` re-export block, `ssh.py`, `local.py`, ~176 test refs
+
+### Phase 2 — private modules that are already public interfaces
+- [x] `_cli.py` → `cli.py` — named in `pyproject.toml:43` entry points
+- [x] `_bootstrap.py` → `bootstrap.py` — `python -m runplz._bootstrap` is baked
+      into generated remote shell at 3 sites; its env-var protocol is a wire
+      contract and `$RUNPLZ_OUT` is documented user API
+- [x] `_runs.py` → `runs.py` — owns the on-disk manifest format read back by
+      `ps`/`kill` across versions
+- [x] write real contract docstrings on each (this is the "clear semantics" half)
+- [x] stays private: `_excludes.py`, `_logcapture.py`, `_selector.py`
+
+### Phase 3 — `app.py` backend-facing contract
+- [x] `_repo_root_for` → `repo_root_for`
+- [x] `App._repo_root` → `App.repo_root` (read by 4 modules)
+- [x] `App._entrypoint` → `App.entrypoint`
+- [x] `_VALID_BACKENDS` — fold into `registry.names()`, single source of truth
+
+### Verification
+- [x] `./format.sh`, `./lint.sh`, `./test.sh` all green
+- [x] assert no test patches a name that no longer exists (a rename that leaves
+      a dead patch target is the exact failure this plan is designed to avoid)
+- [x] version bump + PR + deploy
+
+**Not in this PR:** the 3 correctness-sweep findings (`sys.exit(main())`,
+bootstrap `sys.path`, env-key validation). Mechanical rename and behavior change
+should not share a diff.
+
+### Review
+
+**Result: zero cross-module private references remain.** Before this change
+`brev.py` imported 11 underscore names from `ssh_common`, and `cli.py`
+reached into `app.py` for four more. An AST sweep now finds none.
+
+- 11 dispatch stages promoted to public and declared in `__all__`
+- `_cli` → `cli`, `_runs` → `runs`, `_bootstrap` → `bootstrap`
+- `_VALID_BACKENDS` and `_PS_BACKENDS` deleted — they were pure aliases of
+  `registry.names()` / `ps_names()`, so the CLI now reads the registry
+  directly and there is nothing left to drift
+- `App._repo_root`/`._entrypoint` → `App.repo_root`/`.entrypoint`;
+  `_repo_root_for` → `repo_root_for`
+- `__all__` added to `runs`, `cli`, `app`, `config`, `image`; ssh_common's
+  expanded from 56 to 87 entries (31 public names were undeclared)
+- README gained a "Public API" section; AGENTS.md scope list updated
+
+**Underscores that stayed, and why.** `_excludes`, `_logcapture`,
+`_selector` are genuinely file-local. `_bootstrap`, `_cli`, `_ssh_common`
+are compat entry points, documented as such in their own docstrings.
+
+**The one thing that changed the plan.** `_bootstrap` looked like the
+clearest rename candidate — until it turned out runplz does not ship
+itself to the remote, so the container's runplz version is independent of
+the orchestrator's. The invoked module path is therefore a cross-version
+wire format: emitting `runplz.bootstrap` would break a new orchestrator
+against a container pinned to an older runplz. The implementation moved to
+the public `bootstrap.py`, but backends still emit the legacy path, and
+`test_emitted_bootstrap_path_is_the_legacy_one` fails if someone
+"finishes" the rename without a deprecation window.
+
+**Policy reversal, recorded deliberately.** `test_dispatch_internals_stay_private`
+asserted the opposite of this change — that the pipeline stages must stay
+out of `__all__`. It was replaced by `test_dispatch_pipeline_is_public`,
+which states the reasoning: a seam that another module imports and five
+test modules patch is an interface.
+
+**Verification.** format/lint/test green, 742 passed (up 4). Beyond the
+suite: a clean-venv install confirmed the new `runplz.cli:main` entry
+point resolves and backend choices still come from the registry; both
+`python -m runplz._bootstrap` and `python -m runplz.bootstrap` were
+executed end to end; and two mutations of renamed stages
+(`check_preconditions` no-op, `stream_and_wait` always 0) each failed the
+suite, proving the renamed seams still intercept rather than silently
+passing.

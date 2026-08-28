@@ -40,7 +40,7 @@ dev = [
 ]
 
 [project.scripts]
-runplz = "runplz._cli:main"
+runplz = "runplz.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/pirl-unc/runplz"
