@@ -155,7 +155,10 @@ class App:
         # Runtime-populated by the CLI before local_entrypoint fires.
         self._backend: Optional[str] = None
         self._backend_kwargs: dict = {}
-        self.repo_root: Optional[Path] = None
+        self._repo_root: Optional[Path] = None
+        # Whether `repo_root` was chosen by the caller rather than inferred.
+        # Inference must re-run on every bind(); a caller's choice must not.
+        self._repo_root_explicit = False
 
     def function(
         self,
@@ -273,12 +276,16 @@ class App:
                 "can locate the script's repo root."
             )
         if repo_root is not None:
-            self.repo_root = repo_root
-        elif self.repo_root is None:
-            # Only infer when the caller has not set one. `repo_root` is public,
-            # so assigning it before bind() must not be silently discarded.
+            # A per-call argument, so it applies to this bind only — going
+            # through the property setter would mark it "caller chose this"
+            # and leak it into every later bind() that omits the argument.
+            self._repo_root = Path(repo_root).resolve()
+        elif not self._repo_root_explicit:
+            # Infer afresh on every bind. Assigning `app.repo_root` is honored
+            # (it is public, so a caller's choice must not be discarded), but a
+            # repo_root passed to one bind() must not leak into the next.
             any_fn = next(iter(self.functions.values()))
-            self.repo_root = repo_root_for(Path(any_fn.module_file))
+            self._repo_root = repo_root_for(Path(any_fn.module_file))
         self._backend = backend
         self._backend_kwargs = {"outputs_dir": outputs_dir}
         # Which selector each backend takes comes from the registry too, so
@@ -291,6 +298,26 @@ class App:
             self._backend_kwargs["build"] = False
         return self
 
+    @property
+    def repo_root(self) -> Optional[Path]:
+        """Local directory staged to the remote.
+
+        Normally inferred from the job script's location. Assign it to
+        override; the value is resolved to an absolute path, so a string or a
+        relative path is accepted and fails here rather than deep inside
+        dispatch after a box has been paid for.
+        """
+        return self._repo_root
+
+    @repo_root.setter
+    def repo_root(self, value) -> None:
+        if value is None:
+            self._repo_root = None
+            self._repo_root_explicit = False
+            return
+        self._repo_root = Path(value).resolve()
+        self._repo_root_explicit = True
+
     def _dispatch(self, function: Function, args: list, kwargs: dict):
         if self._backend is None:
             raise RuntimeError(
@@ -301,7 +328,18 @@ class App:
                 f"(For in-process execution without a backend, use "
                 f"{function.name}.local(...) instead.)"
             )
+        # registry.load() first: an unknown backend is the more specific
+        # error, and load() only imports a module -- nothing is provisioned.
         module = registry.load(self._backend)
+        # Checked here, not in a backend: every backend funnels through this
+        # method, and the provisioning ones would otherwise create and pay for
+        # a box before noticing that no repo could be staged to it.
+        if self.repo_root is None:
+            raise RuntimeError(
+                f"{function.name}.remote(...) was called but App.repo_root is "
+                "not set. Dispatch through the `runplz` CLI or call "
+                "App.bind(...), either of which sets it."
+            )
         return module.run(self, function, args, kwargs, **self._backend_kwargs)
 
 

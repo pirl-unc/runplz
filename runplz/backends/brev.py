@@ -38,6 +38,56 @@ from runplz.selector import Candidate
 
 __all__ = ["run"]
 
+# Names that lived on this module from 3.5 until 3.20.0. brev never called
+# them -- they were aliases of the shared layer -- so they are gone from
+# brev's own imports, but they were plain public names on a public module,
+# and a minor bump should not ImportError on `from runplz.backends.brev
+# import rsync_up`. Forwarded with a warning; drop in 4.0.
+_MOVED_TO_SSH_COMMON = frozenset(
+    {
+        "FAILURE_TAIL_LINES",
+        "build_image",
+        "build_remote_run_manifest",
+        "check_preconditions",
+        "container_running",
+        "ensure_docker",
+        "ensure_remote_rsync",
+        "fetch_failure_tail",
+        "make_container_name",
+        "make_remote_run_context",
+        "prepare_remote_run",
+        "raise_for_runtime_cap",
+        "remote_has_nvidia",
+        "render_image_ops_script",
+        "rsync_down",
+        "rsync_up",
+        "run_container_detached",
+        "run_container_mode",
+        "run_local",
+        "run_native",
+        "ssh_capture",
+        "ssh_exec",
+        "stream_and_wait",
+        "wait_until_ssh_reachable",
+    }
+)
+
+
+def __getattr__(name):
+    if name in _MOVED_TO_SSH_COMMON:
+        import warnings
+
+        warnings.warn(
+            f"runplz.backends.brev.{name} moved to runplz.backends.ssh_common "
+            f"in 3.20.0; import it from there. This alias goes away in 4.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        from runplz.backends import ssh_common
+
+        return getattr(ssh_common, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # Brev instance names must be slug-ish. Lowercase, ASCII, hyphen-separated.
 # Some providers cap names around 30-40 chars; keep the generated part short

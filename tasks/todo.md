@@ -1002,3 +1002,46 @@ Fixed:
 
 Both new guards were mutation-tested: switching modal.py to the new
 bootstrap path, and reintroducing a private-module import, each fail.
+
+### Review round 3
+
+Two findings were regressions I introduced in round 2:
+
+- `bind()`'s `elif self.repo_root is None` made repo_root **sticky across
+  binds** — `bind(repo_root=X)` then `bind("local")` kept X. Verified by
+  running it. `repo_root` is now a property: assignment coerces to an
+  absolute Path and records caller intent; a `bind(repo_root=...)` argument
+  is per-call and sets the value directly, so it no longer leaks. Four
+  behaviors pinned by tests.
+- The `repo is None` guard I added to `dispatch_to_target` fires **after**
+  provisioning — gcp/aws/brev would create a box and wait out the ssh
+  timeout first. Moved to `App._dispatch`, above every backend, after
+  `registry.load()` so "unknown backend" stays the more specific error.
+
+Also fixed:
+
+- both legacy shims bound `main` by value, so patching `runplz.cli.main`
+  did not reach `runplz._cli.main` — the exact aliasing trap this PR's own
+  policy warns about. Both now forward via module `__getattr__`, matching
+  `backends/_ssh_common.py`, and both `raise SystemExit(main())`.
+- brev's deleted names were plain public names on a public module since
+  3.5. Deleting them outright would ImportError on a minor bump, so brev
+  now forwards them to ssh_common with a DeprecationWarning (drop in 4.0).
+  `brev.__all__` stays `["run"]`.
+- the wire-format guard's `>= 3` floor was satisfiable by a docstring and a
+  `pkill` string; it now counts `python -m runplz._bootstrap` invocations
+  exactly. Mutation-tested: removing one real emit now fails.
+- the private-reference guard skipped every relative import
+  (`from . import _x` has `module=None`); it now resolves `node.level`.
+- the backend-choices test only asserted registry ⊆ choices, losing the
+  deleted constant's two-directional guarantee; it now compares the
+  parser's actual `choices` for both `run` and `ps`.
+- README's Public API table was missing seven of the thirteen public
+  modules, so the promotions were invisible to their audience.
+  `test_readme_documents_every_public_module` pins the table to
+  `PUBLIC_MODULES` — it found three of those gaps itself.
+- orphan comment describing the deleted `_PS_BACKENDS`; SSH_OPTS tuple
+  rationale recorded at the definition.
+
+Filed rather than fixed: #87 (two `@local_entrypoint` decorators silently
+last-wins). Real, but a behavior change, and this PR is a rename.

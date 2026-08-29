@@ -210,6 +210,9 @@ _RSYNC_NOISE_EXCLUDES = (
 # ServerAliveInterval=30 + large ServerAliveCountMax keeps each
 # individual session alive during idle stretches (docker image pulls,
 # data downloads, between-epoch pauses).
+# A tuple, not a list: this is exported, and a mutable module-level
+# default would let one caller's `.append()` change every later ssh
+# invocation in the process. Build your own list from it.
 SSH_OPTS = (
     # Ephemeral cloud boxes are a new host key every time, and every probe
     # runs with BatchMode=yes — which cannot answer OpenSSH's default

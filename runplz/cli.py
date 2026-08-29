@@ -331,10 +331,6 @@ def _load_app(script_path: Path):
     return apps[0]
 
 
-# Which backends `runplz ps` can enumerate is a property of each backend,
-# declared once in runplz.backends.registry.
-
-
 def _ps_main(argv):
     """Dispatch ``runplz ps`` — list runplz jobs across backends."""
     # Read the registry once: the choices and the fan-out list must be the

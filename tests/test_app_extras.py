@@ -1,5 +1,7 @@
 """App / Image edge-case coverage not already hit by test_runplz.py."""
 
+from pathlib import Path
+
 import pytest
 
 from runplz import App, BrevConfig, Image, ImageOp, ModalConfig
@@ -110,25 +112,57 @@ def test_registry_is_the_only_backend_list():
     assert set(registry.provisioning_names()) <= set(registry.names())
 
 
-def test_cli_backend_choices_come_from_the_registry(capsys):
-    """argparse `choices` must track the registry, not a private copy.
+def test_cli_backend_choices_equal_the_registry():
+    """argparse `choices` must EQUAL the registry, not merely contain it.
 
-    Driven through the real parser: an unknown backend makes argparse print
-    the permitted set, so if `choices` stopped reading the registry the
-    listed names would diverge. In-process — spawning an interpreter to read
-    one error message costs a few hundred ms per run and buys nothing.
+    The deleted `_VALID_BACKENDS` assertion was two-directional. A one-way
+    "every registry name appears in the error message" check passes for
+    `choices=list(registry.names()) + ["bogus"]`, so assert on the parser's
+    actual choices instead of a formatted message.
     """
-    import pytest
+    import argparse
+    from unittest import mock
 
     from runplz import cli
     from runplz.backends import registry
 
-    with pytest.raises(SystemExit):
-        cli.main(["not-a-backend", "job.py"])
+    seen = {}
+    real_add = argparse.ArgumentParser.add_argument
 
-    message = capsys.readouterr().err
-    for name in registry.names():
-        assert name in message, f"{name} missing from argparse choices: {message}"
+    def capture(self, *args, **kwargs):
+        if args and args[0] in ("backend",) and "choices" in kwargs:
+            seen[args[0]] = kwargs["choices"]
+        return real_add(self, *args, **kwargs)
+
+    with mock.patch.object(argparse.ArgumentParser, "add_argument", capture):
+        with pytest.raises(SystemExit):
+            cli.main(["not-a-backend", "job.py"])
+
+    assert "backend" in seen, "the backend argument declared no choices"
+    assert list(seen["backend"]) == list(registry.names())
+
+
+def test_ps_backend_choices_equal_the_registry():
+    """Same two-directional guarantee for `runplz ps`, which lost _PS_BACKENDS."""
+    import argparse
+    from unittest import mock
+
+    from runplz import cli
+    from runplz.backends import registry
+
+    seen = {}
+    real_add = argparse.ArgumentParser.add_argument
+
+    def capture(self, *args, **kwargs):
+        if args and args[0] == "backend" and "choices" in kwargs:
+            seen["backend"] = kwargs["choices"]
+        return real_add(self, *args, **kwargs)
+
+    with mock.patch.object(argparse.ArgumentParser, "add_argument", capture):
+        with pytest.raises(SystemExit):
+            cli.main(["ps", "not-a-backend"])
+
+    assert list(seen["backend"]) == list(registry.ps_names())
 
 
 def test_every_registered_backend_is_importable_and_runnable():
@@ -155,3 +189,71 @@ def test_registry_rejects_an_unknown_backend():
 
     with pytest.raises(ValueError, match="backend must be one of"):
         registry.get("k8s")
+
+
+# ---------------------------------------------------------------------------
+# repo_root became public in 3.20.0, which makes its assignment semantics API
+
+
+def _app_with_fn(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "job.py").write_text("# job\n")
+    app = App("v")
+
+    @app.function(image=Image.from_registry("ubuntu:22.04"))
+    def train():
+        pass
+
+    train.module_file = str(repo / "job.py")
+    return app, repo.resolve()
+
+
+def test_repo_root_assignment_is_coerced_to_an_absolute_path(tmp_path):
+    """A str or relative path must fail here, not deep inside dispatch.
+
+    Unresolved, `repo / outputs_dir` raises TypeError and `relative_to(repo)`
+    raises ValueError — both after a paid box has been provisioned.
+    """
+    app, _ = _app_with_fn(tmp_path)
+    app.repo_root = str(tmp_path)
+    assert isinstance(app.repo_root, Path)
+    assert app.repo_root.is_absolute()
+
+
+def test_bind_repo_root_argument_does_not_leak_into_later_binds(tmp_path):
+    """A per-call argument applies to that call only."""
+    app, repo = _app_with_fn(tmp_path)
+    other = (tmp_path / "other").resolve()
+    other.mkdir()
+
+    app.bind("ssh", host="h", repo_root=other)
+    assert app.repo_root == other
+
+    app.bind("local")
+    assert app.repo_root == repo, "a bind()-scoped repo_root leaked into the next bind"
+
+
+def test_assigned_repo_root_survives_bind(tmp_path):
+    """Assigning the public attribute is a choice; bind() must not discard it."""
+    app, _ = _app_with_fn(tmp_path)
+    other = (tmp_path / "other").resolve()
+    other.mkdir()
+
+    app.repo_root = other
+    app.bind("local")
+    assert app.repo_root == other
+
+
+def test_dispatch_refuses_before_provisioning_when_repo_root_is_unset(tmp_path):
+    """The check belongs above the backends, not inside one.
+
+    A provisioning backend would otherwise create the box and wait out the
+    ssh timeout before discovering there is nothing to stage to it.
+    """
+    app, _ = _app_with_fn(tmp_path)
+    app.bind("local")
+    app._repo_root = None
+    fn = next(iter(app.functions.values()))
+    with pytest.raises(RuntimeError, match="repo_root"):
+        app._dispatch(fn, [], {})

@@ -16,10 +16,10 @@ SHARED_MODULES = (
     "runplz.backends.registry",
 )
 
-# Every module the README's "Public API" table names, plus the three promoted
-# out of underscores in 3.20.0. The __all__ guards below run over all of them:
-# the README states "not in __all__ means internal", so a public module with a
-# stale __all__ silently mislabels its own surface.
+# Every module that is public API, which must match the README's "Public API"
+# table (test_readme_documents_every_public_module below pins that). The
+# __all__ guards run over all of them: the README states "not in __all__ means
+# internal", so a public module with a stale __all__ mislabels its own surface.
 PUBLIC_MODULES = SHARED_MODULES + (
     "runplz.app",
     "runplz.config",
@@ -76,15 +76,22 @@ def test_nothing_imports_a_private_name_or_module_across_a_module_line():
         if path.name in allowed:
             continue
         tree = ast.parse(path.read_text())
+        package = ".".join(path.relative_to(root.parent).with_suffix("").parts[:-1])
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
+                # Resolve relative imports first: `from . import _x` has
+                # module=None, and an earlier version treated that as
+                # "not a runplz import" and skipped the alias check too.
                 module = node.module or ""
+                if node.level:
+                    module = f"{package}.{module}" if module else package
                 if not module.startswith("runplz"):
                     continue
-                if module == f"runplz.backends.{path.stem}" or module == f"runplz.{path.stem}":
-                    continue  # a module importing from itself is not a boundary
-                if any(part.startswith("_") for part in module.split(".")):
+                own = {f"runplz.backends.{path.stem}", f"runplz.{path.stem}"}
+                if module not in own and any(part.startswith("_") for part in module.split(".")):
                     offenders.append(f"{path.name}: from {module} import ...")
+                if module in own:
+                    continue  # a module importing from itself is not a boundary
                 for alias in node.names:
                     if alias.name.startswith("_") and not alias.name.startswith("__"):
                         offenders.append(f"{path.name}: from {module} import {alias.name}")
@@ -217,16 +224,27 @@ def test_emitted_bootstrap_path_is_the_legacy_one():
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1] / "runplz"
+    # Exact counts of the *invocation* specifically. A `>=` floor on bare
+    # occurrences is not enough: ssh_common also names the path in a docstring
+    # and in a `pkill -f` fallback, so deleting a real emit still left the
+    # total above the floor and shipped a broken wire contract green.
     emitters = {
         "backends/local.py": 1,
         "backends/modal.py": 1,
         "backends/ssh_common.py": 3,
     }
-    for rel, minimum in emitters.items():
+    for rel, expected in emitters.items():
         text = (root / rel).read_text()
-        assert "runplz.bootstrap" not in text, f"{rel} emits the new bootstrap path"
-        assert text.count("runplz._bootstrap") >= minimum, (
-            f"{rel} should invoke runplz._bootstrap at least {minimum}x"
+        emits = text.count("-m", 0) and text.count("runplz._bootstrap")
+        invocations = text.count('"-m", "runplz._bootstrap"') + text.count("-m runplz._bootstrap")
+        assert invocations == expected, (
+            f"{rel}: expected {expected} `python -m runplz._bootstrap` "
+            f"invocation(s), found {invocations}"
+        )
+        assert emits  # the path must still appear at all
+        # Substring-free check that no emit switched to the new path.
+        assert '"runplz.bootstrap"' not in text and "-m runplz.bootstrap" not in text, (
+            f"{rel} emits the new bootstrap path"
         )
 
 
@@ -236,3 +254,18 @@ def test_ssh_common_compat_shim_still_resolves_public_names():
 
     assert _ssh_common.dispatch_to_target is not None
     assert _ssh_common.wait_until_ssh_reachable is not None
+
+
+def test_readme_documents_every_public_module():
+    """The README's Public API table is the user-facing half of PUBLIC_MODULES.
+
+    Promoting a module out of an underscore is invisible to the people it was
+    done for unless the table lists it — and the table is where the README
+    says semver coverage begins.
+    """
+    from pathlib import Path
+
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    table = readme.split("## Public API", 1)[1].split("\n## ", 1)[0]
+    missing = [name for name in PUBLIC_MODULES if f"`{name}`" not in table]
+    assert not missing, "not in the README Public API table: " + ", ".join(missing)

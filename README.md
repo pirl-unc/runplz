@@ -315,13 +315,20 @@ internal that can move in a patch release.
 
 | Module | What it is |
 |---|---|
-| `runplz` | `App`, `Function`, `Image`, `ImageOp`, and the five backend configs. The only import most job scripts need. |
+| `runplz` | Re-exports everything below that a job script needs: `App`, `Function`, `Image`, `ImageOp`, and the five backend configs. The only import most scripts need. |
+| `runplz.app` | `App`, `Function`, `repo_root_for`. |
+| `runplz.config` | `BrevConfig`, `SshConfig`, `ModalConfig`, `GcpConfig`, `AwsConfig`. |
+| `runplz.image` | `Image` and the `ImageOp` DSL. |
 | `runplz.cli` | The `runplz` console script (`main`). Also reachable as `python -m runplz.cli`. |
 | `runplz.runs` | The `tail` / `status` / `kill` verbs, plus the reader for the `run.json` manifest that `rsync_down` leaves in your outputs dir. |
 | `runplz.bootstrap` | The in-container loader and its **environment contract** — `RUNPLZ_SCRIPT`, `RUNPLZ_FUNCTION`, `RUNPLZ_OUT`, `RUNPLZ_ARGS`, `RUNPLZ_KWARGS`. |
 | `runplz.backends.registry` | What backends exist and what each accepts — the single source of truth behind the CLI's choices. |
 | `runplz.backends.ssh_common` | The shared layer every ssh-reachable backend runs on: `dispatch_to_target`, `run_on_provisioned_vm`, and the individual pipeline stages. |
 | `runplz.backends.provisioning` | Retry policy, GPU shape tables, instance naming, and teardown shared by the cloud drivers. |
+| `runplz.backends.docker` | Container labels and `docker ps` parsing, shared by the local and ssh backends. |
+| `runplz.selector` | `pick_machine` / `pick_machines` — cost-tolerance shape selection with an availability tiebreak. |
+| `runplz.excludes` | `DEFAULT_TRANSFER_EXCLUDES`, the secret-shaped patterns kept off every host -> remote transfer. |
+| `runplz.logcapture` | Tees the driver's stdout/stderr to a log file (what `--log-file` drives). |
 
 Writing a new backend means answering three questions — how do I create a
 box, what ssh target do I hand over, how do I tear it down — and passing
