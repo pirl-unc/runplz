@@ -26,6 +26,8 @@ necessary.
 
 from __future__ import annotations
 
+__all__ = ["resolve_log_path", "tee_stdio_to", "default_log_path"]
+
 import contextlib
 import os
 import sys

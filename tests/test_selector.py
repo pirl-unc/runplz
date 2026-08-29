@@ -1,12 +1,12 @@
 """Coverage for the cross-backend machine-type selector.
 
-See runplz/_selector.py for the algorithm. Exercises the 5% cost
+See runplz/selector.py for the algorithm. Exercises the 5% cost
 tolerance + availability-hint tiebreaker plus the fallback paths.
 """
 
 import pytest
 
-from runplz._selector import Candidate, pick_machine, pick_machines
+from runplz.selector import Candidate, pick_machine, pick_machines
 
 
 def _c(name, price, hint=None, region=None):

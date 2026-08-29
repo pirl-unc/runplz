@@ -274,7 +274,9 @@ class App:
             )
         if repo_root is not None:
             self.repo_root = repo_root
-        else:
+        elif self.repo_root is None:
+            # Only infer when the caller has not set one. `repo_root` is public,
+            # so assigning it before bind() must not be silently discarded.
             any_fn = next(iter(self.functions.values()))
             self.repo_root = repo_root_for(Path(any_fn.module_file))
         self._backend = backend

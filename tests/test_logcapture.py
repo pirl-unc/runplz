@@ -1,11 +1,11 @@
-"""Coverage for the #23 log-file tee in runplz/_logcapture.py."""
+"""Coverage for the #23 log-file tee in runplz/logcapture.py."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from unittest import mock
 
-from runplz._logcapture import default_log_path, resolve_log_path, tee_stdio_to
+from runplz.logcapture import default_log_path, resolve_log_path, tee_stdio_to
 
 # --- default_log_path --------------------------------------------------
 
@@ -157,7 +157,7 @@ def test_tee_survives_log_write_failure():
     still complete — a broken logfile shouldn't swallow terminal output."""
     from io import StringIO
 
-    from runplz._logcapture import _TeeStream
+    from runplz.logcapture import _TeeStream
 
     class _BrokenLog:
         def write(self, _s):

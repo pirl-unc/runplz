@@ -138,7 +138,7 @@ def main(argv=None):
     # Resolve the log path relative to the same outputs-dir we'll hand to
     # the backend. The log-capture has to wrap everything after this point,
     # including the entrypoint and the backend dispatch.
-    from runplz._logcapture import resolve_log_path, tee_stdio_to
+    from runplz.logcapture import resolve_log_path, tee_stdio_to
 
     outputs_dir_abs = (app.repo_root / args.outputs_dir).resolve()
     log_path = resolve_log_path(
@@ -337,6 +337,9 @@ def _load_app(script_path: Path):
 
 def _ps_main(argv):
     """Dispatch ``runplz ps`` — list runplz jobs across backends."""
+    # Read the registry once: the choices and the fan-out list must be the
+    # same set, which the deleted _PS_BACKENDS constant used to guarantee.
+    ps_backends = registry.ps_names()
     p = argparse.ArgumentParser(
         prog="runplz ps",
         description="List runplz jobs currently running across backends.",
@@ -344,7 +347,7 @@ def _ps_main(argv):
     p.add_argument(
         "backend",
         nargs="?",
-        choices=registry.ps_names(),
+        choices=ps_backends,
         help="Limit listing to one backend. Default: fan out to all of local, brev, modal.",
     )
     p.add_argument(
@@ -368,7 +371,7 @@ def _ps_main(argv):
     if args.ssh_port is not None and not (0 < args.ssh_port < 65536):
         p.error(f"--ssh-port must be a valid TCP port (1-65535); got {args.ssh_port}.")
 
-    backends = [args.backend] if args.backend else list(registry.ps_names())
+    backends = [args.backend] if args.backend else list(ps_backends)
     ssh_hosts = [h.strip() for h in (args.ssh_host or "").split(",") if h.strip()]
 
     rows = []
@@ -591,4 +594,4 @@ def _add_run_lookup_args(parser):
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

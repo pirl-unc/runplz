@@ -44,6 +44,9 @@ root but not siblings sitting next to it. This diverges from plain
 `python path/to/job.py`; see issue tracking before relying on either.
 """
 
+__all__ = ["main"]
+
+
 import importlib.util
 import json
 import os

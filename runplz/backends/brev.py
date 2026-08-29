@@ -18,7 +18,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from runplz._selector import Candidate
 from runplz.backends.provisioning import (
     CloudCliError,
     RetryPolicy,
@@ -30,41 +29,12 @@ from runplz.backends.provisioning import (
 from runplz.backends.ssh_common import (
     CLEANUP_SIGNALS as ssh_common_CLEANUP_SIGNALS,
 )
-
-# brev's dispatch runs through ssh_common.run_on_provisioned_vm, so the
-# staging/run helpers below are no longer called from this module — they are
-# internals of dispatch_to_target now. They stay imported because
-# `runplz.backends.brev.<helper>` has been part of this module's surface
-# since 3.5 and the test suite patches them here.
-from runplz.backends.ssh_common import (  # noqa: F401
-    FAILURE_TAIL_LINES,
+from runplz.backends.ssh_common import (
     OrchestratorKilled,
-    build_image,
-    build_remote_run_manifest,
-    check_preconditions,
-    container_running,
-    ensure_docker,
-    ensure_remote_rsync,
-    fetch_failure_tail,
-    make_container_name,
-    make_remote_run_context,
     orchestrator_signal_cleanup,
-    prepare_remote_run,
-    raise_for_runtime_cap,
-    remote_has_nvidia,
-    render_image_ops_script,
-    rsync_down,
-    rsync_up,
-    run_container_detached,
-    run_container_mode,
-    run_local,
-    run_native,
     run_on_provisioned_vm,
-    ssh_capture,
-    ssh_exec,
-    stream_and_wait,
-    wait_until_ssh_reachable,
 )
+from runplz.selector import Candidate
 
 __all__ = ["run"]
 
@@ -520,7 +490,7 @@ def _create_instance(name: str, *, cfg=None, image=None, function=None):
     1. `cfg.instance_type` — explicit user override (if set).
     2. Cheapest match from `brev search` driven by `function`'s resource
        constraints, with the 5% cost-tolerance + availability tiebreaker
-       applied via `runplz._selector.pick_machine`.
+       applied via `runplz.selector.pick_machine`.
 
     Raises only if the picker finds no matches.
     """
@@ -929,7 +899,7 @@ def _pick_instance_types(function, *, n: int = 1, exclude_providers: tuple = ())
     Returns `[]` on no match. When n == 1, returns a single-element list
     (or []).
     """
-    from runplz._selector import pick_machines
+    from runplz.selector import pick_machines
 
     # gpu mode whenever the user named a model OR set any GPU-shaped
     # constraint (min_gpu_memory, multi-GPU). This is what makes

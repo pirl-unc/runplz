@@ -31,9 +31,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from runplz._excludes import DEFAULT_TRANSFER_EXCLUDES
 from runplz.backends import docker
 from runplz.backends.provisioning import RetryPolicy, retry_budget_spent
+from runplz.excludes import DEFAULT_TRANSFER_EXCLUDES
 
 __all__ = [
     # --- running one function on a reachable box -------------------------
@@ -210,7 +210,7 @@ _RSYNC_NOISE_EXCLUDES = (
 # ServerAliveInterval=30 + large ServerAliveCountMax keeps each
 # individual session alive during idle stretches (docker image pulls,
 # data downloads, between-epoch pauses).
-SSH_OPTS = [
+SSH_OPTS = (
     # Ephemeral cloud boxes are a new host key every time, and every probe
     # runs with BatchMode=yes — which cannot answer OpenSSH's default
     # "are you sure?" prompt. Without this, a fresh EC2 IP fails host-key
@@ -229,7 +229,7 @@ SSH_OPTS = [
     "ServerAliveCountMax=240",
     "-o",
     "TCPKeepAlive=yes",
-]
+)
 
 
 @dataclass(frozen=True)
@@ -1100,7 +1100,7 @@ def rsync_up(
     for pat in _RSYNC_NOISE_EXCLUDES:
         cmd.append(f"--exclude={pat}")
     # Safety: never ship local secrets / dotenv / SSH keys to a remote box.
-    # See runplz/_excludes.py for the rationale.
+    # See runplz/excludes.py for the rationale.
     for pat in DEFAULT_TRANSFER_EXCLUDES:
         cmd.append(f"--exclude={pat}")
     # Don't re-upload the outputs we'll rsync_down later. _RSYNC_NOISE_EXCLUDES
@@ -2824,6 +2824,10 @@ def dispatch_to_target(
     itself; see :func:`run_on_provisioned_vm`.
     """
     repo = app.repo_root
+    if repo is None:
+        raise RuntimeError(
+            "App repo_root not set. Call App.bind() (or the runplz CLI) before dispatching."
+        )
     host_out = (repo / outputs_dir).resolve()
     host_out.mkdir(parents=True, exist_ok=True)
 

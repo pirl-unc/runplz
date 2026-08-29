@@ -110,25 +110,23 @@ def test_registry_is_the_only_backend_list():
     assert set(registry.provisioning_names()) <= set(registry.names())
 
 
-def test_cli_backend_choices_come_from_the_registry():
+def test_cli_backend_choices_come_from_the_registry(capsys):
     """argparse `choices` must track the registry, not a private copy.
 
-    Driven through the real CLI: an unknown backend makes argparse print the
-    permitted set, so if `choices` ever stopped reading the registry the
-    listed names would diverge from `registry.names()`.
+    Driven through the real parser: an unknown backend makes argparse print
+    the permitted set, so if `choices` stopped reading the registry the
+    listed names would diverge. In-process — spawning an interpreter to read
+    one error message costs a few hundred ms per run and buys nothing.
     """
-    import subprocess
-    import sys
+    import pytest
 
+    from runplz import cli
     from runplz.backends import registry
 
-    proc = subprocess.run(
-        [sys.executable, "-m", "runplz.cli", "not-a-backend", "job.py"],
-        capture_output=True,
-        text=True,
-    )
-    assert proc.returncode != 0
-    message = proc.stderr + proc.stdout
+    with pytest.raises(SystemExit):
+        cli.main(["not-a-backend", "job.py"])
+
+    message = capsys.readouterr().err
     for name in registry.names():
         assert name in message, f"{name} missing from argparse choices: {message}"
 

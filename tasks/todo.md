@@ -959,3 +959,46 @@ executed end to end; and two mutations of renamed stages
 (`check_preconditions` no-op, `stream_and_wait` always 0) each failed the
 suite, proving the renamed seams still intercept rather than silently
 passing.
+
+### Review round 2 (code-review findings)
+
+The review caught a claim I had made and got wrong: I reported "zero
+cross-module private references" after the first pass, but my audit only
+detected private *names*, not private *modules*. In
+`from runplz._excludes import DEFAULT_TRANSFER_EXCLUDES` the name is public
+and the module is not, so five such imports were live while the check
+reported clean. `test_nothing_imports_a_private_name_or_module_across_a_module_line`
+now walks the AST and checks both halves; the corrected audit reports zero
+for real, with three underscore modules left, all documented compat shims.
+
+Fixed:
+
+- `runplz/cli.py` discarded `main()`'s return code while the shim this PR
+  added propagated it — and this PR newly advertised `python -m runplz.cli`
+  in the README. All three entry points now agree (verified: exit 1).
+- promoted `_excludes`/`_selector`/`_logcapture`; each was imported across
+  a module line by a public module
+- `provisioning.__all__` omitted five public constants, including
+  `ALREADY_EXISTS`, which `gcp.py` imports — a name the README's own rule
+  called droppable in a patch release
+- the `__all__` drift guard covered only `ssh_common`; now parametrized
+  over all 13 public modules, and it immediately found three more gaps
+  (`selector.MachineChoice`, `DEFAULT_COST_TOLERANCE`,
+  `logcapture.default_log_path`). Also handles `AnnAssign`.
+- the wire-format guard omitted `modal.py`, a third emit site, and its
+  `>= 3` total was satisfiable by a docstring and a `pkill` string; now
+  asserts per-file
+- `SSH_OPTS` was a mutable list in `__all__` -> tuple
+- `dispatch_to_target` dereferenced `app.repo_root` unguarded; now raises
+  the same actionable error `local.py`/`modal.py` do
+- `bind()` silently overwrote a caller-set `repo_root`, newly invited by
+  making the attribute public; now only infers when unset
+- deleted brev's 24 dead re-exports and repointed 52 test call sites at
+  `ssh_common`. This also retired an overstated justification: the policy
+  test had cited "brev has to re-export all eleven" as evidence the stages
+  are API. brev called none of them.
+- the registry test spawned an interpreter to read one argparse message;
+  now in-process
+
+Both new guards were mutation-tested: switching modal.py to the new
+bootstrap path, and reintroducing a private-module import, each fail.

@@ -14,11 +14,8 @@ from unittest import mock
 import pytest
 
 from runplz import App, BrevConfig, Image, ModalConfig
-from runplz.backends.brev import (
-    _brev_gpu_name,
-    _pick_instance_type,
-    render_image_ops_script,
-)
+from runplz.backends.brev import _brev_gpu_name, _pick_instance_type
+from runplz.backends.ssh_common import render_image_ops_script
 
 # ---- Image DSL rendering --------------------------------------------------
 

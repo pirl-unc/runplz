@@ -96,7 +96,7 @@ def test_render_modal_image_non_editable_install(tmp_path):
 def test_render_modal_image_passes_default_secret_ignores_to_add_local_dir(tmp_path):
     """Issue #18: .env / ssh keys / credentials.json must not be baked
     into the Modal image layer."""
-    from runplz._excludes import DEFAULT_TRANSFER_EXCLUDES
+    from runplz.excludes import DEFAULT_TRANSFER_EXCLUDES
 
     img = Image.from_registry("ubuntu:22.04").pip_install_local_dir(".", editable=False)
     src = modal_backend._render_modal_image(img, repo=tmp_path)

@@ -21,6 +21,15 @@ the original (cheapest-first) order so behavior doesn't silently
 diverge from the pre-selector implementation.
 """
 
+__all__ = [
+    "Candidate",
+    "MachineChoice",
+    "pick_machine",
+    "pick_machines",
+    "DEFAULT_COST_TOLERANCE",
+]
+
+
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
