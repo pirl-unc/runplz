@@ -125,6 +125,7 @@ STATE = LOG + ".state"
 ROUTES = {routes!r}
 FAIL_TIMES = {fail_times!r}
 FAIL_MESSAGE = {fail_message!r}
+MALFORMED = {malformed!r}
 KNOWN_OPTIONS = {_KNOWN_OPTIONS!r}
 REQUIRED_OPTIONS = {_REQUIRED_OPTIONS!r}
 
@@ -243,12 +244,15 @@ if "{name}" == "gcloud" and route_name == "compute/config-ssh":
                 "  UserKnownHostsFile /dev/null\\n"
             )
 
-sys.stdout.write(ROUTES[key])
+if "/".join(key) in MALFORMED:
+    sys.stdout.write(MALFORMED["/".join(key)])
+else:
+    sys.stdout.write(ROUTES[key])
 sys.exit(0)
 '''
 
 
-def install(bin_dir: Path, *, name: str, fail_times=None, fail_message="") -> Path:
+def install(bin_dir: Path, *, name: str, fail_times=None, fail_message="", malformed=None) -> Path:
     """Write a stub `gcloud` or `aws` into `bin_dir`; return its call log."""
     routes = {"gcloud": _GCLOUD_ROUTES, "aws": _AWS_ROUTES}[name]
     log = bin_dir / f"{name}-calls.jsonl"
@@ -260,6 +264,7 @@ def install(bin_dir: Path, *, name: str, fail_times=None, fail_message="") -> Pa
             routes=routes,
             fail_times=fail_times or {},
             fail_message=fail_message,
+            malformed=malformed or {},
             _KNOWN_OPTIONS=_KNOWN_OPTIONS,
             _REQUIRED_OPTIONS=_REQUIRED_OPTIONS,
         )
