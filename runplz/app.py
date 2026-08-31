@@ -21,6 +21,7 @@ __all__ = [
 import inspect
 import json
 import os
+import re
 import warnings
 from pathlib import Path
 from typing import Callable, Optional
@@ -95,7 +96,7 @@ class Function:
         self.num_gpus = num_gpus
         self.min_gpus = num_gpus
         self.timeout = timeout
-        self.env = dict(env or {})
+        self.env = _normalize_env(fn.__name__, env)
         # Preconditions: declarative remote-state requirements probed *after*
         # rsync_up but *before* bootstrap, so a misprovisioned box (small
         # /dev/shm, full disk, missing GPU) fails fast instead of wasting
@@ -204,6 +205,17 @@ class App:
 
     def local_entrypoint(self):
         def decorator(fn: Callable) -> Callable:
+            if self.entrypoint is not None:
+                # Last-wins would leave the first driver unreachable with no
+                # output at all — the CLI runs one and never mentions the
+                # other. Every comparable ambiguity here is an error: multiple
+                # Apps in a script, or multiple @app.function with no
+                # entrypoint to disambiguate. Issue #87.
+                raise ValueError(
+                    f"{self.name} already has an @app.local_entrypoint "
+                    f"({self.entrypoint.__name__}); only one is allowed. "
+                    f"Remove one, or have it call the other."
+                )
             self.entrypoint = fn
             return fn
 
@@ -547,6 +559,42 @@ def _coalesce_min_gpus(fn_name: str, *, min_gpus: Optional[int], num_gpus: int) 
             f"num_gpus={num_gpus}. Pass only one (prefer min_gpus going forward)."
         )
     return min_gpus
+
+
+_ENV_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _normalize_env(fn_name: str, raw: Optional[dict]) -> dict:
+    """Validate the user's `env=` dict and return a clean copy.
+
+    Every entry is rendered into remote shell as ``export KEY=<quoted value>``.
+    Values are quoted; keys cannot be, because a shell variable name is not a
+    word that quoting applies to. A key that is not a valid identifier
+    therefore produces shell that *parses* — so `sh -n` does not catch it —
+    and fails at runtime::
+
+        $ bash -c 'set -euo pipefail; export MY-VAR=x; echo reached'
+        bash: export: `MY-VAR=x': not a valid identifier   # exit 1
+
+    The remote command runs under ``set -euo pipefail``, so that aborts the
+    whole job, after the box has been provisioned and the repo rsynced, with
+    an error naming neither runplz nor the offending key. Checked here
+    instead: the laptop knows everything it needs to. Issue #88.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"@app.function({fn_name}): env must be a dict; got {type(raw).__name__}.")
+    cleaned: dict = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not _ENV_KEY_RE.fullmatch(key):
+            raise ValueError(
+                f"@app.function({fn_name}): env key {key!r} is not a valid shell "
+                f"identifier. Use letters, digits and underscores, not starting "
+                f"with a digit — the remote `export` would fail mid-run otherwise."
+            )
+        cleaned[key] = value
+    return cleaned
 
 
 def _normalize_preconditions(fn_name: str, raw: Optional[dict]) -> dict:

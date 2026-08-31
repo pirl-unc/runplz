@@ -378,3 +378,102 @@ def test_bind_without_functions_is_fine_when_repo_root_is_supplied(tmp_path):
 
     with pytest.raises(RuntimeError, match="at least one"):
         App("y").bind("local")
+
+
+# ---------------------------------------------------------------------------
+# Fail on the laptop, not after the box is paid for (#87, #88)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["MY-VAR", "2FAST", "HAS SPACE", "a;touch /tmp/x", "with.dot", "", "$HOME"],
+)
+def test_env_key_must_be_a_shell_identifier(key):
+    """`export {key}=...` parses but fails at runtime for a non-identifier.
+
+    `sh -n` does not catch it — the syntax is valid — and the remote runs
+    under `set -euo pipefail`, so it aborts the job after provisioning with
+    an error naming neither runplz nor the key.
+    """
+    app = App("t")
+    with pytest.raises(ValueError, match="not a valid shell identifier"):
+
+        @app.function(image=Image.from_registry("ubuntu:22.04"), env={key: "x"})
+        def fn():
+            pass
+
+
+@pytest.mark.parametrize("key", ["OK", "OK_VAR", "_LEADING", "x2", "A1_b2"])
+def test_valid_env_keys_are_accepted(key):
+    app = App("t")
+
+    @app.function(image=Image.from_registry("ubuntu:22.04"), env={key: "x"})
+    def fn():
+        pass
+
+    assert fn.env == {key: "x"}
+
+
+def test_env_must_be_a_dict():
+    app = App("t")
+    with pytest.raises(ValueError, match="env must be a dict"):
+
+        @app.function(image=Image.from_registry("ubuntu:22.04"), env=[("A", "b")])
+        def fn():
+            pass
+
+
+def test_every_accepted_env_key_survives_a_real_shell():
+    """The regex is only right if the shell agrees with it.
+
+    Renders the same `export` line the backends emit and runs it, so this
+    fails if the accepted character set and bash's idea of an identifier
+    ever diverge.
+    """
+    import shlex
+    import subprocess
+
+    app = App("t")
+
+    @app.function(
+        image=Image.from_registry("ubuntu:22.04"),
+        env={"OK": "1", "OK_VAR": "a b", "_LEAD": "x'y", "n2": "$NOPE"},
+    )
+    def fn():
+        pass
+
+    exports = " ".join(f"export {k}={shlex.quote(str(v))};" for k, v in fn.env.items())
+    proc = subprocess.run(
+        ["bash", "-c", f'set -euo pipefail; {exports} echo OK; echo "$OK_VAR"'],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "a b" in proc.stdout
+
+
+def test_second_local_entrypoint_is_rejected():
+    """Last-wins left the first driver unreachable with no output at all."""
+    app = App("t")
+
+    @app.local_entrypoint()
+    def first():
+        pass
+
+    with pytest.raises(ValueError, match="already has an @app.local_entrypoint"):
+
+        @app.local_entrypoint()
+        def second():
+            pass
+
+    assert app.entrypoint is first, "the first entrypoint must survive the rejection"
+
+
+def test_one_local_entrypoint_still_works():
+    app = App("t")
+
+    @app.local_entrypoint()
+    def only():
+        pass
+
+    assert app.entrypoint is only
