@@ -21,7 +21,7 @@ import subprocess
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Callable, NamedTuple, Optional
+from typing import Callable, Optional
 
 __all__ = [
     "CloudCliError",
@@ -33,12 +33,15 @@ __all__ = [
     "run_cli",
     "render_command",
     # Choosing a machine for a function's resource request.
+    "MachineOffering",
     "GpuShapes",
+    "AWS_CPU_SHAPES",
+    "GCP_CPU_SHAPES",
     "GCP_GPUS",
     "AWS_GPUS",
     "resolve_gpu_label",
     "gpu_count",
-    "pick_shape",
+    "select_machine",
     # Giving the machine back.
     "apply_teardown",
     "AWS_RETRY_POLICY",
@@ -475,76 +478,244 @@ def run_cli(
 # shape pass machine_type / instance_type and skip all of this.
 
 
-class GpuShapes(NamedTuple):
-    """What one GPU model looks like on one provider."""
+@dataclass(frozen=True)
+class MachineOffering:
+    """One provider machine type and the resources it actually supplies.
 
-    # GCP needs an accelerator name for shapes that don't bundle a GPU.
-    # AWS has no equivalent, so it is None there.
+    Selection and validation consume the same records. That prevents the old
+    split-brain design where production built a plausible name arithmetically
+    while tests separately asserted a hand-written list of names.
+    """
+
+    name: str
+    vcpus: int
+    memory_gb: float
+    gpus: int = 0
+
+    def satisfies(self, *, min_cpu: float, min_memory: float, gpus: int) -> bool:
+        return self.gpus == gpus and self.vcpus >= min_cpu and self.memory_gb >= min_memory
+
+
+@dataclass(frozen=True)
+class GpuShapes:
+    """All machine offerings for one GPU model on one provider."""
+
+    # GCP needs an accelerator name for shapes with separately attached GPUs.
+    # AWS and GCP's accelerator-optimized machine families bundle the GPU.
     accelerator: Optional[str]
     family: str
     vram_gb: int
-    # GPU count -> the exact machine type that sells it. None means the
-    # family takes a separately-attached accelerator instead.
-    shapes: Optional[dict]
+    offerings: tuple[MachineOffering, ...]
+    attached: bool = False
+
+    @property
+    def gpu_counts(self) -> tuple[int, ...]:
+        return tuple(sorted({offering.gpus for offering in self.offerings}))
 
 
-# Machine types are enumerated, never derived. Arithmetic gets this wrong in
-# two different ways: `f"{family}.xlarge"` invents p3.xlarge and
-# g4dn.24xlarge, which do not exist, and g2-standard's numeric suffix is
-# vCPUs rather than GPUs, so `4 * count` names a real machine that quietly
-# carries one GPU instead of the eight that were asked for.
+def _offering(name: str, vcpus: int, memory_gb: float, gpus: int = 0) -> MachineOffering:
+    return MachineOffering(name, vcpus, memory_gb, gpus)
+
+
+# Exact capabilities from the provider machine-type specifications. Ordering is
+# deliberately smallest-first: select_machine returns the first offering that
+# satisfies every declared minimum. A request beyond the last entry raises; it
+# never clamps to an undersized but syntactically valid machine.
+AWS_CPU_SHAPES = tuple(
+    _offering(name, vcpus, vcpus * 4)
+    for name, vcpus in (
+        ("m6i.large", 2),
+        ("m6i.xlarge", 4),
+        ("m6i.2xlarge", 8),
+        ("m6i.4xlarge", 16),
+        ("m6i.8xlarge", 32),
+        ("m6i.12xlarge", 48),
+        ("m6i.16xlarge", 64),
+        ("m6i.24xlarge", 96),
+        ("m6i.32xlarge", 128),
+    )
+)
+
+GCP_CPU_SHAPES = tuple(
+    _offering(f"n2-standard-{vcpus}", vcpus, vcpus * 4)
+    for vcpus in (2, 4, 8, 16, 32, 48, 64, 80, 96, 128)
+)
+
+
+def _n1_offerings(gpu_counts_and_sizes: dict) -> tuple[MachineOffering, ...]:
+    """Build the finite standard N1 shapes allowed for attached GPUs.
+
+    GCE publishes different maximum vCPU ranges for each GPU/count pair.
+    N1 standard shapes carry 3.75 GB per vCPU (not 4 GB); keeping that fact
+    here prevents memory minima from silently receiving a smaller machine.
+    """
+    return tuple(
+        _offering(f"n1-standard-{vcpus}", vcpus, vcpus * 3.75, gpus)
+        for gpus, sizes in gpu_counts_and_sizes.items()
+        for vcpus in sizes
+    )
+
+
 GCP_GPUS = {
-    "T4": GpuShapes("nvidia-tesla-t4", "n1-standard", 16, None),
-    "V100": GpuShapes("nvidia-tesla-v100", "n1-standard", 16, None),
+    "T4": GpuShapes(
+        "nvidia-tesla-t4",
+        "n1-standard",
+        16,
+        _n1_offerings({1: (8, 16, 32), 2: (8, 16, 32), 4: (16, 32, 64, 96)}),
+        attached=True,
+    ),
+    "V100": GpuShapes(
+        "nvidia-tesla-v100",
+        "n1-standard",
+        16,
+        _n1_offerings({1: (8,), 2: (8, 16), 4: (16, 32), 8: (32, 64, 96)}),
+        attached=True,
+    ),
     "L4": GpuShapes(
         "nvidia-l4",
         "g2-standard",
         24,
-        {1: "g2-standard-4", 2: "g2-standard-24", 4: "g2-standard-48", 8: "g2-standard-96"},
+        (
+            _offering("g2-standard-4", 4, 16, 1),
+            _offering("g2-standard-8", 8, 32, 1),
+            _offering("g2-standard-12", 12, 48, 1),
+            _offering("g2-standard-16", 16, 64, 1),
+            _offering("g2-standard-32", 32, 128, 1),
+            _offering("g2-standard-24", 24, 96, 2),
+            _offering("g2-standard-48", 48, 192, 4),
+            _offering("g2-standard-96", 96, 384, 8),
+        ),
     ),
     "A100-40GB": GpuShapes(
         "nvidia-tesla-a100",
         "a2-highgpu",
         40,
-        {1: "a2-highgpu-1g", 2: "a2-highgpu-2g", 4: "a2-highgpu-4g", 8: "a2-highgpu-8g"},
+        tuple(
+            _offering(f"a2-highgpu-{gpus}g", vcpus, memory, gpus)
+            for gpus, vcpus, memory in (
+                (1, 12, 85),
+                (2, 24, 170),
+                (4, 48, 340),
+                (8, 96, 680),
+            )
+        ),
     ),
     "A100-80GB": GpuShapes(
         "nvidia-a100-80gb",
         "a2-ultragpu",
         80,
-        {1: "a2-ultragpu-1g", 2: "a2-ultragpu-2g", 4: "a2-ultragpu-4g", 8: "a2-ultragpu-8g"},
+        tuple(
+            _offering(f"a2-ultragpu-{gpus}g", vcpus, memory, gpus)
+            for gpus, vcpus, memory in (
+                (1, 12, 170),
+                (2, 24, 340),
+                (4, 48, 680),
+                (8, 96, 1360),
+            )
+        ),
     ),
-    "H100": GpuShapes("nvidia-h100-80gb", "a3-highgpu", 80, {8: "a3-highgpu-8g"}),
+    "H100": GpuShapes(
+        "nvidia-h100-80gb",
+        "a3-highgpu",
+        80,
+        (_offering("a3-highgpu-8g", 208, 1872, 8),),
+    ),
 }
+
+
+def _aws_scale(family: str, one_gpu_memory: int) -> tuple[MachineOffering, ...]:
+    """Common G4dn/G5/G6/G6e layout for 1, 4 and 8 GPU offerings."""
+    one_gpu = tuple(
+        _offering(f"{family}.{size}", vcpus, memory, 1)
+        for size, vcpus, memory in (
+            ("xlarge", 4, one_gpu_memory),
+            ("2xlarge", 8, one_gpu_memory * 2),
+            ("4xlarge", 16, one_gpu_memory * 4),
+            ("8xlarge", 32, one_gpu_memory * 8),
+            ("16xlarge", 64, one_gpu_memory * 16),
+        )
+    )
+    four_gpu = (
+        _offering(f"{family}.12xlarge", 48, one_gpu_memory * 12, 4),
+        _offering(f"{family}.24xlarge", 96, one_gpu_memory * 24, 4),
+    )
+    eight_gpu = (_offering(f"{family}.48xlarge", 192, one_gpu_memory * 48, 8),)
+    if family == "g4dn":
+        four_gpu = (_offering("g4dn.12xlarge", 48, 192, 4),)
+        eight_gpu = (_offering("g4dn.metal", 96, 384, 8),)
+    return one_gpu + four_gpu + eight_gpu
+
 
 AWS_GPUS = {
-    "T4": GpuShapes(None, "g4dn", 16, {1: "g4dn.xlarge", 4: "g4dn.12xlarge", 8: "g4dn.metal"}),
-    "V100": GpuShapes(None, "p3", 16, {1: "p3.2xlarge", 4: "p3.8xlarge", 8: "p3.16xlarge"}),
-    "A10G": GpuShapes(None, "g5", 24, {1: "g5.xlarge", 4: "g5.12xlarge", 8: "g5.48xlarge"}),
-    "L4": GpuShapes(None, "g6", 24, {1: "g6.xlarge", 4: "g6.12xlarge", 8: "g6.48xlarge"}),
-    "L40S": GpuShapes(None, "g6e", 48, {1: "g6e.xlarge", 4: "g6e.12xlarge", 8: "g6e.48xlarge"}),
-    "A100-40GB": GpuShapes(None, "p4d", 40, {8: "p4d.24xlarge"}),
-    "A100-80GB": GpuShapes(None, "p4de", 80, {8: "p4de.24xlarge"}),
-    "H100": GpuShapes(None, "p5", 80, {8: "p5.48xlarge"}),
+    "T4": GpuShapes(None, "g4dn", 16, _aws_scale("g4dn", 16)),
+    "V100": GpuShapes(
+        None,
+        "p3",
+        16,
+        (
+            _offering("p3.2xlarge", 8, 61, 1),
+            _offering("p3.8xlarge", 32, 244, 4),
+            _offering("p3.16xlarge", 64, 488, 8),
+        ),
+    ),
+    "A10G": GpuShapes(None, "g5", 24, _aws_scale("g5", 16)),
+    "L4": GpuShapes(None, "g6", 24, _aws_scale("g6", 16)),
+    "L40S": GpuShapes(None, "g6e", 48, _aws_scale("g6e", 32)),
+    "A100-40GB": GpuShapes(None, "p4d", 40, (_offering("p4d.24xlarge", 96, 1152, 8),)),
+    "A100-80GB": GpuShapes(None, "p4de", 80, (_offering("p4de.24xlarge", 96, 1152, 8),)),
+    "H100": GpuShapes(
+        None,
+        "p5",
+        80,
+        (
+            _offering("p5.4xlarge", 16, 256, 1),
+            _offering("p5.48xlarge", 192, 2048, 8),
+        ),
+    ),
 }
 
 
-def pick_shape(label: str, count: int, table: dict, *, cloud: str) -> str:
-    """Return the machine type selling exactly `count` of `label`'s GPU.
+def _resource_minimums(function) -> tuple[float, float]:
+    min_cpu = float(getattr(function, "min_cpu", None) or 0) or 2
+    min_memory = float(getattr(function, "min_memory", None) or 0)
+    return min_cpu, min_memory
 
-    Refuses a count the family does not offer rather than fabricating a name:
-    a wrong-but-plausible type either fails deep inside the provider CLI or,
-    worse, launches a box with fewer GPUs than the job asked for.
+
+def select_machine(
+    function,
+    offerings: tuple[MachineOffering, ...],
+    *,
+    cloud: str,
+    gpus: int = 0,
+    gpu_label: Optional[str] = None,
+) -> MachineOffering:
+    """Choose the smallest known offering satisfying every resource minimum.
+
+    The function is intentionally provider-neutral. Provider drivers supply
+    only their ordered catalogue and vocabulary; count validation, CPU/RAM
+    validation and the fail-instead-of-clamp contract live here once.
     """
-    shapes = table[label].shapes
-    if shapes is None:
-        raise KeyError(label)
-    if count not in shapes:
+    min_cpu, min_memory = _resource_minimums(function)
+    matching_count = tuple(offering for offering in offerings if offering.gpus == gpus)
+    if not matching_count:
+        counts = sorted({offering.gpus for offering in offerings})
+        resource = gpu_label or "GPU"
         raise CloudCliError(
-            f"{cloud} sells {label} in {sorted(shapes)} GPU counts, not {count}. "
+            f"{cloud} sells {resource} in {counts} GPU counts, not {gpus}. "
             f"Pass an explicit machine type to use a shape runplz doesn't know."
         )
-    return shapes[count]
+    for offering in matching_count:
+        if offering.satisfies(min_cpu=min_cpu, min_memory=min_memory, gpus=gpus):
+            return offering
+    largest = max(matching_count, key=lambda item: (item.vcpus, item.memory_gb))
+    resource = f"{gpu_label} with {gpus} GPU(s)" if gpu_label else "CPU-only"
+    raise CloudCliError(
+        f"{cloud} has no known {resource} machine satisfying "
+        f"min_cpu={min_cpu:g}, min_memory={min_memory:g} GB. "
+        f"Largest known is {largest.name} ({largest.vcpus} vCPU, "
+        f"{largest.memory_gb:g} GB). Pass an explicit machine type to use "
+        f"a shape runplz doesn't know."
+    )
 
 
 def resolve_gpu_label(function, table: dict) -> Optional[str]:

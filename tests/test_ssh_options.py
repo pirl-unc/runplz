@@ -32,6 +32,12 @@ def test_identity_file_is_user_expanded():
     assert "~" not in argv[argv.index("-i") + 1]
 
 
+def test_known_hosts_file_is_isolated_and_user_expanded():
+    argv = ssh_cmd_opts(SshOptions(known_hosts_file="~/.runplz-test-known-hosts"))
+    option = next(value for value in argv if value.startswith("UserKnownHostsFile="))
+    assert option == f"UserKnownHostsFile={Path.home()}/.runplz-test-known-hosts"
+
+
 def test_identities_only_accompanies_an_explicit_key():
     """Otherwise a loaded agent offers its other keys first and can trip
     the server's MaxAuthTries before ours is ever tried."""
@@ -217,9 +223,17 @@ def test_cli_without_ssh_flags_defers_to_the_manifest(tmp_path):
 
 
 def test_manifest_records_only_what_is_needed_to_reconnect():
-    opts = SshOptions(port=2200, identity_file="~/.ssh/k.pem")
+    opts = SshOptions(
+        port=2200,
+        identity_file="~/.ssh/k.pem",
+        known_hosts_file="/tmp/runplz-known-hosts",
+    )
     recorded = opts.to_dict()
-    assert recorded == {"port": 2200, "identity_file": "~/.ssh/k.pem"}
+    assert recorded == {
+        "port": 2200,
+        "identity_file": "~/.ssh/k.pem",
+        "known_hosts_file": "/tmp/runplz-known-hosts",
+    }
     assert SshOptions.from_dict(recorded) == opts
 
 

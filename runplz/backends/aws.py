@@ -15,6 +15,7 @@ ssh wait until it times out.
 """
 
 from runplz.backends.provisioning import (
+    AWS_CPU_SHAPES,
     AWS_GPUS,
     AWS_RETRY_POLICY,
     AWS_TEARDOWN_POLICY,
@@ -22,9 +23,9 @@ from runplz.backends.provisioning import (
     apply_teardown,
     gpu_count,
     make_instance_name,
-    pick_shape,
     resolve_gpu_label,
     run_cli,
+    select_machine,
 )
 from runplz.backends.ssh_common import SshOptions, run_on_provisioned_vm
 
@@ -141,31 +142,14 @@ def resolve_instance_type(cfg, function) -> str:
 
     label = resolve_gpu_label(function, AWS_GPUS)
     if label is None:
-        return f"m6i.{_cpu_size_name(function)}"
-    return pick_shape(label, gpu_count(function), AWS_GPUS, cloud="EC2")
-
-
-def _cpu_size_name(function) -> str:
-    """Round the cpu/memory request up to an m6i size.
-
-    m6i.<size> gives 4 GB of RAM per vCPU, so `min_memory` constrains the
-    size just as `min_cpu` does — the config documents both as inputs.
-    """
-    want_cpu = float(getattr(function, "min_cpu", None) or 0) or 2
-    want_mem = float(getattr(function, "min_memory", None) or 0)
-    need = max(want_cpu, want_mem / 4.0)
-    for vcpus, name in (
-        (2, "large"),
-        (4, "xlarge"),
-        (8, "2xlarge"),
-        (16, "4xlarge"),
-        (32, "8xlarge"),
-        (48, "12xlarge"),
-        (64, "16xlarge"),
-    ):
-        if vcpus >= need:
-            return name
-    return "32xlarge"
+        return select_machine(function, AWS_CPU_SHAPES, cloud="EC2").name
+    return select_machine(
+        function,
+        AWS_GPUS[label].offerings,
+        cloud="EC2",
+        gpus=gpu_count(function),
+        gpu_label=label,
+    ).name
 
 
 def instance_type_has_gpu(instance_type: str) -> bool:

@@ -690,16 +690,16 @@ Depends on the backend:
 ## Install
 
 ```bash
-pip install runplz                 # core (local + brev + ssh)
-pip install 'runplz[modal]'        # add Modal support
+pip install runplz                 # includes the Modal Python SDK
 ```
 
-The core dependency set is empty. Backends shell out to system CLIs:
+The Python package includes the Modal SDK. Backends also shell out to
+system-installed CLIs:
 
 - `local` → `docker`
 - `brev`  → `brev`, `docker` (or skipped in `mode="container"`), `ssh`, `rsync`
 - `ssh`   → `ssh`, `rsync` (docker on the remote if `use_docker=True`)
-- `modal` → `modal>=1.1,<2` Python package
+- `modal` → `modal>=1.1,<2` Python package (included automatically)
 
 ## Data in and out
 
@@ -865,6 +865,21 @@ own unprivileged `sshd` on loopback, so no Remote Login, no CI-only
 service, no configuration. Real staging, rsync, detached launch, kill and
 fetch-back. This is the tier that catches generated shell that parses but
 does not work.
+
+Set `RUNPLZ_E2E_REMOTE=docker` (or just have Docker running on a non-Linux
+host) and the same tests run against a Debian container instead, so the
+remote matches production. That matters on a Mac: macOS cannot run the
+detached launch at all (issue #92), so those tests skip against a local
+sshd there and run against a container.
+
+**Shape catalogue** (`test_cloud_catalogue.py`). `botocore` bundles the EC2
+instance-type list as a static enum, so every shape runplz can emit is
+checked against the real catalogue with no account and no network. This
+repo shipped `p3.xlarge`, which does not exist. Note that an API emulator
+would not have caught it — `moto` accepts `--instance-type not-a-real-type`
+quite happily. GCE has no offline equivalent (`gcloud emulators` covers
+only firestore and spanner), so its shapes get format and self-consistency
+checks only.
 
 Nothing in any tier can spend money: `conftest.py` intercepts
 `subprocess.run` and refuses `brev` / `gcloud` / `aws` / `ssh` / `rsync`

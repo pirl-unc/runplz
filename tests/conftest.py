@@ -179,3 +179,41 @@ def fast_clock(monkeypatch):
         mod = __import__(mod_path, fromlist=["time"])
         monkeypatch.setattr(mod, "time", clock, raising=False)
     return clock
+
+
+@pytest.fixture(scope="session")
+def sshd_server(tmp_path_factory):
+    """Shared, isolated SSH endpoint for local and cloud-handoff e2e tests.
+
+    Auto mode may skip when this machine genuinely has no usable endpoint.
+    An explicitly requested backend is a test contract and therefore fails
+    loudly if it cannot start; CI cannot go green after silently testing zero
+    SSH behavior.
+    """
+    from sshd_harness import select_backend
+
+    mode = os.environ.get("RUNPLZ_E2E_REMOTE", "auto").lower()
+    root = tmp_path_factory.mktemp("sshd")
+    try:
+        server, unavailable = select_backend(root)
+    except Exception as exc:
+        message = f"could not initialize SSH test backend: {exc}"
+        if mode == "auto":
+            pytest.skip(message)
+        pytest.fail(message)
+    if server is None:
+        if mode == "auto":
+            pytest.skip(unavailable)
+        pytest.fail(unavailable)
+    try:
+        server.start()
+    except Exception as exc:
+        server.stop()
+        message = f"could not start {type(server).__name__}: {exc}"
+        if mode == "auto":
+            pytest.skip(message)
+        pytest.fail(message)
+    try:
+        yield server
+    finally:
+        server.stop()

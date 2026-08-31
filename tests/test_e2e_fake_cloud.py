@@ -11,6 +11,7 @@ The billing guard permits this because the stubs resolve inside the
 `sandbox_bin` fixture's directory -- a real `gcloud` on PATH stays blocked.
 """
 
+import subprocess
 from pathlib import Path
 
 import fake_cloud
@@ -18,6 +19,7 @@ import pytest
 
 from runplz import App, AwsConfig, GcpConfig, Image
 from runplz.backends import aws, gcp
+from runplz.backends import ssh_common as sc
 
 
 def _app(tmp_path, **cfg):
@@ -177,7 +179,9 @@ def test_aws_reads_the_instance_id_out_of_real_cli_json(tmp_path, sandbox_bin):
     )
     _run_until_dispatch_fails(aws, app, fn)
 
-    for argv in fake_cloud.calls_matching(log, "describe-instances"):
+    descriptions = fake_cloud.calls_matching(log, "describe-instances")
+    assert descriptions, fake_cloud.calls(log)
+    for argv in descriptions:
         assert "i-fake0123456789" in argv
 
 
@@ -200,3 +204,151 @@ def test_stub_is_the_binary_that_actually_ran(sandbox_bin):
     fake_cloud.install(sandbox_bin, name="gcloud")
     resolved = Path(shutil.which("gcloud")).resolve()
     assert resolved.parent == sandbox_bin, resolved
+
+
+def test_stub_rejects_unknown_and_missing_cli_arguments(sandbox_bin):
+    """The fake must fail on malformed commands, like the vendor CLI does."""
+    fake_cloud.install(sandbox_bin, name="gcloud")
+
+    unknown = subprocess.run(
+        ["gcloud", "compute", "instances", "create", "--not-a-real-flag=x"],
+        capture_output=True,
+        text=True,
+    )
+    assert unknown.returncode != 0
+    assert "unknown option" in unknown.stderr
+
+    missing_name = subprocess.run(
+        [
+            "gcloud",
+            "compute",
+            "instances",
+            "create",
+            "--project=p",
+            "--zone=z",
+            "--machine-type=n2-standard-2",
+            "--image-family=ubuntu",
+            "--image-project=p",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert missing_name.returncode != 0
+    assert "requires an instance name" in missing_name.stderr
+
+    duplicate = subprocess.run(
+        [
+            "gcloud",
+            "compute",
+            "instances",
+            "create",
+            "fake",
+            "--project=p",
+            "--project=q",
+            "--zone=z",
+            "--machine-type=n2-standard-2",
+            "--image-family=ubuntu",
+            "--image-project=p",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert duplicate.returncode != 0
+    assert "duplicate option" in duplicate.stderr
+
+
+@pytest.mark.live_ssh
+def test_fake_aws_control_plane_hands_off_to_live_ssh(
+    tmp_path, sandbox_bin, sshd_server, monkeypatch
+):
+    """Provisioning output, SSH options, and a real endpoint must agree."""
+    log = fake_cloud.install(sandbox_bin, name="aws")
+    server = sshd_server
+    user = (
+        server.target.split("@", 1)[0] if "@" in server.target else __import__("getpass").getuser()
+    )
+    app, fn = _app(
+        tmp_path,
+        aws_config=AwsConfig(
+            region="us-east-1",
+            key_name="k",
+            ssh_user=user,
+            ssh_ready_wait_seconds=30,
+        ),
+    )
+
+    original_lifecycle = aws.run_on_provisioned_vm
+
+    def run_with_harness_options(**kwargs):
+        kwargs["ssh_opts"] = server.ssh_options()
+        return original_lifecycle(**kwargs)
+
+    monkeypatch.setattr(aws, "run_on_provisioned_vm", run_with_harness_options)
+    handed_off = []
+
+    def real_ssh_dispatch(**kwargs):
+        handed_off.append(kwargs)
+        assert "HANDOFF_OK" in sc.ssh_capture(
+            kwargs["target"], "echo HANDOFF_OK", ssh_opts=kwargs["ssh_opts"]
+        )
+
+    monkeypatch.setattr(sc, "dispatch_to_target", real_ssh_dispatch)
+    aws.run(app, fn, [], {})
+
+    assert len(handed_off) == 1
+    assert handed_off[0]["target"].endswith("127.0.0.1")
+    assert fake_cloud.calls_matching(log, "run-instances")
+    assert fake_cloud.calls_matching(log, "terminate-instances")
+
+
+@pytest.mark.live_ssh
+def test_fake_gcp_control_plane_hands_off_to_live_ssh(
+    tmp_path, sandbox_bin, sshd_server, monkeypatch
+):
+    """The gcloud config-ssh alias must resolve to the same live endpoint."""
+    log = fake_cloud.install(sandbox_bin, name="gcloud")
+    server = sshd_server
+    user = (
+        server.target.split("@", 1)[0] if "@" in server.target else __import__("getpass").getuser()
+    )
+    home = tmp_path / "home"
+    config_path = home / ".ssh" / "config"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("RUNPLZ_FAKE_SSH_CONFIG", str(config_path))
+    monkeypatch.setenv(
+        "RUNPLZ_FAKE_SSH_HOST", server.host if hasattr(server, "host") else "127.0.0.1"
+    )
+    monkeypatch.setenv("RUNPLZ_FAKE_SSH_USER", user)
+    monkeypatch.setenv("RUNPLZ_FAKE_SSH_PORT", str(server.port))
+    monkeypatch.setenv("RUNPLZ_FAKE_SSH_IDENTITY", str(server.identity))
+    # OpenSSH resolves the user's config from the account database rather than
+    # trusting HOME, so point the production option list explicitly at the
+    # throwaway config that the fake `config-ssh` command writes.
+    monkeypatch.setattr(sc, "SSH_OPTS", ("-F", str(config_path)))
+    app, fn = _app(
+        tmp_path,
+        gcp_config=GcpConfig(project="p", zone="z", ssh_ready_wait_seconds=30),
+    )
+
+    original_lifecycle = gcp.run_on_provisioned_vm
+
+    def run_with_harness_options(**kwargs):
+        kwargs["ssh_opts"] = server.ssh_options()
+        return original_lifecycle(**kwargs)
+
+    monkeypatch.setattr(gcp, "run_on_provisioned_vm", run_with_harness_options)
+    handed_off = []
+
+    def real_ssh_dispatch(**kwargs):
+        handed_off.append(kwargs)
+        assert "HANDOFF_OK" in sc.ssh_capture(
+            kwargs["target"], "echo HANDOFF_OK", ssh_opts=kwargs["ssh_opts"]
+        )
+
+    monkeypatch.setattr(sc, "dispatch_to_target", real_ssh_dispatch)
+    gcp.run(app, fn, [], {})
+
+    assert len(handed_off) == 1
+    assert config_path.exists()
+    assert fake_cloud.calls_matching(log, "create")
+    assert fake_cloud.calls_matching(log, "delete")

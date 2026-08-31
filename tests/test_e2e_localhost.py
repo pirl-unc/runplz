@@ -22,36 +22,25 @@ import uuid
 from pathlib import Path
 
 import pytest
-from sshd_harness import LocalSshd, find_sshd
 
 from runplz.backends import ssh_common as sc
 
 pytestmark = pytest.mark.live_ssh
 
 
-@pytest.fixture(scope="module")
-def sshd(tmp_path_factory):
-    """A private sshd for this module. Skips if the machine has no sshd."""
-    if find_sshd() is None:
-        pytest.skip("no sshd binary on this machine")
-    root = tmp_path_factory.mktemp("sshd")
-    server = LocalSshd(root)
-    try:
-        server.start()
-    except Exception as exc:  # pragma: no cover - environment-dependent
-        pytest.skip(f"could not start a local sshd: {exc}")
-    yield server
-    server.stop()
+@pytest.fixture
+def target(sshd_server):
+    """Address the box exactly as the code under test will.
+
+    Includes the user when the backend needs one — the container's only
+    account is root, and `SshOptions` has no user field.
+    """
+    return sshd_server.target
 
 
 @pytest.fixture
-def target(sshd):
-    return "127.0.0.1"
-
-
-@pytest.fixture
-def opts(sshd):
-    return sc.SshOptions(port=sshd.port, identity_file=str(sshd.identity))
+def opts(sshd_server):
+    return sshd_server.ssh_options()
 
 
 @pytest.fixture
@@ -61,9 +50,12 @@ def remote_is_linux(target, opts):
     macOS `nohup` refuses to detach in a non-interactive ssh session
     ("can't detach from console: Inappropriate ioctl for device"), and
     macOS has no `setsid`, so detached launch does not work there at all --
-    issue #92. Every documented remote is Linux, and CI is Linux, so the
-    detached tests run where it matters and skip on a Mac dev box rather
-    than reporting a runplz bug that only exists on the harness's platform.
+    issue #92. Every documented remote is Linux, so the detached tests run
+    where it matters and skip rather than reporting a runplz bug that only
+    exists on the harness's platform.
+
+    Start Docker and this stops skipping anywhere: the container backend
+    makes the remote Linux regardless of the host.
     """
     return "Linux" in sc.ssh_capture(target, "uname -s", ssh_opts=opts)
 
@@ -221,7 +213,7 @@ def test_rsync_down_brings_outputs_back(tmp_path, target, opts, remote_run):
 
 def test_preconditions_probe_parses_a_real_machine(target, opts):
     """`parse_probe_sections` against real uname/df output, not a fixture."""
-    sc.check_preconditions(target, {}, ssh_opts=opts)  # no requirements: must not raise
+    sc.check_preconditions(target, {"disk_free_gb": 0.001}, ssh_opts=opts)
 
 
 def test_wait_until_ssh_reachable_succeeds_against_a_live_host(target, opts):

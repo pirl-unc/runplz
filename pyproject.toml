@@ -27,16 +27,26 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 requires-python = ">=3.10"
-# runplz core depends only on the stdlib. Backends use subprocess to shell out
-# to `docker`, `ssh`, `rsync`, `brev` (CLI tools). Modal is an optional extra.
-dependencies = []
+# The command-line backends shell out to locally-installed `docker`, `ssh`,
+# `rsync`, and `brev` tools. Modal is imported by the bundled backend, so its
+# Python SDK is an ordinary runtime dependency rather than an optional extra.
+dependencies = ["modal>=1.1,<2"]
 
 [project.optional-dependencies]
-modal = ["modal>=1.1,<2"]
 dev = [
     "pytest",
     "pytest-cov",
     "ruff",
+    # Test-only. botocore bundles the authoritative EC2 instance-type
+    # catalogue offline, so tests/test_cloud_catalogue.py can prove every
+    # shape runplz emits is a real instance type without an AWS account.
+    # Runtime dependencies are declared above; botocore remains test-only.
+    "botocore",
+    # Test-only. Backs the optional container variant of the ssh end-to-end
+    # tier, which gives a Linux remote on a macOS dev box so the detached
+    # tests run there instead of skipping. Falls back to a local sshd when
+    # Docker is not available.
+    "testcontainers",
 ]
 
 [project.scripts]
@@ -55,6 +65,15 @@ version = {attr = "runplz.version.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+# Current branch coverage is 93.85%; keep the gate just below the measured
+# value and ratchet it upward as the remaining environment-dependent branches
+# gain focused tests.
+fail_under = 93.8
 
 [tool.ruff]
 line-length = 100

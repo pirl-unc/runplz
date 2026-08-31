@@ -203,7 +203,7 @@ def test_aws_instance_type_derived_from_gpu(tmp_path, spec, expect):
 def test_aws_rejects_an_impossible_gpu_count_before_ec2_does(tmp_path):
     app = _app(tmp_path, aws_config=_aws())
     fn = _function(app, gpu="H100", min_gpus=2)
-    with pytest.raises(provisioning.CloudCliError, match=r"sells H100 in \[8\] GPU counts"):
+    with pytest.raises(provisioning.CloudCliError, match=r"sells H100 in \[1, 8\] GPU counts"):
         aws.resolve_instance_type(app.aws_config, fn)
 
 
@@ -573,7 +573,7 @@ def test_gcp_refuses_a_gpu_count_the_family_does_not_sell(tmp_path, gpu, count):
     app = _app(tmp_path, gcp_config=_gcp())
     fn = _function(app, gpu=gpu, min_gpus=count)
     entry = provisioning.GCP_GPUS[gpu]
-    if entry.shapes is None or count in entry.shapes:
+    if count in entry.gpu_counts:
         pytest.skip("this count is sold")
     with pytest.raises(provisioning.CloudCliError, match="GPU counts"):
         gcp.resolve_shape(app.gcp_config, fn)
@@ -583,7 +583,7 @@ def test_gcp_refuses_a_gpu_count_the_family_does_not_sell(tmp_path, gpu, count):
 def test_aws_refuses_a_gpu_count_the_family_does_not_sell(tmp_path, gpu, count):
     app = _app(tmp_path, aws_config=_aws())
     fn = _function(app, gpu=gpu, min_gpus=count)
-    if count in provisioning.AWS_GPUS[gpu].shapes:
+    if count in provisioning.AWS_GPUS[gpu].gpu_counts:
         pytest.skip("this count is sold")
     with pytest.raises(provisioning.CloudCliError, match="GPU counts"):
         aws.resolve_instance_type(app.aws_config, fn)
