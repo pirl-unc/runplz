@@ -18,7 +18,9 @@ their patch overrides ours.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -50,11 +52,31 @@ def _first_token(cmd) -> str:
     return ""
 
 
+# Directories holding stub executables a test installed itself. A billed
+# name resolving inside one of these is not the real CLI and cannot spend
+# money, so it is allowed through without a live marker. Registered by the
+# `sandbox_bin` fixture; the guard resolves the program on PATH and compares,
+# so the real `gcloud` stays blocked even while a fake one is installed.
+_SANDBOX_BINS: set = set()
+
+
+def _resolves_into_sandbox(prog: str) -> bool:
+    if not _SANDBOX_BINS:
+        return False
+    found = shutil.which(prog)
+    if not found:
+        return False
+    found = Path(found).resolve()
+    return any(sandbox in found.parents for sandbox in _SANDBOX_BINS)
+
+
 def _make_guarded_run(request):
     def guarded(cmd, *args, **kwargs):
         prog = _first_token(cmd)
         required = _BILLED_COMMANDS.get(prog)
         if required and not request.node.get_closest_marker(required):
+            if _resolves_into_sandbox(prog):
+                return subprocess.run(cmd, *args, **kwargs)
             raise RuntimeError(
                 f"test {request.node.nodeid} tried to run `{prog}` for "
                 f"real — mock it, or mark the test `@pytest.mark.{required}` "
@@ -63,6 +85,25 @@ def _make_guarded_run(request):
         return subprocess.run(cmd, *args, **kwargs)
 
     return guarded
+
+
+@pytest.fixture
+def sandbox_bin(tmp_path, monkeypatch):
+    """A PATH directory for stub executables, exempted from the billing guard.
+
+    Lets a test install a fake `gcloud`/`aws` and run the real provisioning
+    code against it. The exemption is by resolved path, not by name, so a
+    test that forgets to install its stub still hits the real guard rather
+    than silently reaching the actual CLI.
+    """
+    bin_dir = (tmp_path / "sandbox-bin").resolve()
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    _SANDBOX_BINS.add(bin_dir)
+    try:
+        yield bin_dir
+    finally:
+        _SANDBOX_BINS.discard(bin_dir)
 
 
 class _GuardedSubprocessModule:
@@ -120,3 +161,21 @@ def _isolate_brev_onboarding(monkeypatch, tmp_path):
         return
     if hasattr(brev, "_BREV_ONBOARDING"):
         monkeypatch.setattr(brev, "_BREV_ONBOARDING", tmp_path / ".brev-onboarding.json")
+
+
+@pytest.fixture
+def fast_clock(monkeypatch):
+    """Make every backoff and poll interval instantaneous.
+
+    `wait_until_ssh_reachable` polls every 15s and the retry loops back off,
+    so a test that drives real provisioning code spends its whole runtime
+    asleep. Patches the `time` reference inside each module that sleeps, not
+    the global one.
+    """
+    from clock import FakeClock
+
+    clock = FakeClock()
+    for mod_path in ("runplz.backends.ssh_common", "runplz.backends.provisioning"):
+        mod = __import__(mod_path, fromlist=["time"])
+        monkeypatch.setattr(mod, "time", clock, raising=False)
+    return clock

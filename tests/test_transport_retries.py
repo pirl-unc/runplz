@@ -14,6 +14,7 @@ import subprocess
 from unittest import mock
 
 import pytest
+from clock import FakeClock as _FakeClock
 
 from runplz.backends import ssh_common as sc
 
@@ -38,37 +39,6 @@ def _remote_failure(code=1):
 # wall-clock loop reached during the test into a busy-loop.
 def _nap(_s):
     return None
-
-
-class _FakeClock:
-    """Stands in for the `time` module inside ssh_common only.
-
-    Patching `sc.time.sleep` set the attribute on the *global* time module —
-    `ssh_common.time is time` — so every wall-clock loop reached during a
-    test became a busy-loop. Replacing ssh_common's reference instead keeps
-    the patch where it was advertised, and lets a test advance the clock.
-    """
-
-    def __init__(self):
-        self.now = 0.0
-        self.slept = []
-
-    def sleep(self, seconds):
-        self.slept.append(seconds)
-        self.now += seconds
-
-    def monotonic(self):
-        return self.now
-
-    def strftime(self, *a, **kw):
-        import time as _time
-
-        return _time.strftime(*a, **kw)
-
-    def gmtime(self, *a, **kw):
-        import time as _time
-
-        return _time.gmtime(*a, **kw)
 
 
 @pytest.fixture

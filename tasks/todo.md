@@ -1242,3 +1242,55 @@ The shadowing test originally used `types`, which is already in
 of path order and passed under the `insert(0)` mutation. Rewritten to use
 `colorsys`, which is not preloaded, with an in-test assertion that it is not
 preloaded so the test cannot silently rot back into vacuity.
+
+---
+
+## Two new test tiers (3.23.0)
+
+The suite was 11.6k lines of test against 9.4k of source, 427 `mock.patch`
+sites, 138 patched `subprocess` calls — and 4 places that executed anything
+real. It verified that runplz *builds* the strings its author expected, so
+it could only ever be as correct as the author's model of the remote. Every
+expensive bug this session lived in that gap.
+
+- [x] **Cloud lifecycle against stub CLIs** (`test_e2e_fake_cloud.py`).
+      Stub `gcloud`/`aws` executables (`fake_cloud.py`) on `PATH`: real
+      subprocess, real argv, real JSON, real exit codes, scripted transient
+      failures so the retry loop is *exercised* rather than described.
+      11 tests covering create argv, all three `on_finish` modes,
+      teardown-after-dispatch-failure, retry vs non-retry classification,
+      and instance-id round-tripping.
+- [x] **End-to-end over real ssh** (`test_e2e_localhost.py`). The tier
+      starts its own unprivileged `sshd` on loopback (`sshd_harness.py`),
+      so it needs no Remote Login, no CI-only service and no config —
+      it runs everywhere and is not skipped by default.
+- [x] The billing guard got *stronger*, not weaker: a billed name is
+      allowed only when it resolves inside a directory the test created
+      (`sandbox_bin`). A real `gcloud` stays blocked while a stub is
+      installed, and a test that forgets to install its stub still trips it.
+- [x] `FakeClock` lifted out of `test_transport_retries.py` into
+      `tests/clock.py`; the new `fast_clock` fixture patches the `time`
+      reference in both sleeping modules. Cloud tier: 128s -> 4s.
+
+### It found a real bug immediately
+
+`nohup` on macOS cannot detach in a non-interactive ssh session
+("can't detach from console: Inappropriate ioctl for device"), and macOS
+has no `setsid`, so **detached launch does not work against a macOS
+remote** — filed as #92. Linux remotes, which is every documented target
+and CI, are unaffected. The two detached tests skip when the remote reports
+Darwin, linking the issue, so they exercise production behavior in CI
+rather than reporting a platform artifact as a runplz failure.
+
+### Verification
+
+Both tiers mutation-tested rather than assumed:
+
+- dropping `.env` from the secret-exclude list fails the rsync test — that
+  exclude list is a security control and was previously only ever checked
+  by asserting on rsync's argv, which cannot tell you whether rsync obeyed
+- breaking `rsync_down` fails the outputs test
+- a test asserting the harness is a live connection guards the fixture, so
+  a broken sshd cannot produce a green run
+
+882 passed, 3 skipped, 32s.
