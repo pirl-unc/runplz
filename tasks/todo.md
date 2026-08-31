@@ -1195,3 +1195,50 @@ currently surfaces only after a box has been provisioned — or not at all.
 Left alone: the CLI shows a 23-line traceback for these, because they are
 raised while executing the user's script. Suppressing that would hide
 genuine user-code errors, and the user's own line is already in the trace.
+
+---
+
+## Job script import semantics (3.22.0)
+
+Closes #89.
+
+**The issue's premise was wrong and I corrected it publicly first.** I had
+filed it as "`python jobs/train.py` works, dispatch doesn't". Measured, the
+two are exact opposites:
+
+|  | `sys.path[0]` | sibling import | repo-root import |
+|---|---|---|---|
+| `python jobs/train.py` | script's directory | works | **fails** |
+| runplz bootstrap | `''` (CWD = repo root) | **fails** | works |
+
+My original check put the imports inside the function body, so running the
+script never executed them — "no output" meant "never ran".
+
+That inverted the fix. The issue's own suggested option 1 (insert the script
+dir at `sys.path[0]`, matching Python) would have **broken every job that
+imports from the repo root today** — the working, staged-by-design behavior.
+
+- [x] **Append**, don't insert. A strict superset: nothing that resolves
+      today changes, siblings newly resolve, and landing after the stdlib
+      means `jobs/types.py` cannot shadow `types` for the run. Plain Python
+      would let it. Cost: a sibling named after a stdlib module stays
+      unimportable — a deliberate trade.
+- [x] `bootstrap`'s contract docstring rewritten; it documented the old
+      behavior
+- [x] README gains an "Imports" section stating the order and both
+      consequences
+- [x] version bump, PR, deploy
+
+### Verification
+
+Mutation-tested twice, and the second mutation exposed a weak test of mine:
+
+- removing the fix fails the sibling test
+- switching `append` -> `insert(0)` (plain-Python order) fails the ordering
+  test **and** the shadowing test
+
+The shadowing test originally used `types`, which is already in
+`sys.modules` when the job body runs — so it resolved from cache regardless
+of path order and passed under the `insert(0)` mutation. Rewritten to use
+`colorsys`, which is not preloaded, with an in-test assertion that it is not
+preloaded so the test cannot silently rot back into vacuity.
