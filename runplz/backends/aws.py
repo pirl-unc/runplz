@@ -28,7 +28,17 @@ from runplz.backends.provisioning import (
 )
 from runplz.backends.ssh_common import SshOptions, run_on_provisioned_vm
 
-__all__ = ["run"]
+# `run` and `list_jobs` are the driver contract the registry calls; the
+# rest is this driver's own testable surface.
+__all__ = [
+    "run",
+    "resolve_instance_type",
+    "instance_type_has_gpu",
+    "resolve_ami",
+    "build_run_instances_command",
+    "apply_on_finish",
+    "DEFAULT_ROOT_DEVICE",
+]
 
 # Deep Learning AMI ids are region-specific and roll monthly, so resolve the
 # current one from SSM instead of hardcoding something that rots.

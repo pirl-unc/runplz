@@ -80,7 +80,7 @@ def _probe_stdout(*, shm_bytes=None, home_bytes=None, gpus=None, vram_mib=None):
 def test_check_preconditions_no_op_when_empty():
     # Empty dict must not even ssh.
     with mock.patch("runplz.backends.ssh_common.ssh_capture") as ssh_mock:
-        ssh_common._check_preconditions("box", {})
+        ssh_common.check_preconditions("box", {})
     ssh_mock.assert_not_called()
 
 
@@ -90,7 +90,7 @@ def test_check_preconditions_passes_when_observed_meets_minimum(capsys):
         shm_bytes=4 * 1024**3, home_bytes=100 * 1024**3, gpus=8, vram_mib=80 * 1024
     )
     with mock.patch("runplz.backends.ssh_common.ssh_capture", return_value=stdout):
-        ssh_common._check_preconditions(
+        ssh_common.check_preconditions(
             "box",
             {"shm_gb": 4.0, "disk_free_gb": 50.0, "gpu_count": 8, "gpu_memory_gb": 40},
         )
@@ -101,7 +101,7 @@ def test_check_preconditions_warns_when_below_min_but_above_half(capsys):
     # 3 GiB shm vs declared 4 GB → below min, but above 50% → warn only.
     stdout = _probe_stdout(shm_bytes=3 * 1024**3, home_bytes=100 * 1024**3)
     with mock.patch("runplz.backends.ssh_common.ssh_capture", return_value=stdout):
-        ssh_common._check_preconditions("box", {"shm_gb": 4.0})
+        ssh_common.check_preconditions("box", {"shm_gb": 4.0})
     out = capsys.readouterr().out
     assert "precondition warning" in out
     assert "shm_gb" in out
@@ -112,14 +112,14 @@ def test_check_preconditions_fails_when_below_half(capsys):
     stdout = _probe_stdout(shm_bytes=1 * 1024**3, home_bytes=100 * 1024**3)
     with mock.patch("runplz.backends.ssh_common.ssh_capture", return_value=stdout):
         with pytest.raises(ssh_common.PreconditionFailed, match="shm_gb"):
-            ssh_common._check_preconditions("box", {"shm_gb": 4.0})
+            ssh_common.check_preconditions("box", {"shm_gb": 4.0})
 
 
 def test_check_preconditions_warns_when_observed_unparseable(capsys):
     # Probe section empty (e.g. /dev/shm not mounted) → warn, don't fail.
     stdout = _probe_stdout(shm_bytes=None, home_bytes=100 * 1024**3)
     with mock.patch("runplz.backends.ssh_common.ssh_capture", return_value=stdout):
-        ssh_common._check_preconditions("box", {"shm_gb": 4.0})
+        ssh_common.check_preconditions("box", {"shm_gb": 4.0})
     assert "could not probe shm_gb" in capsys.readouterr().out
 
 
@@ -127,7 +127,7 @@ def test_check_preconditions_gpu_count_below_half_fails():
     stdout = _probe_stdout(gpus=1)  # vs 4 declared → below 50% → fail
     with mock.patch("runplz.backends.ssh_common.ssh_capture", return_value=stdout):
         with pytest.raises(ssh_common.PreconditionFailed, match="gpu_count"):
-            ssh_common._check_preconditions("box", {"gpu_count": 4})
+            ssh_common.check_preconditions("box", {"gpu_count": 4})
 
 
 def test_check_preconditions_gpu_memory_translates_mib_to_gb(capsys):
@@ -135,14 +135,14 @@ def test_check_preconditions_gpu_memory_translates_mib_to_gb(capsys):
     stdout = _probe_stdout(vram_mib=24 * 1024)
     with mock.patch("runplz.backends.ssh_common.ssh_capture", return_value=stdout):
         with pytest.raises(ssh_common.PreconditionFailed, match="gpu_memory_gb"):
-            ssh_common._check_preconditions("box", {"gpu_memory_gb": 80})
+            ssh_common.check_preconditions("box", {"gpu_memory_gb": 80})
 
 
 def test_check_preconditions_aggregates_multiple_failures():
     stdout = _probe_stdout(shm_bytes=512 * 1024**2, home_bytes=1 * 1024**3, gpus=0)
     with mock.patch("runplz.backends.ssh_common.ssh_capture", return_value=stdout):
         with pytest.raises(ssh_common.PreconditionFailed) as ei:
-            ssh_common._check_preconditions(
+            ssh_common.check_preconditions(
                 "box",
                 {"shm_gb": 4.0, "disk_free_gb": 50.0, "gpu_count": 8},
             )

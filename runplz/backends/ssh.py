@@ -28,7 +28,12 @@ from runplz.backends.ssh_common import (
     wait_until_ssh_reachable,
 )
 
-__all__ = ["run", "list_jobs"]
+# `run` and `list_jobs` are the driver contract the registry calls; the
+# rest is this driver's own testable surface.
+__all__ = [
+    "run",
+    "list_jobs",
+]
 
 
 def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
@@ -65,7 +70,7 @@ def list_jobs(
     """Return runplz jobs currently running on the SSH target ``host``.
 
     SSH has no registry of hosts, so the caller must supply one. Filters on
-    the ``runplz=1`` label — the same label stamped by :func:`_run_container_detached`.
+    the ``runplz=1`` label — the same label stamped by :func:`run_container_detached`.
     """
     target, resolved_port = _build_ssh_target(host, user=user, port=port)
     ssh_opts = SshOptions(port=resolved_port, identity_file=ssh_key_path)

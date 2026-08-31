@@ -18,6 +18,9 @@ Modal's `add_local_dir(ignore=[...])` contract). Directory patterns
 without trailing slashes still match the directory itself.
 """
 
+__all__ = ["DEFAULT_TRANSFER_EXCLUDES"]
+
+
 DEFAULT_TRANSFER_EXCLUDES = (
     # dotenv + its common prod/dev variants. `.env.example` is left in.
     ".env",

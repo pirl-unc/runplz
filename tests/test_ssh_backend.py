@@ -18,7 +18,7 @@ from runplz.backends.ssh_common import SshOptions
 
 def _app(tmp_path, cfg=None):
     app = App("demo", ssh_config=cfg or SshConfig(on_finish="leave"))
-    app._repo_root = tmp_path
+    app.repo_root = tmp_path
     return app
 
 
@@ -255,17 +255,17 @@ def test_ssh_run_end_to_end_passes_port_through_to_helpers(tmp_path):
         ),
         mock.patch.multiple(
             "runplz.backends.ssh_common",
-            _prepare_remote_run=mock.DEFAULT,
-            _ensure_remote_rsync=mock.DEFAULT,
+            prepare_remote_run=mock.DEFAULT,
+            ensure_remote_rsync=mock.DEFAULT,
             rsync_up=fake_rsync_up,
-            _ensure_docker=mock.DEFAULT,
-            _remote_has_nvidia=mock.Mock(return_value=False),
-            _build_image=fake_build,
-            _run_container_detached=mock.DEFAULT,
-            _stream_and_wait=fake_stream,
+            ensure_docker=mock.DEFAULT,
+            remote_has_nvidia=mock.Mock(return_value=False),
+            build_image=fake_build,
+            run_container_detached=mock.DEFAULT,
+            stream_and_wait=fake_stream,
             ssh_capture=mock.DEFAULT,
             rsync_down=mock.DEFAULT,
-            _fetch_failure_tail=mock.DEFAULT,
+            fetch_failure_tail=mock.DEFAULT,
         ),
     ):
         ssh.run(app, fn, [], {}, host="gpu.example.com")
@@ -430,14 +430,14 @@ def test_ssh_run_vm_docker_happy_path(tmp_path):
         ),
         mock.patch.multiple(
             "runplz.backends.ssh_common",
-            _prepare_remote_run=mock.DEFAULT,
-            _ensure_remote_rsync=mock.DEFAULT,
+            prepare_remote_run=mock.DEFAULT,
+            ensure_remote_rsync=mock.DEFAULT,
             rsync_up=mock.DEFAULT,
-            _ensure_docker=mock.DEFAULT,
-            _remote_has_nvidia=mock.Mock(return_value=True),
-            _build_image=mock.DEFAULT,
-            _run_container_detached=mock.DEFAULT,
-            _stream_and_wait=mock.Mock(return_value=0),
+            ensure_docker=mock.DEFAULT,
+            remote_has_nvidia=mock.Mock(return_value=True),
+            build_image=mock.DEFAULT,
+            run_container_detached=mock.DEFAULT,
+            stream_and_wait=mock.Mock(return_value=0),
             ssh_capture=mock.DEFAULT,
             rsync_down=mock.DEFAULT,
         ),
@@ -458,11 +458,11 @@ def test_ssh_run_native_happy_path(tmp_path):
         ),
         mock.patch.multiple(
             "runplz.backends.ssh_common",
-            _prepare_remote_run=mock.DEFAULT,
-            _ensure_remote_rsync=mock.DEFAULT,
+            prepare_remote_run=mock.DEFAULT,
+            ensure_remote_rsync=mock.DEFAULT,
             rsync_up=mock.DEFAULT,
-            _remote_has_nvidia=mock.Mock(return_value=False),
-            _run_native=mock.Mock(return_value=0),
+            remote_has_nvidia=mock.Mock(return_value=False),
+            run_native=mock.Mock(return_value=0),
             rsync_down=mock.DEFAULT,
         ),
     ):
@@ -484,17 +484,17 @@ def test_ssh_run_nonzero_exit_raises_with_tail(tmp_path):
         ),
         mock.patch.multiple(
             "runplz.backends.ssh_common",
-            _prepare_remote_run=mock.DEFAULT,
-            _ensure_remote_rsync=mock.DEFAULT,
+            prepare_remote_run=mock.DEFAULT,
+            ensure_remote_rsync=mock.DEFAULT,
             rsync_up=mock.DEFAULT,
-            _ensure_docker=mock.DEFAULT,
-            _remote_has_nvidia=mock.Mock(return_value=False),
-            _build_image=mock.DEFAULT,
-            _run_container_detached=mock.DEFAULT,
-            _stream_and_wait=mock.Mock(return_value=42),
+            ensure_docker=mock.DEFAULT,
+            remote_has_nvidia=mock.Mock(return_value=False),
+            build_image=mock.DEFAULT,
+            run_container_detached=mock.DEFAULT,
+            stream_and_wait=mock.Mock(return_value=42),
             ssh_capture=mock.DEFAULT,
             rsync_down=mock.DEFAULT,
-            _fetch_failure_tail=mock.Mock(return_value="KeyError: missing-key"),
+            fetch_failure_tail=mock.Mock(return_value="KeyError: missing-key"),
         ),
     ):
         with pytest.raises(RuntimeError) as ei:

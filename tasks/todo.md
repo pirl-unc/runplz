@@ -857,3 +857,306 @@ New tests per issue, landed alongside code:
 ## Review section
 
 _Filled in after implementation._
+
+---
+
+## Public API surface: minimize private names (3.20.0)
+
+**Rule applied:** a module or name typed by anything outside its own file is
+public. Underscores are reserved for genuinely file-local helpers.
+
+**Constraint:** no compat aliases for names that get patched. `_old = new` and
+`__getattr__` module shims are read-safe but patch-unsafe — patching the alias
+sets an attribute nothing reads, so the test passes without testing. Rename
+outright, update every call site.
+
+### Phase 1 — `ssh_common.py` dispatch pipeline goes public
+The module was made public at 3.15.3 but its 11 pipeline stages stayed
+underscore-private while being imported by `brev.py`. Promote them and give the
+module an `__all__`.
+
+- [x] `_prepare_remote_run` → `prepare_remote_run`
+- [x] `_ensure_remote_rsync` → `ensure_remote_rsync`
+- [x] `_check_preconditions` → `check_preconditions`
+- [x] `_ensure_docker` → `ensure_docker`
+- [x] `_build_image` → `build_image`
+- [x] `_run_container_detached` → `run_container_detached`
+- [x] `_run_container_mode` → `run_container_mode`
+- [x] `_run_native` → `run_native`
+- [x] `_stream_and_wait` → `stream_and_wait`
+- [x] `_fetch_failure_tail` → `fetch_failure_tail`
+- [x] `_remote_has_nvidia` → `remote_has_nvidia`
+- [x] update `brev.py` re-export block, `ssh.py`, `local.py`, ~176 test refs
+
+### Phase 2 — private modules that are already public interfaces
+- [x] `_cli.py` → `cli.py` — named in `pyproject.toml:43` entry points
+- [x] `_bootstrap.py` → `bootstrap.py` — `python -m runplz._bootstrap` is baked
+      into generated remote shell at 3 sites; its env-var protocol is a wire
+      contract and `$RUNPLZ_OUT` is documented user API
+- [x] `_runs.py` → `runs.py` — owns the on-disk manifest format read back by
+      `ps`/`kill` across versions
+- [x] write real contract docstrings on each (this is the "clear semantics" half)
+- [x] ~~stays private: `_excludes.py`, `_logcapture.py`, `_selector.py`~~
+      **Reversed in round 2** — all three are imported across a module line
+      by a public module, so they were promoted to `excludes.py`,
+      `logcapture.py`, `selector.py`. The original call was wrong because
+      the audit behind it only detected private *names*, not private
+      *modules*.
+
+### Phase 3 — `app.py` backend-facing contract
+- [x] `_repo_root_for` → `repo_root_for`
+- [x] `App._repo_root` → `App.repo_root` (read by 4 modules)
+- [x] `App._entrypoint` → `App.entrypoint`
+- [x] `_VALID_BACKENDS` — fold into `registry.names()`, single source of truth
+
+### Verification
+- [x] `./format.sh`, `./lint.sh`, `./test.sh` all green
+- [x] assert no test patches a name that no longer exists (a rename that leaves
+      a dead patch target is the exact failure this plan is designed to avoid)
+- [x] version bump + PR + deploy
+
+**Not in this PR (as planned):** the 3 correctness-sweep findings
+(`sys.exit(main())`, bootstrap `sys.path`, env-key validation).
+
+**Superseded — read this instead.** `sys.exit(main())` *did* ship, in round 2:
+this PR newly advertised `python -m runplz.cli` in the README while that path
+silently discarded exit codes, so promoting it and leaving it broken was not a
+defensible split. Rounds 2-5 added further behavior changes — `SSH_OPTS`
+list->tuple, `App.repo_root` validation and precedence, `App._dispatch`
+preconditions, brev's deprecating `__getattr__`, the CLI no longer overriding a
+standing `repo_root`. The "mechanical rename only" framing stopped being
+accurate after round 2; this is a rename **plus** the API hardening the rename
+exposed. Still deferred: the bootstrap `sys.path` divergence and env-key
+validation.
+
+### Review
+
+**Result: zero cross-module private references remain.** Before this change
+`brev.py` imported 11 underscore names from `ssh_common`, and `cli.py`
+reached into `app.py` for four more. An AST sweep now finds none.
+
+- 11 dispatch stages promoted to public and declared in `__all__`
+- `_cli` → `cli`, `_runs` → `runs`, `_bootstrap` → `bootstrap`
+- `_VALID_BACKENDS` and `_PS_BACKENDS` deleted — they were pure aliases of
+  `registry.names()` / `ps_names()`, so the CLI now reads the registry
+  directly and there is nothing left to drift
+- `App._repo_root`/`._entrypoint` → `App.repo_root`/`.entrypoint`;
+  `_repo_root_for` → `repo_root_for`
+- `__all__` added to `runs`, `cli`, `app`, `config`, `image`; ssh_common's
+  expanded from 56 to 87 entries (31 public names were undeclared)
+- README gained a "Public API" section; AGENTS.md scope list updated
+
+**Underscores that stayed, and why.** `_excludes`, `_logcapture`,
+`_selector` are genuinely file-local (**superseded — see round 2, all three
+were promoted**). `_bootstrap`, `_cli`, `_ssh_common`
+are compat entry points, documented as such in their own docstrings.
+
+**The one thing that changed the plan.** `_bootstrap` looked like the
+clearest rename candidate — until it turned out runplz does not ship
+itself to the remote, so the container's runplz version is independent of
+the orchestrator's. The invoked module path is therefore a cross-version
+wire format: emitting `runplz.bootstrap` would break a new orchestrator
+against a container pinned to an older runplz. The implementation moved to
+the public `bootstrap.py`, but backends still emit the legacy path, and
+`test_emitted_bootstrap_path_is_the_legacy_one` fails if someone
+"finishes" the rename without a deprecation window.
+
+**Policy reversal, recorded deliberately.** `test_dispatch_internals_stay_private`
+asserted the opposite of this change — that the pipeline stages must stay
+out of `__all__`. It was replaced by `test_dispatch_pipeline_is_public`,
+which states the reasoning: a seam that another module imports and five
+test modules patch is an interface.
+
+**Verification.** format/lint/test green, 742 passed (up 4). Beyond the
+suite: a clean-venv install confirmed the new `runplz.cli:main` entry
+point resolves and backend choices still come from the registry; both
+`python -m runplz._bootstrap` and `python -m runplz.bootstrap` were
+executed end to end; and two mutations of renamed stages
+(`check_preconditions` no-op, `stream_and_wait` always 0) each failed the
+suite, proving the renamed seams still intercept rather than silently
+passing.
+
+### Review round 2 (code-review findings)
+
+The review caught a claim I had made and got wrong: I reported "zero
+cross-module private references" after the first pass, but my audit only
+detected private *names*, not private *modules*. In
+`from runplz._excludes import DEFAULT_TRANSFER_EXCLUDES` the name is public
+and the module is not, so five such imports were live while the check
+reported clean. `test_nothing_imports_a_private_name_or_module_across_a_module_line`
+now walks the AST and checks both halves; the corrected audit reports zero
+for real, with three underscore modules left, all documented compat shims.
+
+Fixed:
+
+- `runplz/cli.py` discarded `main()`'s return code while the shim this PR
+  added propagated it — and this PR newly advertised `python -m runplz.cli`
+  in the README. All three entry points now agree (verified: exit 1).
+- promoted `_excludes`/`_selector`/`_logcapture`; each was imported across
+  a module line by a public module
+- `provisioning.__all__` omitted five public constants, including
+  `ALREADY_EXISTS`, which `gcp.py` imports — a name the README's own rule
+  called droppable in a patch release
+- the `__all__` drift guard covered only `ssh_common`; now parametrized
+  over all 13 public modules, and it immediately found three more gaps
+  (`selector.MachineChoice`, `DEFAULT_COST_TOLERANCE`,
+  `logcapture.default_log_path`). Also handles `AnnAssign`.
+- the wire-format guard omitted `modal.py`, a third emit site, and its
+  `>= 3` total was satisfiable by a docstring and a `pkill` string; now
+  asserts per-file
+- `SSH_OPTS` was a mutable list in `__all__` -> tuple
+- `dispatch_to_target` dereferenced `app.repo_root` unguarded; now raises
+  the same actionable error `local.py`/`modal.py` do
+- `bind()` silently overwrote a caller-set `repo_root`, newly invited by
+  making the attribute public; now only infers when unset
+- deleted brev's 24 dead re-exports and repointed 52 test call sites at
+  `ssh_common`. This also retired an overstated justification: the policy
+  test had cited "brev has to re-export all eleven" as evidence the stages
+  are API. brev called none of them.
+- the registry test spawned an interpreter to read one argparse message;
+  now in-process
+
+Both new guards were mutation-tested: switching modal.py to the new
+bootstrap path, and reintroducing a private-module import, each fail.
+
+### Review round 3
+
+Two findings were regressions I introduced in round 2:
+
+- `bind()`'s `elif self.repo_root is None` made repo_root **sticky across
+  binds** — `bind(repo_root=X)` then `bind("local")` kept X. Verified by
+  running it. `repo_root` is now a property: assignment coerces to an
+  absolute Path and records caller intent; a `bind(repo_root=...)` argument
+  is per-call and sets the value directly, so it no longer leaks. Four
+  behaviors pinned by tests.
+- The `repo is None` guard I added to `dispatch_to_target` fires **after**
+  provisioning — gcp/aws/brev would create a box and wait out the ssh
+  timeout first. Moved to `App._dispatch`, above every backend, after
+  `registry.load()` so "unknown backend" stays the more specific error.
+
+Also fixed:
+
+- both legacy shims bound `main` by value, so patching `runplz.cli.main`
+  did not reach `runplz._cli.main` — the exact aliasing trap this PR's own
+  policy warns about. Both now forward via module `__getattr__`, matching
+  `backends/_ssh_common.py`, and both `raise SystemExit(main())`.
+- brev's deleted names were plain public names on a public module since
+  3.5. Deleting them outright would ImportError on a minor bump, so brev
+  now forwards them to ssh_common with a DeprecationWarning (drop in 4.0).
+  `brev.__all__` stays `["run"]`.
+- the wire-format guard's `>= 3` floor was satisfiable by a docstring and a
+  `pkill` string; it now counts `python -m runplz._bootstrap` invocations
+  exactly. Mutation-tested: removing one real emit now fails.
+- the private-reference guard skipped every relative import
+  (`from . import _x` has `module=None`); it now resolves `node.level`.
+- the backend-choices test only asserted registry ⊆ choices, losing the
+  deleted constant's two-directional guarantee; it now compares the
+  parser's actual `choices` for both `run` and `ps`.
+- README's Public API table was missing seven of the thirteen public
+  modules, so the promotions were invisible to their audience.
+  `test_readme_documents_every_public_module` pins the table to
+  `PUBLIC_MODULES` — it found three of those gaps itself.
+- orphan comment describing the deleted `_PS_BACKENDS`; SSH_OPTS tuple
+  rationale recorded at the definition.
+
+Filed rather than fixed: #87 (two `@local_entrypoint` decorators silently
+last-wins). Real, but a behavior change, and this PR is a rename.
+
+### Review round 4
+
+`repo_root` broke a third time, in a new way: `app.repo_root = X` then
+`bind(repo_root=Y)` then `bind()` yielded Y — the per-call argument both
+destroyed the standing assignment and leaked forward, violating both
+invariants the round-3 comments claimed. Each earlier fix passed its own
+single-branch test, so the model was replaced rather than patched again:
+two fields (`_repo_root` effective, `_repo_root_assigned` standing), and
+bind() recomputes from scratch in precedence order every call, so no branch
+can leave a stale value. The whole matrix is now one test.
+
+- the public setter validated nothing: `repo_root = ""` resolved to the
+  process CWD, so rsync_up would stage whatever directory the caller
+  happened to be in — a home dir, or `/` — onto a remote box. Empty,
+  whitespace, nonexistent and non-directory values now raise, matching the
+  validation `bind()` already did for `outputs_dir`.
+- `App._entrypoint` -> `App.entrypoint` had no alias, and the failure was
+  *silent*: `app._entrypoint = driver` left `entrypoint` unset, so the CLI
+  synthesized a default from the lone @app.function and dispatched a
+  different job. Deprecating property alias added — a silent wrong-job run
+  is worse than the ImportError the brev shim exists to prevent.
+- the brev forwarder had zero coverage; a typo in `_MOVED_TO_SSH_COMMON`
+  would have shipped green. Now asserted name-by-name against ssh_common,
+  including the warning and `dir()`.
+- brev's `__getattr__` had no `__dir__`, so the 24 compat names resolved
+  but were invisible to introspection.
+- the private-import guard's allowlist exempted nothing today but would
+  have exempted the three highest-risk files forever. Removed — the shims
+  alias public modules and pass on their own merits.
+- `text.count("-m", 0) and ...` in the wire guard read as two checks and
+  was one. Deleted.
+- **tasks/todo.md contradicted the diff**: a checked-off "stays private:
+  _excludes/_logcapture/_selector" survived round 2's reversal. Marked.
+- README's `runplz.app` row omitted two `__all__` names; a new test pins
+  rows against each module's exports.
+- the removal of `_excludes`/`_selector`/`_logcapture` (no shim, unlike
+  `_cli`/`_bootstrap`) is now pinned by a test so the asymmetry reads as a
+  decision: those were never an invocation path.
+
+809 passed.
+
+### Review round 5
+
+**Process failure worth recording.** Two "fixed" claims in round 4 were
+false: the dead `text.count("-m", 0)` expression was never deleted (the
+formatter had reflowed my anchor line, so `str.replace` matched nothing and
+I never re-grepped), and the todo.md scope note was edited with an anchor
+that likewise did not match. Both were then written up as done. Every fix
+this round was verified by a re-grep/execution pass afterwards, and that
+pass caught nothing outstanding.
+
+Round-5 findings, all confirmed by running them first:
+
+- **the CLI discarded a standing `app.repo_root`.** It passed
+  `repo_root=repo_root_for(script_path)` unconditionally, and a bind
+  argument outranks a standing assignment — so the override this PR
+  documented was a no-op on the path almost everyone uses. Now passed only
+  as a fallback. Mutation-tested.
+- `repo_root` was validated for existence but not for *containing the
+  function's script*, so `relative_to()` still raised inside
+  `dispatch_to_target` — after the box was created, ssh waited out and the
+  tree rsynced. Checked in `_dispatch` now, before any provisioning.
+- `_coerce_repo_root`'s empty check was `isinstance(value, str)`, so a
+  PathLike bypassed it. Uses `os.fspath` now. Documented limit: `Path("")`
+  is already `Path(".")` at construction and cannot be distinguished from a
+  deliberate `"."`.
+- `App._repo_root` got no alias while `App._entrypoint` did, so the old
+  spelling still wrote the field and skipped all the new validation.
+- **brev's compat set was exactly inverted.** It forwarded the eleven
+  *public* stage names, which never existed on brev, and dropped the eleven
+  *underscore* spellings that did — verified against
+  `git show origin/main:runplz/backends/brev.py`. Both spellings now map to
+  ssh_common.
+- both DeprecationWarnings were invisible where they matter: the CLI
+  executes user scripts as `_runplz_user_job`, and Python only surfaces
+  DeprecationWarning in `__main__`. The CLI now enables them for runplz and
+  for the loaded script; verified the warning appears against the user's
+  own line number.
+- `test_readme_lists_every_exported_name` ended in `or len(row) > 40`,
+  true of every row — it asserted nothing. Replaced with a check that no
+  row names a symbol absent from every public `__all__`; mutation-tested.
+- `PUBLIC_MODULES` omitted the six backend drivers even though
+  `registry.load()` calls `run`/`list_jobs` across a module line. All six
+  now declare `__all__` (brev's `["run"]` had omitted `list_jobs`) and have
+  a README row.
+- the private-import guard derived a module's own name from `path.stem`
+  without its package, and had no non-vacuity assertion — the test it
+  replaced asserted the directory existed for exactly that reason.
+- the `repo_root is None` invariant existed in four places with three
+  wordings; now one `App.require_repo_root()` with four call sites.
+- `bind()`'s "declare a function so we can locate the repo root" fired even
+  when a repo_root was handed in, where the reason is false.
+
+Not addressed: the three legacy shims still implement attribute forwarding
+with two idioms. They behave identically and are pinned by tests; a shared
+helper would need its own public home for an eight-line idiom.
+
+843 passed.

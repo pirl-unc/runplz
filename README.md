@@ -307,6 +307,49 @@ GPU the first one still holds.
 Runs launched before 3.16 carry no marker; `kill` falls back to the
 recorded bootstrap pid alone and says so in its output.
 
+## Public API
+
+Everything below is importable and covered by semantic versioning. Each
+module declares an `__all__`; if a name is not in one, treat it as an
+internal that can move in a patch release.
+
+| Module | What it is |
+|---|---|
+| `runplz` | Re-exports everything below that a job script needs: `App`, `Function`, `Image`, `ImageOp`, and the five backend configs. The only import most scripts need. |
+| `runplz.app` | `App`, `Function`, `repo_root_for`, `validate_image_vs_brev_mode`, `PRECONDITION_KEYS`. |
+| `runplz.config` | `BrevConfig`, `SshConfig`, `ModalConfig`, `GcpConfig`, `AwsConfig`. |
+| `runplz.image` | `Image` and the `ImageOp` DSL. |
+| `runplz.cli` | The `runplz` console script (`main`). Also reachable as `python -m runplz.cli`. |
+| `runplz.runs` | The `tail` / `status` / `kill` verbs, plus the reader for the `run.json` manifest that `rsync_down` leaves in your outputs dir. |
+| `runplz.bootstrap` | The in-container loader and its **environment contract** — `RUNPLZ_SCRIPT`, `RUNPLZ_FUNCTION`, `RUNPLZ_OUT`, `RUNPLZ_ARGS`, `RUNPLZ_KWARGS`. |
+| `runplz.backends.registry` | What backends exist and what each accepts — the single source of truth behind the CLI's choices. |
+| `runplz.backends.ssh_common` | The shared layer every ssh-reachable backend runs on: `dispatch_to_target`, `run_on_provisioned_vm`, and the individual pipeline stages. |
+| `runplz.backends.provisioning` | Retry policy, GPU shape tables, instance naming, and teardown shared by the cloud drivers. |
+| `runplz.backends.local`, `runplz.backends.ssh`, `runplz.backends.brev`, `runplz.backends.modal`, `runplz.backends.gcp`, `runplz.backends.aws` | The backend drivers. Each exports `run` and (where the backend can enumerate jobs) `list_jobs` — the contract `registry.load()` calls. Normally reached through the CLI or `App.bind()`, not imported directly. |
+| `runplz.backends.docker` | Container labels and `docker ps` parsing, shared by the local and ssh backends. |
+| `runplz.selector` | `pick_machine` / `pick_machines` — cost-tolerance shape selection with an availability tiebreak. |
+| `runplz.excludes` | `DEFAULT_TRANSFER_EXCLUDES`, the secret-shaped patterns kept off every host -> remote transfer. |
+| `runplz.logcapture` | Tees the driver's stdout/stderr to a log file (what `--log-file` drives). |
+
+Writing a new backend means answering three questions — how do I create a
+box, what ssh target do I hand over, how do I tear it down — and passing
+the answers to `run_on_provisioned_vm`. See `runplz/backends/gcp.py`; it
+is about 150 lines end to end.
+
+### Two module paths are deliberately underscore-named
+
+`runplz._bootstrap` and `runplz._cli` are legacy entry points kept for
+compatibility, not internals.
+
+`runplz._bootstrap` is the load-bearing one. runplz does **not** ship
+itself to the remote — only your repo goes over the wire — so the
+container's runplz comes from PyPI or your base image and its version is
+independent of the orchestrator's. A 3.20 orchestrator routinely talks to
+a 3.19 container. That makes the invoked module path part of the wire
+format, so backends still emit `python -m runplz._bootstrap`, which older
+containers understand. For the same reason the `RUNPLZ_*` variables may
+only be added to, never renamed.
+
 ## Backend config
 
 `App(..., brev_config=BrevConfig(...), modal_config=ModalConfig(...),

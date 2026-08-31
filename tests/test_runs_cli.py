@@ -6,7 +6,7 @@ from unittest import mock
 
 import pytest
 
-from runplz import _cli, _runs
+from runplz import cli, runs
 
 
 def _write_manifest(outputs_dir: Path, manifest: dict) -> Path:
@@ -39,7 +39,7 @@ def _manifest(**overrides) -> dict:
 
 def test_resolve_uses_manifest_target_and_meta(tmp_path):
     _write_manifest(tmp_path, _manifest())
-    target, meta, manifest = _runs.resolve_target_and_meta(
+    target, meta, manifest = runs.resolve_target_and_meta(
         outputs_dir=tmp_path, host_override=None, run_id_override=None
     )
     assert target == "my-gpu-box"
@@ -49,7 +49,7 @@ def test_resolve_uses_manifest_target_and_meta(tmp_path):
 
 def test_resolve_host_override_wins(tmp_path):
     _write_manifest(tmp_path, _manifest())
-    target, _, _ = _runs.resolve_target_and_meta(
+    target, _, _ = runs.resolve_target_and_meta(
         outputs_dir=tmp_path, host_override="other-box", run_id_override=None
     )
     assert target == "other-box"
@@ -57,13 +57,13 @@ def test_resolve_host_override_wins(tmp_path):
 
 def test_resolve_run_id_requires_host(tmp_path):
     with pytest.raises(RuntimeError, match="--run-id requires --host"):
-        _runs.resolve_target_and_meta(
+        runs.resolve_target_and_meta(
             outputs_dir=tmp_path, host_override=None, run_id_override="xyz"
         )
 
 
 def test_resolve_run_id_with_host_skips_manifest(tmp_path):
-    target, meta, manifest = _runs.resolve_target_and_meta(
+    target, meta, manifest = runs.resolve_target_and_meta(
         outputs_dir=tmp_path, host_override="some-box", run_id_override="rid-123"
     )
     assert target == "some-box"
@@ -73,7 +73,7 @@ def test_resolve_run_id_with_host_skips_manifest(tmp_path):
 
 def test_resolve_falls_back_when_manifest_missing_meta(tmp_path):
     _write_manifest(tmp_path, _manifest(remote_paths={}))
-    target, meta, _ = _runs.resolve_target_and_meta(
+    target, meta, _ = runs.resolve_target_and_meta(
         outputs_dir=tmp_path, host_override=None, run_id_override=None
     )
     assert target == "my-gpu-box"
@@ -81,10 +81,8 @@ def test_resolve_falls_back_when_manifest_missing_meta(tmp_path):
 
 
 def test_resolve_raises_clean_when_no_manifest(tmp_path):
-    with pytest.raises(_runs.ManifestNotFound):
-        _runs.resolve_target_and_meta(
-            outputs_dir=tmp_path, host_override=None, run_id_override=None
-        )
+    with pytest.raises(runs.ManifestNotFound):
+        runs.resolve_target_and_meta(outputs_dir=tmp_path, host_override=None, run_id_override=None)
 
 
 # ---------------------------------------------------------------------------
@@ -94,8 +92,8 @@ def test_resolve_raises_clean_when_no_manifest(tmp_path):
 def test_tail_invokes_remote_tail_n(tmp_path):
     _write_manifest(tmp_path, _manifest())
     fake = mock.Mock(returncode=0)
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake) as run_mock:
-        rc = _runs.tail(
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake) as run_mock:
+        rc = runs.tail(
             outputs_dir=tmp_path,
             host_override=None,
             run_id_override=None,
@@ -113,8 +111,8 @@ def test_tail_invokes_remote_tail_n(tmp_path):
 def test_tail_follow_uses_dash_F(tmp_path):
     _write_manifest(tmp_path, _manifest())
     fake = mock.Mock(returncode=0)
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake) as run_mock:
-        _runs.tail(
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake) as run_mock:
+        runs.tail(
             outputs_dir=tmp_path,
             host_override=None,
             run_id_override=None,
@@ -149,8 +147,8 @@ def test_status_summarizes_last_event_and_heartbeat(tmp_path, capsys):
         "---END---\n"
     )
     fake = mock.Mock(returncode=0, stdout=fake_stdout, stderr="")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake):
-        rc = _runs.status(outputs_dir=tmp_path, host_override=None, run_id_override=None)
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake):
+        rc = runs.status(outputs_dir=tmp_path, host_override=None, run_id_override=None)
     assert rc == 0
     out = capsys.readouterr().out
     assert "target: my-gpu-box" in out
@@ -163,8 +161,8 @@ def test_status_handles_empty_event_log(tmp_path, capsys):
     _write_manifest(tmp_path, _manifest())
     fake_stdout = "---LAST_EVENT---\n---LAST_HEARTBEAT---\n---EVENT_COUNT---\n0\n---END---\n"
     fake = mock.Mock(returncode=0, stdout=fake_stdout, stderr="")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake):
-        _runs.status(outputs_dir=tmp_path, host_override=None, run_id_override=None)
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake):
+        runs.status(outputs_dir=tmp_path, host_override=None, run_id_override=None)
     out = capsys.readouterr().out
     assert "last event: (none recorded)" in out
     assert "last heartbeat: (none yet)" in out
@@ -173,8 +171,8 @@ def test_status_handles_empty_event_log(tmp_path, capsys):
 def test_status_returns_ssh_failure_code(tmp_path, capsys):
     _write_manifest(tmp_path, _manifest())
     fake = mock.Mock(returncode=255, stdout="", stderr="ssh: connect refused")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake):
-        rc = _runs.status(outputs_dir=tmp_path, host_override=None, run_id_override=None)
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake):
+        rc = runs.status(outputs_dir=tmp_path, host_override=None, run_id_override=None)
     assert rc == 255
     out = capsys.readouterr().out
     assert "ssh to my-gpu-box failed" in out
@@ -186,8 +184,8 @@ def test_status_returns_ssh_failure_code(tmp_path, capsys):
 
 def test_cli_tail_dispatch(tmp_path):
     _write_manifest(tmp_path, _manifest())
-    with mock.patch.object(_runs, "tail", return_value=0) as tail_mock:
-        rc = _cli.main(["tail", "--outputs-dir", str(tmp_path), "-n", "10"])
+    with mock.patch.object(runs, "tail", return_value=0) as tail_mock:
+        rc = cli.main(["tail", "--outputs-dir", str(tmp_path), "-n", "10"])
     assert rc == 0
     kwargs = tail_mock.call_args.kwargs
     assert kwargs["lines"] == 10
@@ -197,27 +195,27 @@ def test_cli_tail_dispatch(tmp_path):
 
 def test_cli_tail_follow_flag(tmp_path):
     _write_manifest(tmp_path, _manifest())
-    with mock.patch.object(_runs, "tail", return_value=0) as tail_mock:
-        _cli.main(["tail", "--outputs-dir", str(tmp_path), "-f"])
+    with mock.patch.object(runs, "tail", return_value=0) as tail_mock:
+        cli.main(["tail", "--outputs-dir", str(tmp_path), "-f"])
     assert tail_mock.call_args.kwargs["follow"] is True
 
 
 def test_cli_status_dispatch(tmp_path):
     _write_manifest(tmp_path, _manifest())
-    with mock.patch.object(_runs, "status", return_value=0) as status_mock:
-        rc = _cli.main(["status", "--outputs-dir", str(tmp_path)])
+    with mock.patch.object(runs, "status", return_value=0) as status_mock:
+        rc = cli.main(["status", "--outputs-dir", str(tmp_path)])
     assert rc == 0
     status_mock.assert_called_once()
 
 
 def test_cli_tail_surfaces_missing_manifest(tmp_path, capsys):
-    rc = _cli.main(["tail", "--outputs-dir", str(tmp_path)])
+    rc = cli.main(["tail", "--outputs-dir", str(tmp_path)])
     assert rc == 1
     assert "No run manifest" in capsys.readouterr().err
 
 
 def test_cli_status_run_id_without_host_errors(tmp_path, capsys):
-    rc = _cli.main(["status", "--outputs-dir", str(tmp_path), "--run-id", "xyz"])
+    rc = cli.main(["status", "--outputs-dir", str(tmp_path), "--run-id", "xyz"])
     assert rc == 2
     assert "--run-id requires --host" in capsys.readouterr().err
 
@@ -228,26 +226,26 @@ def test_cli_status_run_id_without_host_errors(tmp_path, capsys):
 
 def test_remote_shell_path_rewrites_tilde_to_home():
     """`~` expands before quoting, so a `~/` path is literal in the remote shell."""
-    assert _runs.remote_shell_path("~/runplz-runs/r1/out") == "$HOME/runplz-runs/r1/out"
-    assert _runs.remote_shell_path("/abs/path") == "/abs/path"
-    assert _runs.remote_shell_path("$HOME/already") == "$HOME/already"
+    assert runs.remote_shell_path("~/runplz-runs/r1/out") == "$HOME/runplz-runs/r1/out"
+    assert runs.remote_shell_path("/abs/path") == "/abs/path"
+    assert runs.remote_shell_path("$HOME/already") == "$HOME/already"
 
 
 @pytest.mark.parametrize(
     "call",
     [
-        lambda d: _runs.tail(
+        lambda d: runs.tail(
             outputs_dir=d, host_override=None, run_id_override=None, lines=5, follow=False
         ),
-        lambda d: _runs.status(outputs_dir=d, host_override=None, run_id_override=None),
-        lambda d: _runs.kill(outputs_dir=d, host_override=None, run_id_override=None),
+        lambda d: runs.status(outputs_dir=d, host_override=None, run_id_override=None),
+        lambda d: runs.kill(outputs_dir=d, host_override=None, run_id_override=None),
     ],
     ids=["tail", "status", "kill"],
 )
 def test_remote_commands_never_ship_an_unexpandable_tilde(tmp_path, call):
     _write_manifest(tmp_path, _manifest())
     fake = mock.Mock(returncode=0, stdout="---SUMMARY---\n---END---\n", stderr="")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake) as run_mock:
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake) as run_mock:
         call(tmp_path)
     remote_cmd = run_mock.call_args.args[0][-1]
     assert "~/" not in remote_cmd
@@ -256,7 +254,7 @@ def test_remote_commands_never_ship_an_unexpandable_tilde(tmp_path, call):
 
 def test_resolve_rejects_a_run_id_that_could_escape_the_path():
     with pytest.raises(RuntimeError, match="not a valid run id"):
-        _runs.resolve_target_and_meta(
+        runs.resolve_target_and_meta(
             outputs_dir=Path("."),
             host_override="box",
             run_id_override='x"; rm -rf ~; echo "',
@@ -266,6 +264,6 @@ def test_resolve_rejects_a_run_id_that_could_escape_the_path():
 def test_kill_drops_a_tampered_run_id_from_the_remote_command(tmp_path):
     _write_manifest(tmp_path, _manifest(run_id='evil"; touch /tmp/pwned; echo "'))
     fake = mock.Mock(returncode=0, stdout="---SUMMARY---\n---END---\n", stderr="")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake) as run_mock:
-        _runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake) as run_mock:
+        runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
     assert "pwned" not in run_mock.call_args.args[0][-1]

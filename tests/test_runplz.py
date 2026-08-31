@@ -14,11 +14,8 @@ from unittest import mock
 import pytest
 
 from runplz import App, BrevConfig, Image, ModalConfig
-from runplz.backends.brev import (
-    _brev_gpu_name,
-    _pick_instance_type,
-    render_image_ops_script,
-)
+from runplz.backends.brev import _brev_gpu_name, _pick_instance_type
+from runplz.backends.ssh_common import render_image_ops_script
 
 # ---- Image DSL rendering --------------------------------------------------
 
@@ -508,7 +505,7 @@ def test_cli_allows_brev_without_instance_for_ephemeral_mode(tmp_path):
     exit). The CLI must stop rejecting the missing flag."""
     import textwrap
 
-    from runplz import _cli
+    from runplz import cli
 
     script = tmp_path / "job.py"
     script.write_text(
@@ -535,7 +532,7 @@ def test_cli_allows_brev_without_instance_for_ephemeral_mode(tmp_path):
         "runplz.backends.brev.run",
         lambda app, function, args, kwargs, **kw: captured.update({"kw": kw}),
     ):
-        _cli.main(["brev", str(script)])
+        cli.main(["brev", str(script)])
     # instance is threaded through as None; brev.run() expands it to an
     # ephemeral name on its own.
     assert captured["kw"]["instance"] is None
@@ -808,7 +805,7 @@ def test_local_backend_accepts_dockerfile_with_default_container_mode(tmp_path):
 
 
 def test_cli_errors_on_instance_with_non_brev_backend(tmp_path):
-    from runplz import _cli
+    from runplz import cli
 
     script = tmp_path / "job.py"
     script.write_text(
@@ -823,11 +820,11 @@ def test_cli_errors_on_instance_with_non_brev_backend(tmp_path):
         "    pass\n"
     )
     with pytest.raises(SystemExit):
-        _cli.main(["local", str(script), "--instance", "stray"])
+        cli.main(["local", str(script), "--instance", "stray"])
 
 
 def test_cli_errors_on_no_build_with_non_local_backend(tmp_path):
-    from runplz import _cli
+    from runplz import cli
 
     script = tmp_path / "job.py"
     script.write_text(
@@ -842,4 +839,4 @@ def test_cli_errors_on_no_build_with_non_local_backend(tmp_path):
         "    pass\n"
     )
     with pytest.raises(SystemExit):
-        _cli.main(["brev", str(script), "--instance", "b", "--no-build"])
+        cli.main(["brev", str(script), "--instance", "b", "--no-build"])

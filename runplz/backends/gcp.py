@@ -31,7 +31,15 @@ from runplz.backends.provisioning import (
 )
 from runplz.backends.ssh_common import run_on_provisioned_vm
 
-__all__ = ["run"]
+# `run` and `list_jobs` are the driver contract the registry calls; the
+# rest is this driver's own testable surface.
+__all__ = [
+    "run",
+    "ssh_alias",
+    "resolve_shape",
+    "build_create_command",
+    "apply_on_finish",
+]
 
 
 def run(app, function, args, kwargs, *, outputs_dir: str = "out"):

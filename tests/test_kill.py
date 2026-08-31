@@ -12,7 +12,7 @@ from unittest import mock
 
 import pytest
 
-from runplz import _cli, _runs
+from runplz import cli, runs
 from runplz.backends import ssh_common
 
 RUN_ID = "20260826T010203Z-myhost-train-deadbeef"
@@ -202,8 +202,8 @@ class _FakeBox:
         script.write_text(ssh_common.build_kill_command(str(self.meta), **kwargs))
         r = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=180)
         assert r.returncode == 0, r.stderr
-        sections = _runs._parse_status_sections(r.stdout)
-        return _runs._parse_kv_block(sections.get("SUMMARY", ""))
+        sections = runs._parse_status_sections(r.stdout)
+        return runs._parse_kv_block(sections.get("SUMMARY", ""))
 
     def cleanup(self):
         self._stop.set()
@@ -420,7 +420,7 @@ def test_container_mode_records_container_name_for_kill():
         backend="brev", target="box", function_name="train"
     )
     with mock.patch.object(ssh_common, "ssh_exec", fake_ssh):
-        ssh_common._run_container_detached(
+        ssh_common.run_container_detached(
             target="box",
             container_name="runplz-train-abc12345",
             function=function,
@@ -439,14 +439,14 @@ def test_container_mode_records_container_name_for_kill():
 
 
 # ---------------------------------------------------------------------------
-# _runs.kill
+# runs.kill
 
 
 def test_kill_reports_a_clean_stop(tmp_path, capsys):
     _write_manifest(tmp_path)
     fake = mock.Mock(returncode=0, stdout=_summary(), stderr="")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake) as run_mock:
-        rc = _runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake) as run_mock:
+        rc = runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
     assert rc == 0
     out = capsys.readouterr().out
     assert "target:     my-gpu-box" in out
@@ -460,8 +460,8 @@ def test_kill_reports_a_clean_stop(tmp_path, capsys):
 def test_kill_reports_escalation(tmp_path, capsys):
     _write_manifest(tmp_path)
     fake = mock.Mock(returncode=0, stdout=_summary(escalated="1"), stderr="")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake):
-        _runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake):
+        runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
     assert "escalated to SIGKILL" in capsys.readouterr().out
 
 
@@ -469,8 +469,8 @@ def test_kill_reports_escalation(tmp_path, capsys):
 def test_kill_reports_the_signal_actually_sent(tmp_path, capsys, signal):
     _write_manifest(tmp_path)
     fake = mock.Mock(returncode=0, stdout=_summary(signal=signal), stderr="")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake):
-        _runs.kill(
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake):
+        runs.kill(
             outputs_dir=tmp_path,
             host_override=None,
             run_id_override=None,
@@ -485,8 +485,8 @@ def test_kill_on_an_already_dead_run_is_a_success(tmp_path, capsys):
         initial="dead", final="dead", signalled="0", alive_before="0", alive_after="0", pid=""
     )
     fake = mock.Mock(returncode=0, stdout=stdout, stderr="")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake):
-        rc = _runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake):
+        rc = runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
     assert rc == 0
     assert "nothing to kill" in capsys.readouterr().out
 
@@ -496,9 +496,9 @@ def test_kill_returns_nonzero_when_the_run_survives(tmp_path, capsys):
     _write_manifest(tmp_path)
     stdout = _summary(final="running", alive_after="1", survivors="111 222")
     fake = mock.Mock(returncode=0, stdout=stdout, stderr="")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake):
-        rc = _runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
-    assert rc == _runs.KILL_SURVIVED_RC
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake):
+        rc = runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
+    assert rc == runs.KILL_SURVIVED_RC
     out = capsys.readouterr().out
     assert "SIGNALLED BUT STILL ALIVE" in out
     assert "111 222" in out
@@ -510,9 +510,9 @@ def test_kill_returns_nonzero_when_only_the_container_survives(tmp_path, capsys)
         container="runplz-train-abc", container_state="running", alive_after="1", survivors=""
     )
     fake = mock.Mock(returncode=0, stdout=stdout, stderr="")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake):
-        rc = _runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
-    assert rc == _runs.KILL_SURVIVED_RC
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake):
+        rc = runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
+    assert rc == runs.KILL_SURVIVED_RC
     assert "container still running" in capsys.readouterr().out
 
 
@@ -520,8 +520,8 @@ def test_kill_does_not_claim_success_when_the_remote_script_did_not_run(tmp_path
     """A login shell that can't parse the script, or a banner on stdout."""
     _write_manifest(tmp_path)
     fake = mock.Mock(returncode=0, stdout="Welcome to Ubuntu!\n", stderr="")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake):
-        rc = _runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake):
+        rc = runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
     assert rc == 2
     err = capsys.readouterr().err
     assert "could not read a kill result" in err
@@ -530,8 +530,8 @@ def test_kill_does_not_claim_success_when_the_remote_script_did_not_run(tmp_path
 def test_kill_warns_when_no_process_marker_was_available(tmp_path, capsys):
     _write_manifest(tmp_path)
     fake = mock.Mock(returncode=0, stdout=_summary(scan="0"), stderr="")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake):
-        _runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake):
+        runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
     assert "no process marker available" in capsys.readouterr().out
 
 
@@ -546,8 +546,8 @@ def test_kill_renders_gpu_memory_and_heartbeat_and_logtail(tmp_path, capsys):
         "---LOGTAIL---\n| epoch 1\n| --- checkpoint saved ---\n| epoch 2\n",
     )
     fake = mock.Mock(returncode=0, stdout=stdout, stderr="")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake):
-        _runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake):
+        runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
     out = capsys.readouterr().out
     assert "gpu memory: gpu0=0MiB, gpu1=512MiB" in out
     assert "2026-08-26T01:05:30Z" in out
@@ -559,8 +559,8 @@ def test_kill_renders_gpu_memory_and_heartbeat_and_logtail(tmp_path, capsys):
 def test_kill_returns_ssh_failure_code(tmp_path, capsys):
     _write_manifest(tmp_path)
     fake = mock.Mock(returncode=255, stdout="", stderr="ssh: connect refused")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake):
-        rc = _runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake):
+        rc = runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
     assert rc == 255
     assert "ssh to my-gpu-box failed" in capsys.readouterr().err
 
@@ -568,10 +568,10 @@ def test_kill_returns_ssh_failure_code(tmp_path, capsys):
 def test_kill_survives_an_ssh_timeout(tmp_path, capsys):
     _write_manifest(tmp_path)
     with mock.patch(
-        "runplz._runs.subprocess.run",
+        "runplz.runs.subprocess.run",
         side_effect=subprocess.TimeoutExpired(cmd="ssh", timeout=75),
     ):
-        rc = _runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
+        rc = runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
     assert rc == 2
     assert "timed out" in capsys.readouterr().err
 
@@ -579,15 +579,15 @@ def test_kill_survives_an_ssh_timeout(tmp_path, capsys):
 def test_kill_ssh_timeout_outlives_the_remote_escalation_clock(tmp_path):
     _write_manifest(tmp_path)
     fake = mock.Mock(returncode=0, stdout=_summary(), stderr="")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake) as run_mock:
-        _runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None, timeout_s=600)
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake) as run_mock:
+        runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None, timeout_s=600)
     assert run_mock.call_args.kwargs["timeout"] > 600 + ssh_common.KILL_SETTLE_S
 
 
 def test_kill_uses_run_id_override_when_there_is_no_manifest(tmp_path, capsys):
     fake = mock.Mock(returncode=0, stdout=_summary(), stderr="")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake) as run_mock:
-        rc = _runs.kill(outputs_dir=tmp_path, host_override="other-box", run_id_override="rid-9")
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake) as run_mock:
+        rc = runs.kill(outputs_dir=tmp_path, host_override="other-box", run_id_override="rid-9")
     assert rc == 0
     remote_cmd = run_mock.call_args.args[0][-1]
     assert "runplz-runs/rid-9/out/.runplz/bootstrap.pid" in remote_cmd
@@ -600,7 +600,7 @@ def test_kill_refuses_a_tampered_meta_path_from_the_manifest(tmp_path, capsys):
         tmp_path,
         remote_paths={"meta": "~/runplz-runs/$(touch /tmp/runplz-probe)/out/.runplz"},
     )
-    rc = _cli.main(["kill", "--outputs-dir", str(tmp_path)])
+    rc = cli.main(["kill", "--outputs-dir", str(tmp_path)])
     assert rc == 2
     err = capsys.readouterr().err
     assert "refusing to use remote path from the run manifest" in err
@@ -610,8 +610,8 @@ def test_kill_refuses_a_tampered_meta_path_from_the_manifest(tmp_path, capsys):
 def test_kill_drops_a_tampered_run_id_from_the_remote_command(tmp_path):
     _write_manifest(tmp_path, run_id='evil"; touch /tmp/runplz-probe; echo "')
     fake = mock.Mock(returncode=0, stdout=_summary(), stderr="")
-    with mock.patch("runplz._runs.subprocess.run", return_value=fake) as run_mock:
-        _runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake) as run_mock:
+        runs.kill(outputs_dir=tmp_path, host_override=None, run_id_override=None)
     assert "runplz-probe" not in run_mock.call_args.args[0][-1]
 
 
@@ -622,8 +622,8 @@ def test_kill_drops_a_tampered_run_id_from_the_remote_command(tmp_path):
 @pytest.mark.parametrize("verb", ["kill", "cancel"])
 def test_cli_dispatches_both_verbs(tmp_path, verb):
     _write_manifest(tmp_path)
-    with mock.patch.object(_runs, "kill", return_value=0) as kill_mock:
-        rc = _cli.main([verb, "--outputs-dir", str(tmp_path)])
+    with mock.patch.object(runs, "kill", return_value=0) as kill_mock:
+        rc = cli.main([verb, "--outputs-dir", str(tmp_path)])
     assert rc == 0
     kwargs = kill_mock.call_args.kwargs
     assert kwargs["outputs_dir"] == tmp_path.resolve()
@@ -634,14 +634,14 @@ def test_cli_dispatches_both_verbs(tmp_path, verb):
 
 def test_cli_kill_propagates_the_survivor_exit_code(tmp_path):
     _write_manifest(tmp_path)
-    with mock.patch.object(_runs, "kill", return_value=_runs.KILL_SURVIVED_RC):
-        assert _cli.main(["kill", "--outputs-dir", str(tmp_path)]) == _runs.KILL_SURVIVED_RC
+    with mock.patch.object(runs, "kill", return_value=runs.KILL_SURVIVED_RC):
+        assert cli.main(["kill", "--outputs-dir", str(tmp_path)]) == runs.KILL_SURVIVED_RC
 
 
 def test_cli_kill_plumbs_signal_and_timeout(tmp_path):
     _write_manifest(tmp_path)
-    with mock.patch.object(_runs, "kill", return_value=0) as kill_mock:
-        _cli.main(
+    with mock.patch.object(runs, "kill", return_value=0) as kill_mock:
+        cli.main(
             [
                 "kill",
                 "--outputs-dir",
@@ -662,24 +662,24 @@ def test_cli_kill_plumbs_signal_and_timeout(tmp_path):
 def test_cli_kill_rejects_a_negative_timeout(tmp_path):
     _write_manifest(tmp_path)
     with pytest.raises(SystemExit):
-        _cli.main(["kill", "--outputs-dir", str(tmp_path), "--timeout", "-1"])
+        cli.main(["kill", "--outputs-dir", str(tmp_path), "--timeout", "-1"])
 
 
 def test_cli_kill_surfaces_missing_manifest(tmp_path, capsys):
-    rc = _cli.main(["kill", "--outputs-dir", str(tmp_path)])
+    rc = cli.main(["kill", "--outputs-dir", str(tmp_path)])
     assert rc == 1
     assert "No run manifest" in capsys.readouterr().err
 
 
 def test_cli_kill_run_id_without_host_errors(tmp_path, capsys):
-    rc = _cli.main(["kill", "--outputs-dir", str(tmp_path), "--run-id", "xyz"])
+    rc = cli.main(["kill", "--outputs-dir", str(tmp_path), "--run-id", "xyz"])
     assert rc == 2
     assert "--run-id requires --host" in capsys.readouterr().err
 
 
 def test_cli_kill_targets_an_explicit_host_and_run_id(tmp_path):
-    with mock.patch.object(_runs, "kill", return_value=0) as kill_mock:
-        _cli.main(["kill", "--host", "other-box", "--run-id", "rid-9"])
+    with mock.patch.object(runs, "kill", return_value=0) as kill_mock:
+        cli.main(["kill", "--host", "other-box", "--run-id", "rid-9"])
     kwargs = kill_mock.call_args.kwargs
     assert kwargs["host_override"] == "other-box"
     assert kwargs["run_id_override"] == "rid-9"

@@ -49,6 +49,14 @@ __all__ = [
     "retry_budget_spent",
     "NO_RETRIES",
     "RetryPolicy",
+    # --- retry classification tables -------------------------------------
+    "GCP_TRANSIENT",
+    "GCP_NON_RETRIABLE",
+    "AWS_TRANSIENT",
+    "AWS_NON_RETRIABLE",
+    # gcp.py reads this to tell a benign "already exists" (a retried create
+    # whose first attempt landed) from a real failure.
+    "ALREADY_EXISTS",
 ]
 
 # Instance names have to be DNS-ish on both clouds: lowercase alphanumerics

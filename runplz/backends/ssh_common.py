@@ -31,9 +31,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from runplz._excludes import DEFAULT_TRANSFER_EXCLUDES
 from runplz.backends import docker
 from runplz.backends.provisioning import RetryPolicy, retry_budget_spent
+from runplz.excludes import DEFAULT_TRANSFER_EXCLUDES
 
 __all__ = [
     # --- running one function on a reachable box -------------------------
@@ -41,6 +41,22 @@ __all__ = [
     "run_on_provisioned_vm",
     "DispatchResult",
     "format_remote_failure",
+    # --- the dispatch pipeline, in the order dispatch_to_target runs it ---
+    # Public because a backend may need to drive a stage on its own, and
+    # because these are the seams the test suite patches.
+    "prepare_remote_run",
+    "ensure_remote_rsync",
+    "check_preconditions",
+    "PreconditionFailed",
+    "ensure_docker",
+    "remote_has_nvidia",
+    "build_image",
+    "run_container_detached",
+    "run_container_mode",
+    "run_native",
+    "stream_and_wait",
+    "fetch_failure_tail",
+    "apt_lock_wait_shell",
     # --- provisioning-backend lifecycle ----------------------------------
     "orchestrator_signal_cleanup",
     "OrchestratorKilled",
@@ -53,6 +69,17 @@ __all__ = [
     "LocalRepoState",
     "inspect_local_repo",
     "select_source_paths",
+    # --- remote filesystem layout (a cross-version on-disk contract) -----
+    "REMOTE_REPO_DIR",
+    "REMOTE_OUT_DIR",
+    "REMOTE_RUNS_DIR",
+    "REMOTE_LATEST_LINK",
+    "REMOTE_META_DIRNAME",
+    "REMOTE_IMAGE_TAG",
+    "REMOTE_LAST_LOG",
+    "BOOTSTRAP_PID_FILENAME",
+    "CONTAINER_FILENAME",
+    "LOCAL_SSH_OPTIONS_FILENAME",
     # --- moving code and results -----------------------------------------
     "rsync_up",
     "rsync_down",
@@ -68,6 +95,8 @@ __all__ = [
     "SSH_TRANSPORT_EXIT",
     "SSH_RESULTS_POLICY",
     "SSH_PREP_POLICY",
+    "SSH_OPTS",
+    "RSYNC_TRANSPORT_EXITS",
     "ssh_capture",
     "ssh_cmd_opts",
     "run_local",
@@ -91,10 +120,16 @@ __all__ = [
     "read_remote_exit_code",
     "DetachedProcessState",
     "DetachedRunStatus",
+    "HEARTBEAT_INTERVAL_S",
+    "DETACHED_START_TIMEOUT_S",
+    "DETACHED_START_POLL_INTERVAL_S",
     # --- stopping a run ---------------------------------------------------
     "build_kill_command",
     "make_container_name",
     "RUN_ID_ENV_VAR",
+    "FAILURE_TAIL_LINES",
+    "DEFAULT_KILL_TIMEOUT_S",
+    "KILL_SETTLE_S",
     # --- validating untrusted values headed for a remote shell -----------
     "remote_shell_path",
     "validate_remote_path",
@@ -175,7 +210,10 @@ _RSYNC_NOISE_EXCLUDES = (
 # ServerAliveInterval=30 + large ServerAliveCountMax keeps each
 # individual session alive during idle stretches (docker image pulls,
 # data downloads, between-epoch pauses).
-SSH_OPTS = [
+# A tuple, not a list: this is exported, and a mutable module-level
+# default would let one caller's `.append()` change every later ssh
+# invocation in the process. Build your own list from it.
+SSH_OPTS = (
     # Ephemeral cloud boxes are a new host key every time, and every probe
     # runs with BatchMode=yes — which cannot answer OpenSSH's default
     # "are you sure?" prompt. Without this, a fresh EC2 IP fails host-key
@@ -194,7 +232,7 @@ SSH_OPTS = [
     "ServerAliveCountMax=240",
     "-o",
     "TCPKeepAlive=yes",
-]
+)
 
 
 @dataclass(frozen=True)
@@ -613,7 +651,7 @@ def build_remote_run_manifest(
     }
 
 
-def _prepare_remote_run(
+def prepare_remote_run(
     target: str,
     remote_run: RemoteRunContext,
     *,
@@ -758,7 +796,7 @@ def rsync_transport_flags(ssh_opts=None) -> list:
 
 # --- transient ssh transport failures -------------------------------------
 #
-# Issue #84: a run reached SSH readiness, then died in _prepare_remote_run
+# Issue #84: a run reached SSH readiness, then died in prepare_remote_run
 # with `Can't assign requested address` / `client_loop: send disconnect:
 # Broken pipe`. The remote held only run.json and a launch_prepared event —
 # nothing staged, no bootstrap — and the identical command succeeded on the
@@ -779,7 +817,7 @@ _DOCKER_NO_SUCH_RE = re.compile(r"no such (object|container)", re.I)
 # --timeout we never pass and 35 is daemon-mode only, so without 12 the rsync
 # retry would do nothing for the failure it exists for. 12 is broader than
 # transport (a missing remote rsync binary reports it too), but
-# _ensure_remote_rsync runs first and the budget is bounded, so that
+# ensure_remote_rsync runs first and the budget is bounded, so that
 # ambiguity costs seconds on an already-doomed run.
 RSYNC_TRANSPORT_EXITS = (12, 30, 35, SSH_TRANSPORT_EXIT)
 # Staging is cheap to repeat and the job already spent minutes getting here.
@@ -896,7 +934,7 @@ class PreconditionFailed(RuntimeError):
 _PRECONDITION_FAIL_FRACTION = 0.5
 
 
-def _check_preconditions(
+def check_preconditions(
     target: str, preconditions: dict, *, ssh_opts: Optional[SshOptions] = None
 ) -> None:
     """Probe declared preconditions on the remote box and warn-or-fail.
@@ -1065,7 +1103,7 @@ def rsync_up(
     for pat in _RSYNC_NOISE_EXCLUDES:
         cmd.append(f"--exclude={pat}")
     # Safety: never ship local secrets / dotenv / SSH keys to a remote box.
-    # See runplz/_excludes.py for the rationale.
+    # See runplz/excludes.py for the rationale.
     for pat in DEFAULT_TRANSFER_EXCLUDES:
         cmd.append(f"--exclude={pat}")
     # Don't re-upload the outputs we'll rsync_down later. _RSYNC_NOISE_EXCLUDES
@@ -1268,7 +1306,7 @@ def apt_lock_wait_shell(iterations: int = 60, sleep_s: int = 5) -> str:
     )
 
 
-def _ensure_remote_rsync(target: str, *, ssh_opts: Optional[SshOptions] = None):
+def ensure_remote_rsync(target: str, *, ssh_opts: Optional[SshOptions] = None):
     """Install rsync on the remote if missing (slim container images
     often don't ship with rsync)."""
     cmd = (
@@ -1283,7 +1321,7 @@ def _ensure_remote_rsync(target: str, *, ssh_opts: Optional[SshOptions] = None):
     )
 
 
-def _ensure_docker(target: str, timeout_s: int = 420, *, ssh_opts: Optional[SshOptions] = None):
+def ensure_docker(target: str, timeout_s: int = 420, *, ssh_opts: Optional[SshOptions] = None):
     """Wait for docker daemon to be reachable on the remote, installing
     docker via get.docker.com as a fallback if the daemon never appears."""
     print(f"+ waiting for docker daemon on {target} (up to {timeout_s}s)", flush=True)
@@ -1331,7 +1369,7 @@ def _ensure_docker(target: str, timeout_s: int = 420, *, ssh_opts: Optional[SshO
         )
 
 
-def _remote_has_nvidia(target: str, *, ssh_opts: Optional[SshOptions] = None) -> bool:
+def remote_has_nvidia(target: str, *, ssh_opts: Optional[SshOptions] = None) -> bool:
     # nvidia-smi is often pre-installed without a real GPU; the reliable
     # signal is /proc/driver/nvidia, which only exists when the kernel
     # module is loaded against real hardware.
@@ -1404,7 +1442,7 @@ def render_image_ops_script(image, *, remote_run: Optional[RemoteRunContext] = N
     return "; ".join(lines)
 
 
-def _run_container_mode(
+def run_container_mode(
     *,
     target,
     function,
@@ -1423,12 +1461,12 @@ def _run_container_mode(
     files) so a flaky client-side network connection can't
     kill the remote training job. Local streaming + completion tracking
     runs through a reconnect-tolerant tail-and-poll loop that mirrors
-    the docker-mode ``_stream_and_wait`` pattern.
+    the docker-mode ``stream_and_wait`` pattern.
     """
     ops_script = render_image_ops_script(function.image, remote_run=remote_run)
     if ops_script:
-        # Container mode's equivalent of _build_image: apt/pip layers applied
-        # inline. brev's container mode never reaches _build_image, so without
+        # Container mode's equivalent of build_image: apt/pip layers applied
+        # inline. brev's container mode never reaches build_image, so without
         # this the mode where the box *is* the user's image had no cover at
         # all for a #84-shaped blip.
         retry_on_transport_failure(
@@ -1469,7 +1507,7 @@ def _run_container_mode(
     )
 
 
-def _run_native(
+def run_native(
     *,
     target,
     function,
@@ -1500,7 +1538,7 @@ def _run_native(
         f"pip install --quiet torch --index-url {torch_index}; "
         f"pip install --quiet -e {_remote_repo_shell(remote_run)}"
     )
-    # A superset of _ensure_remote_rsync's apt-get, which is retried — the
+    # A superset of ensure_remote_rsync's apt-get, which is retried — the
     # two adjacent calls should not behave differently for the same failure.
     retry_on_transport_failure(
         lambda: ssh_exec(target, setup, ssh_opts=ssh_opts),
@@ -1511,7 +1549,7 @@ def _run_native(
         f"export {k}={shlex.quote(str(v))};" for k, v in function.env.items()
     )
     # Launch detached and stream with reconnect tolerance — same pattern
-    # as ``_run_container_mode``. See that function's docstring for the
+    # as ``run_container_mode``. See that function's docstring for the
     # SIGPIPE / SSH-drop rationale.
     inner = (
         "set -euo pipefail; "
@@ -1536,7 +1574,7 @@ def _run_native(
     )
 
 
-def _build_image(
+def build_image(
     target: str,
     image,
     *,
@@ -1571,7 +1609,7 @@ def _build_image(
     _record_remote_event(target, remote_run, "build_image_done", ssh_opts=ssh_opts)
 
 
-def _run_container_detached(
+def run_container_detached(
     *,
     target,
     container_name,
@@ -2195,7 +2233,7 @@ def launch_detached_and_wait(
     """Launch a nohup-protected bash command and stream/wait locally.
 
     Core SSH-drop-survival path for container-mode and native backends.
-    Before this helper, ``_run_container_mode`` and ``_run_native`` ran
+    Before this helper, ``run_container_mode`` and ``run_native`` ran
     the bootstrap as a foreground ssh command whose stdout pipeline
     ended with ``tee`` — which meant any ssh drop SIGPIPEd tee and
     cascaded SIGPIPE / BrokenPipeError back through the whole pipeline,
@@ -2322,7 +2360,7 @@ def tail_and_wait_for_detached(
 ) -> int:
     """Stream log_file via ssh ``tail -F`` and return remote exit code.
 
-    Mirrors ``_stream_and_wait``'s reconnect pattern but uses a PID file
+    Mirrors ``stream_and_wait``'s reconnect pattern but uses a PID file
     + events file instead of docker commands for the "is the job still
     alive" and "what was the exit code" checks.
 
@@ -2456,7 +2494,7 @@ def read_remote_exit_code(
     return 1
 
 
-def _stream_and_wait(
+def stream_and_wait(
     target: str,
     container_name: str,
     max_reconnects: int = 20,
@@ -2586,7 +2624,7 @@ def container_running(
 # --- failure context -----------------------------------------------------
 
 
-def _fetch_failure_tail(
+def fetch_failure_tail(
     *,
     target: str,
     container_name: Optional[str],
@@ -2788,7 +2826,7 @@ def dispatch_to_target(
     gone. Provisioning backends wrap this in their own try/finally for the box
     itself; see :func:`run_on_provisioned_vm`.
     """
-    repo = app._repo_root
+    repo = app.require_repo_root(context="dispatch_to_target()")
     host_out = (repo / outputs_dir).resolve()
     host_out.mkdir(parents=True, exist_ok=True)
 
@@ -2799,7 +2837,7 @@ def dispatch_to_target(
         target=target,
         function_name=function.name,
     )
-    _prepare_remote_run(
+    prepare_remote_run(
         target,
         remote_run,
         manifest=build_remote_run_manifest(
@@ -2814,12 +2852,12 @@ def dispatch_to_target(
     )
 
     # Pre-built images (and minimal cloud images) need not ship rsync.
-    _ensure_remote_rsync(target, ssh_opts=ssh_opts)
+    ensure_remote_rsync(target, ssh_opts=ssh_opts)
     rsync_up(repo, target, outputs_dir=outputs_dir, remote_run=remote_run, ssh_opts=ssh_opts)
 
     # Probe declared preconditions (issue #56) before bootstrap, so a
     # misprovisioned box fails fast instead of burning paid GPU minutes.
-    _check_preconditions(target, function.preconditions, ssh_opts=ssh_opts)
+    check_preconditions(target, function.preconditions, ssh_opts=ssh_opts)
 
     rel_script = Path(function.module_file).resolve().relative_to(repo)
 
@@ -2831,7 +2869,7 @@ def dispatch_to_target(
     failure_tail = ""
     try:
         if mode == "container":
-            exit_code = _run_container_mode(
+            exit_code = run_container_mode(
                 target=target,
                 function=function,
                 rel_script=str(rel_script),
@@ -2842,11 +2880,11 @@ def dispatch_to_target(
                 ssh_opts=ssh_opts,
             )
         elif mode == "docker":
-            _ensure_docker(target, ssh_opts=ssh_opts)
-            gpu_flag = "--gpus all" if _remote_has_nvidia(target, ssh_opts=ssh_opts) else ""
+            ensure_docker(target, ssh_opts=ssh_opts)
+            gpu_flag = "--gpus all" if remote_has_nvidia(target, ssh_opts=ssh_opts) else ""
             container_name = make_container_name(function.name)
-            _build_image(target, function.image, remote_run=remote_run, ssh_opts=ssh_opts)
-            _run_container_detached(
+            build_image(target, function.image, remote_run=remote_run, ssh_opts=ssh_opts)
+            run_container_detached(
                 target=target,
                 container_name=container_name,
                 function=function,
@@ -2858,20 +2896,20 @@ def dispatch_to_target(
                 remote_run=remote_run,
                 ssh_opts=ssh_opts,
             )
-            exit_code = _stream_and_wait(
+            exit_code = stream_and_wait(
                 target,
                 container_name,
                 max_runtime_seconds=max_runtime_seconds,
                 ssh_opts=ssh_opts,
             )
         else:
-            exit_code = _run_native(
+            exit_code = run_native(
                 target=target,
                 function=function,
                 rel_script=str(rel_script),
                 args=args,
                 kwargs=kwargs,
-                has_nvidia=_remote_has_nvidia(target, ssh_opts=ssh_opts),
+                has_nvidia=remote_has_nvidia(target, ssh_opts=ssh_opts),
                 remote_run=remote_run,
                 max_runtime_seconds=max_runtime_seconds,
                 ssh_opts=ssh_opts,
@@ -2881,7 +2919,7 @@ def dispatch_to_target(
         # Grab the log tail before the container goes away — `docker rm`
         # wipes it, and a provisioning caller is about to delete the box.
         if exit_code is not None and exit_code != 0:
-            failure_tail = _fetch_failure_tail(
+            failure_tail = fetch_failure_tail(
                 target=target,
                 container_name=container_name,
                 remote_run=remote_run,

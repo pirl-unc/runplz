@@ -11,7 +11,7 @@ from unittest import mock
 
 import pytest
 
-from runplz import _cli
+from runplz import cli
 
 
 def _write_job(tmp_path: Path, body: str) -> Path:
@@ -22,7 +22,7 @@ def _write_job(tmp_path: Path, body: str) -> Path:
 
 def test_cli_script_not_found_errors(tmp_path, capsys):
     with pytest.raises(SystemExit):
-        _cli.main(["local", str(tmp_path / "does-not-exist.py")])
+        cli.main(["local", str(tmp_path / "does-not-exist.py")])
     err = capsys.readouterr().err
     assert "script not found" in err
 
@@ -50,14 +50,14 @@ def test_cli_brev_without_instance_threads_none_for_ephemeral(tmp_path):
         "runplz.backends.brev.run",
         lambda app, function, args, kwargs, **kw: captured.update({"kw": kw}),
     ):
-        _cli.main(["brev", str(script)])
+        cli.main(["brev", str(script)])
     assert captured["kw"]["instance"] is None
 
 
 def test_cli_rejects_script_with_no_app(tmp_path):
     script = _write_job(tmp_path, "x = 1\n")
     with pytest.raises(SystemExit, match="No App found"):
-        _cli.main(["local", str(script)])
+        cli.main(["local", str(script)])
 
 
 def test_cli_rejects_script_with_multiple_apps(tmp_path):
@@ -70,7 +70,7 @@ def test_cli_rejects_script_with_multiple_apps(tmp_path):
         """,
     )
     with pytest.raises(SystemExit, match="Multiple Apps found"):
-        _cli.main(["local", str(script)])
+        cli.main(["local", str(script)])
 
 
 def test_cli_rejects_script_with_multiple_functions_and_no_entrypoint(tmp_path, capsys):
@@ -89,7 +89,7 @@ def test_cli_rejects_script_with_multiple_functions_and_no_entrypoint(tmp_path, 
         """,
     )
     with pytest.raises(SystemExit):
-        _cli.main(["local", str(script)])
+        cli.main(["local", str(script)])
     err = capsys.readouterr().err
     assert "@app.local_entrypoint" in err
     assert "first" in err and "second" in err
@@ -104,7 +104,7 @@ def test_cli_rejects_script_with_no_function_and_no_entrypoint(tmp_path, capsys)
         """,
     )
     with pytest.raises(SystemExit):
-        _cli.main(["local", str(script)])
+        cli.main(["local", str(script)])
     assert "declares no @app.function" in capsys.readouterr().err
 
 
@@ -134,7 +134,7 @@ def test_cli_local_no_build_sets_flag(tmp_path):
         return None
 
     with mock.patch("runplz.backends.local.run", fake_local_run):
-        _cli.main(["local", "--no-build", str(script)])
+        cli.main(["local", "--no-build", str(script)])
 
     assert captured["backend_kwargs"]["build"] is False
     assert captured["backend_kwargs"]["outputs_dir"] == "out"
@@ -161,7 +161,7 @@ def test_cli_outputs_dir_flag_is_forwarded(tmp_path):
         "runplz.backends.local.run",
         lambda app, function, args, kwargs, **kw: captured.update({"kw": kw}),
     ):
-        _cli.main(["local", "--outputs-dir", "artifacts", str(script)])
+        cli.main(["local", "--outputs-dir", "artifacts", str(script)])
     assert captured["kw"]["outputs_dir"] == "artifacts"
 
 
@@ -182,7 +182,7 @@ def test_cli_ssh_requires_host(tmp_path, capsys):
         """,
     )
     with pytest.raises(SystemExit):
-        _cli.main(["ssh", str(script)])
+        cli.main(["ssh", str(script)])
     err = capsys.readouterr().err
     # Names the CLI flag, not just the Python kwarg.
     assert "--host" in err and "needs a host" in err
@@ -209,7 +209,7 @@ def test_cli_ssh_threads_host_into_backend_kwargs(tmp_path):
         "runplz.backends.ssh.run",
         lambda app, function, args, kwargs, **kw: captured.update({"kw": kw}),
     ):
-        _cli.main(["ssh", "--host", "gpu.example.com", str(script)])
+        cli.main(["ssh", "--host", "gpu.example.com", str(script)])
     assert captured["kw"]["host"] == "gpu.example.com"
 
 
@@ -230,7 +230,7 @@ def test_cli_host_rejected_on_non_ssh_backend(tmp_path, capsys):
         """,
     )
     with pytest.raises(SystemExit):
-        _cli.main(["local", "--host", "x", str(script)])
+        cli.main(["local", "--host", "x", str(script)])
     err = capsys.readouterr().err
     assert "--host" in err and "only applies to the ssh backend" in err
 
@@ -253,7 +253,7 @@ def test_cli_modal_dispatches_to_modal_backend(tmp_path):
     )
     called = []
     with mock.patch("runplz.backends.modal.run", lambda *a, **kw: called.append(True)):
-        _cli.main(["modal", str(script)])
+        cli.main(["modal", str(script)])
     assert called == [True]
 
 
@@ -290,7 +290,7 @@ def test_cli_passes_typed_kwargs_to_entrypoint(tmp_path):
     import sys as _sys
 
     with mock.patch("runplz.backends.local.run", lambda *a, **kw: None):
-        _cli.main(["local", str(script), "--steps=1000", "--dataset=big", "--lr=0.01"])
+        cli.main(["local", str(script), "--steps=1000", "--dataset=big", "--lr=0.01"])
     mod = _sys.modules["_runplz_user_job"]
     called.update(mod.received)
     assert called == {"steps": 1000, "dataset": "big", "lr": 0.01}
@@ -318,7 +318,7 @@ def test_cli_entrypoint_uses_defaults_when_args_omitted(tmp_path):
     import sys as _sys
 
     with mock.patch("runplz.backends.local.run", lambda *a, **kw: None):
-        _cli.main(["local", str(script)])
+        cli.main(["local", str(script)])
     assert _sys.modules["_runplz_user_job"].seen == {"steps": 42}
 
 
@@ -340,7 +340,7 @@ def test_cli_entrypoint_missing_required_arg_errors(tmp_path, capsys):
         """,
     )
     with pytest.raises(SystemExit):
-        _cli.main(["local", str(script)])
+        cli.main(["local", str(script)])
     err = capsys.readouterr().err
     assert "--dataset" in err
 
@@ -363,7 +363,7 @@ def test_cli_entrypoint_type_mismatch_errors(tmp_path, capsys):
         """,
     )
     with pytest.raises(SystemExit):
-        _cli.main(["local", str(script), "--steps=not-a-number"])
+        cli.main(["local", str(script), "--steps=not-a-number"])
     err = capsys.readouterr().err
     assert "--steps" in err
     assert "int" in err
@@ -399,7 +399,7 @@ def test_cli_entrypoint_bool_flag_forms(tmp_path):
         (["local", str(script), "--verbose=no"], False),
     ]:
         with mock.patch("runplz.backends.local.run", lambda *a, **kw: None):
-            _cli.main(argv)
+            cli.main(argv)
         assert _sys.modules["_runplz_user_job"].seen["verbose"] is expected, argv
 
 
@@ -427,11 +427,11 @@ def test_cli_entrypoint_optional_annotation_unwrapped(tmp_path):
     import sys as _sys
 
     with mock.patch("runplz.backends.local.run", lambda *a, **kw: None):
-        _cli.main(["local", str(script), "--steps=7"])
+        cli.main(["local", str(script), "--steps=7"])
     assert _sys.modules["_runplz_user_job"].seen == {"steps": 7}
 
     with mock.patch("runplz.backends.local.run", lambda *a, **kw: None):
-        _cli.main(["local", str(script)])
+        cli.main(["local", str(script)])
     assert _sys.modules["_runplz_user_job"].seen == {"steps": None}
 
 
@@ -455,7 +455,7 @@ def test_cli_zero_arg_entrypoint_rejects_extras(tmp_path, capsys):
         """,
     )
     with pytest.raises(SystemExit):
-        _cli.main(["local", str(script), "--foo=bar"])
+        cli.main(["local", str(script), "--foo=bar"])
     err = capsys.readouterr().err
     assert "takes no arguments" in err
 
@@ -466,13 +466,13 @@ def test_repo_root_walks_up_to_git(tmp_path):
     sub.mkdir(parents=True)
     script = sub / "job.py"
     script.write_text("x = 1\n")
-    assert _cli._repo_root_for(script.resolve()) == tmp_path.resolve()
+    assert cli.repo_root_for(script.resolve()) == tmp_path.resolve()
 
 
 def test_repo_root_falls_back_to_script_parent_when_no_git(tmp_path):
     script = tmp_path / "job.py"
     script.write_text("x = 1\n")
-    assert _cli._repo_root_for(script.resolve()) == tmp_path.resolve()
+    assert cli.repo_root_for(script.resolve()) == tmp_path.resolve()
 
 
 # ---------------------------------------------------------------------------
@@ -502,7 +502,7 @@ def test_cli_says_what_is_missing_when_a_cloud_config_is_absent(
     driver ('NoneType' object has no attribute 'machine_type')."""
     script = _write_job(tmp_path, _PLAIN_JOB)
     with pytest.raises(SystemExit):
-        _cli.main([backend, str(script), "--no-log-file"])
+        cli.main([backend, str(script), "--no-log-file"])
     err = capsys.readouterr().err
     assert config_attr in err
     assert "AttributeError" not in err
@@ -512,10 +512,10 @@ def test_cli_says_what_is_missing_when_a_cloud_config_is_absent(
 def test_cli_binds_through_app_bind(tmp_path):
     """One validator, not two. The CLI must not hand-roll _backend again."""
     script = _write_job(tmp_path, _PLAIN_JOB)
-    with mock.patch.object(_cli, "_repo_root_for", side_effect=_cli._repo_root_for):
+    with mock.patch.object(cli, "repo_root_for", side_effect=cli.repo_root_for):
         with mock.patch("runplz.app.App.bind", autospec=True) as bind_mock:
             with pytest.raises((SystemExit, AttributeError, TypeError, RuntimeError)):
-                _cli.main(["local", str(script), "--no-log-file"])
+                cli.main(["local", str(script), "--no-log-file"])
     assert bind_mock.called, "the CLI should delegate backend selection to bind()"
     kwargs = bind_mock.call_args.kwargs
     assert kwargs["outputs_dir"] == "out"
@@ -535,7 +535,7 @@ def test_cli_and_bind_reject_the_same_things(tmp_path, capsys):
     ]
     for argv, expected in cases:
         with pytest.raises(SystemExit):
-            _cli.main([*argv, "--no-log-file"])
+            cli.main([*argv, "--no-log-file"])
         assert expected in capsys.readouterr().err, argv
 
     # And the Python surface raises rather than exiting, with the same rules.
@@ -549,7 +549,38 @@ def test_cli_function_less_script_error_beats_the_generic_bind_error(tmp_path, c
     the actual script, which is more useful."""
     script = _write_job(tmp_path, "from runplz import App\napp = App('t')\n")
     with pytest.raises(SystemExit):
-        _cli.main(["local", str(script), "--no-log-file"])
+        cli.main(["local", str(script), "--no-log-file"])
     err = capsys.readouterr().err
     assert "declares no @app.function" in err
     assert str(script) in err
+
+
+def test_cli_does_not_override_a_script_assigned_repo_root(tmp_path):
+    """`app.repo_root = X` is documented as an override; the CLI must honor it.
+
+    The CLI passes repo_root to bind(), and a bind argument outranks a
+    standing assignment — so passing it unconditionally silently discarded
+    the override on the path almost everyone uses.
+    """
+    monorepo = tmp_path / "monorepo"
+    monorepo.mkdir()
+    jobs = tmp_path / "proj" / "jobs"
+    jobs.mkdir(parents=True)
+    script = jobs / "job.py"
+    script.write_text(
+        "from runplz import App, Image\n"
+        "app = App('t')\n"
+        f"app.repo_root = {str(monorepo)!r}\n"
+        "@app.function(image=Image.from_registry('ubuntu:22.04'))\n"
+        "def go(): pass\n"
+        "@app.local_entrypoint()\n"
+        "def main(): print('SEEN:', app.repo_root)\n"
+    )
+
+    with mock.patch("runplz.backends.local.run"):
+        cli.main(["local", str(script), "--no-log-file"])
+
+    import sys
+
+    loaded = sys.modules["_runplz_user_job"]
+    assert loaded.app.repo_root == monorepo.resolve()

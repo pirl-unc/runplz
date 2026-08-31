@@ -14,6 +14,9 @@ The old `from_dockerfile(...)` path still works (a single-op "include
 dockerfile" image). This is additive.
 """
 
+__all__ = ["Image", "ImageOp"]
+
+
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional, Tuple

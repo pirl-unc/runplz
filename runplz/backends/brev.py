@@ -18,7 +18,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from runplz._selector import Candidate
 from runplz.backends.provisioning import (
     CloudCliError,
     RetryPolicy,
@@ -30,43 +29,98 @@ from runplz.backends.provisioning import (
 from runplz.backends.ssh_common import (
     CLEANUP_SIGNALS as ssh_common_CLEANUP_SIGNALS,
 )
-
-# brev's dispatch runs through ssh_common.run_on_provisioned_vm, so the
-# staging/run helpers below are no longer called from this module — they are
-# internals of dispatch_to_target now. They stay imported because
-# `runplz.backends.brev.<helper>` has been part of this module's surface
-# since 3.5 and the test suite patches them here.
-from runplz.backends.ssh_common import (  # noqa: F401
-    FAILURE_TAIL_LINES,
+from runplz.backends.ssh_common import (
     OrchestratorKilled,
-    _build_image,
-    _check_preconditions,
-    _ensure_docker,
-    _ensure_remote_rsync,
-    _fetch_failure_tail,
-    _prepare_remote_run,
-    _remote_has_nvidia,
-    _run_container_detached,
-    _run_container_mode,
-    _run_native,
-    _stream_and_wait,
-    build_remote_run_manifest,
-    container_running,
-    make_container_name,
-    make_remote_run_context,
     orchestrator_signal_cleanup,
-    raise_for_runtime_cap,
-    render_image_ops_script,
-    rsync_down,
-    rsync_up,
-    run_local,
     run_on_provisioned_vm,
-    ssh_capture,
-    ssh_exec,
-    wait_until_ssh_reachable,
 )
+from runplz.selector import Candidate
 
-__all__ = ["run"]
+# `run` and `list_jobs` are the driver contract the registry calls; the
+# rest is this driver's own testable surface.
+__all__ = [
+    "run",
+    "list_jobs",
+    "dispatch_mode",
+    "BrevInstanceFailed",
+    "CLEANUP_SIGNALS",
+    "BREV_RETRY_POLICY",
+]
+
+# Names that lived on this module from 3.5 until 3.20.0. brev never called
+# them -- they were aliases of the shared layer -- so they are gone from
+# brev's own imports, but they were plain public names on a public module,
+# and a minor bump should not ImportError on `from runplz.backends.brev
+# import rsync_up`. Forwarded with a warning; drop in 4.0.
+# What `runplz.backends.brev` actually re-exported up to 3.19.1, mapped to
+# where each lives now. Eleven were underscore-spelled here (they were
+# ssh_common's private stage names, re-exported for the test suite); those
+# are the ones a downstream `mock.patch("runplz.backends.brev._stream_and_wait")`
+# or `from ... import _prepare_remote_run` would have used, so they are the
+# ones that must keep resolving. Both spellings are accepted: the public one
+# because it is what the name is called now, the underscore one because it
+# is what was actually importable. Drop in 4.0.
+_STAGES_RENAMED_IN_3_20 = (
+    "build_image",
+    "check_preconditions",
+    "ensure_docker",
+    "ensure_remote_rsync",
+    "fetch_failure_tail",
+    "prepare_remote_run",
+    "remote_has_nvidia",
+    "run_container_detached",
+    "run_container_mode",
+    "run_native",
+    "stream_and_wait",
+)
+_MOVED_TO_SSH_COMMON = {
+    # unchanged spelling, moved module
+    name: name
+    for name in (
+        "FAILURE_TAIL_LINES",
+        "build_remote_run_manifest",
+        "container_running",
+        "make_container_name",
+        "make_remote_run_context",
+        "raise_for_runtime_cap",
+        "render_image_ops_script",
+        "rsync_down",
+        "rsync_up",
+        "run_local",
+        "ssh_capture",
+        "ssh_exec",
+        "wait_until_ssh_reachable",
+    )
+}
+# `_build_image` -> `build_image`, and accept the new spelling too.
+_MOVED_TO_SSH_COMMON.update({f"_{name}": name for name in _STAGES_RENAMED_IN_3_20})
+_MOVED_TO_SSH_COMMON.update({name: name for name in _STAGES_RENAMED_IN_3_20})
+
+
+def __getattr__(name):
+    target = _MOVED_TO_SSH_COMMON.get(name)
+    if target is not None:
+        import warnings
+
+        renamed = "" if target == name else f" and was renamed to {target!r}"
+        warnings.warn(
+            f"runplz.backends.brev.{name} moved to runplz.backends.ssh_common "
+            f"in 3.20.0{renamed}; import it from there. "
+            f"This alias goes away in 4.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        from runplz.backends import ssh_common
+
+        return getattr(ssh_common, target)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    # Without this the forwarded names resolve but are invisible to dir(),
+    # inspect.getmembers and tab completion, so anyone auditing what still
+    # works concludes the aliases are already gone.
+    return sorted(set(globals()) | set(_MOVED_TO_SSH_COMMON))
 
 
 # Brev instance names must be slug-ish. Lowercase, ASCII, hyphen-separated.
@@ -520,7 +574,7 @@ def _create_instance(name: str, *, cfg=None, image=None, function=None):
     1. `cfg.instance_type` — explicit user override (if set).
     2. Cheapest match from `brev search` driven by `function`'s resource
        constraints, with the 5% cost-tolerance + availability tiebreaker
-       applied via `runplz._selector.pick_machine`.
+       applied via `runplz.selector.pick_machine`.
 
     Raises only if the picker finds no matches.
     """
@@ -929,7 +983,7 @@ def _pick_instance_types(function, *, n: int = 1, exclude_providers: tuple = ())
     Returns `[]` on no match. When n == 1, returns a single-element list
     (or []).
     """
-    from runplz._selector import pick_machines
+    from runplz.selector import pick_machines
 
     # gpu mode whenever the user named a model OR set any GPU-shaped
     # constraint (min_gpu_memory, multi-GPU). This is what makes

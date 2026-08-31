@@ -24,6 +24,14 @@ True)` mounted at /out, then download after the run via
 `volume.batch_iter(...)` before flipping this on for heavy training.
 """
 
+# `run` and `list_jobs` are the driver contract the registry calls; the
+# rest is this driver's own testable surface.
+__all__ = [
+    "run",
+    "list_jobs",
+]
+
+
 import io
 import json
 import os
@@ -33,7 +41,7 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-from runplz._excludes import DEFAULT_TRANSFER_EXCLUDES
+from runplz.excludes import DEFAULT_TRANSFER_EXCLUDES
 
 _ENTRYPOINT_TEMPLATE = '''\
 """Generated Modal entrypoint for runplz. Do not edit."""
@@ -211,9 +219,7 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
             "Modal backend requires `pip install modal` and `modal setup` (run once)."
         ) from exc
 
-    repo = app._repo_root
-    if repo is None:
-        raise RuntimeError("App repo_root not set (CLI should have set this).")
+    repo = app.require_repo_root(context="modal.run()")
 
     host_out = (repo / outputs_dir).resolve()
     host_out.mkdir(parents=True, exist_ok=True)
@@ -417,7 +423,7 @@ def _render_modal_image(image, *, repo: Path) -> str:
             flags = "-e " if editable else ""
             # Plumb the shared secret-exclude list into Modal's add_local_dir
             # so `.env` / ssh keys / credentials.json don't get baked into
-            # an image layer and uploaded to Modal. See runplz/_excludes.py.
+            # an image layer and uploaded to Modal. See runplz/excludes.py.
             ignore_list = list(DEFAULT_TRANSFER_EXCLUDES)
             lines.append(
                 f"image = image.add_local_dir({str(local_dir)!r}, "

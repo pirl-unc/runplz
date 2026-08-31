@@ -9,19 +9,25 @@ Intentionally minimal:
 Args passed to .remote(...) must be JSON-serializable. No closures, no locals.
 """
 
+__all__ = [
+    "App",
+    "Function",
+    "repo_root_for",
+    "validate_image_vs_brev_mode",
+    "PRECONDITION_KEYS",
+]
+
+
 import inspect
 import json
+import os
+import warnings
 from pathlib import Path
 from typing import Callable, Optional
 
 from runplz.backends import registry
 from runplz.config import AwsConfig, BrevConfig, GcpConfig, ModalConfig, SshConfig
 from runplz.image import Image
-
-# What backends exist, and what each accepts, is described once in
-# runplz.backends.registry. Kept as a module-level name because the CLI
-# imports it for argparse `choices`.
-_VALID_BACKENDS = registry.names()
 
 
 class Function:
@@ -94,7 +100,7 @@ class Function:
         # rsync_up but *before* bootstrap, so a misprovisioned box (small
         # /dev/shm, full disk, missing GPU) fails fast instead of wasting
         # paid GPU minutes on a doomed run. See runplz/backends/ssh_common.py
-        # `_check_preconditions`. v1 keys: shm_gb, disk_free_gb, gpu_count,
+        # `check_preconditions`. v1 keys: shm_gb, disk_free_gb, gpu_count,
         # gpu_memory_gb. Issue #56.
         self.preconditions = _normalize_preconditions(fn.__name__, preconditions)
         self.name = fn.__name__
@@ -146,12 +152,19 @@ class App:
         self.gcp_config = gcp_config
         self.aws_config = aws_config
         self.functions: dict[str, Function] = {}
-        self._entrypoint: Optional[Callable] = None
+        self.entrypoint: Optional[Callable] = None
 
         # Runtime-populated by the CLI before local_entrypoint fires.
         self._backend: Optional[str] = None
         self._backend_kwargs: dict = {}
-        self._repo_root: Optional[Path] = None
+        # Two values, because three things can set a repo root and they do
+        # not have the same lifetime:
+        #   _repo_root_value    what dispatch uses (per-bind)
+        #   _repo_root_assigned a standing choice made via `app.repo_root = X`
+        # A bind(repo_root=...) argument overrides for that call only; it must
+        # neither erase a standing choice nor survive into the next bind.
+        self._repo_root_value: Optional[Path] = None
+        self._repo_root_assigned: Optional[Path] = None
 
     def function(
         self,
@@ -191,7 +204,7 @@ class App:
 
     def local_entrypoint(self):
         def decorator(fn: Callable) -> Callable:
-            self._entrypoint = fn
+            self.entrypoint = fn
             return fn
 
         return decorator
@@ -263,16 +276,22 @@ class App:
             )
         if not outputs_dir or not str(outputs_dir).strip():
             raise ValueError("outputs_dir must be a non-empty path string.")
-        if not self.functions:
+        # Only needed to *infer* the repo root — with one handed in, or a
+        # standing assignment, there is nothing to locate.
+        if not self.functions and repo_root is None and self._repo_root_assigned is None:
             raise RuntimeError(
                 "App.bind() needs at least one @app.function() declared so we "
-                "can locate the script's repo root."
+                "can locate the script's repo root, or an explicit repo_root."
             )
+        # Recomputed from scratch on every bind, in precedence order, so no
+        # branch can leave a stale value behind from a previous call.
         if repo_root is not None:
-            self._repo_root = repo_root
+            self._repo_root_value = _coerce_repo_root(repo_root, "repo_root")
+        elif self._repo_root_assigned is not None:
+            self._repo_root_value = self._repo_root_assigned
         else:
             any_fn = next(iter(self.functions.values()))
-            self._repo_root = _repo_root_for(Path(any_fn.module_file))
+            self._repo_root_value = repo_root_for(Path(any_fn.module_file))
         self._backend = backend
         self._backend_kwargs = {"outputs_dir": outputs_dir}
         # Which selector each backend takes comes from the registry too, so
@@ -285,6 +304,85 @@ class App:
             self._backend_kwargs["build"] = False
         return self
 
+    @property
+    def repo_root(self) -> Optional[Path]:
+        """Local directory staged to the remote.
+
+        Normally inferred from the job script's location. Assign it to
+        override; the value is resolved to an absolute path, so a string or a
+        relative path is accepted and fails here rather than deep inside
+        dispatch after a box has been paid for.
+        """
+        return self._repo_root_value
+
+    @repo_root.setter
+    def repo_root(self, value) -> None:
+        if value is None:
+            self._repo_root_value = None
+            self._repo_root_assigned = None
+            return
+        resolved = _coerce_repo_root(value, "App.repo_root")
+        self._repo_root_value = resolved
+        # A standing choice: it outlives any single bind(), unlike a
+        # bind(repo_root=...) argument.
+        self._repo_root_assigned = resolved
+
+    @property
+    def _entrypoint(self):
+        """Deprecated alias for :attr:`entrypoint` (renamed in 3.20.0).
+
+        Kept because the failure without it is silent, not loud: a script
+        doing `app._entrypoint = driver` would leave `entrypoint` unset, and
+        the CLI would synthesize a default from the single @app.function and
+        dispatch *that* instead — a different job, no error.
+        """
+        return self.entrypoint
+
+    @_entrypoint.setter
+    def _entrypoint(self, value) -> None:
+        warnings.warn(
+            "App._entrypoint was renamed to App.entrypoint in 3.20.0; "
+            "assign that instead. This alias goes away in 4.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.entrypoint = value
+
+    @property
+    def _repo_root(self) -> Optional[Path]:
+        """Deprecated alias for :attr:`repo_root` (renamed in 3.20.0).
+
+        Assigning the old name used to write the field directly, which now
+        also means skipping the validation the public setter added.
+        """
+        return self._repo_root_value
+
+    @_repo_root.setter
+    def _repo_root(self, value) -> None:
+        warnings.warn(
+            "App._repo_root was renamed to App.repo_root in 3.20.0; assign "
+            "that instead. This alias goes away in 4.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.repo_root = value
+
+    def require_repo_root(self, *, context: str = "dispatch") -> Path:
+        """Return `repo_root`, or raise if it is unset.
+
+        One definition of the invariant, called from `_dispatch` and from each
+        backend's `run()`. It used to be re-derived and re-worded in four
+        places, so the same state produced different guidance depending on
+        which entry point you came through.
+        """
+        if self._repo_root_value is None:
+            raise RuntimeError(
+                f"{context} needs App.repo_root, which is not set. Dispatch "
+                "through the `runplz` CLI or call App.bind(...), either of "
+                "which sets it."
+            )
+        return self._repo_root_value
+
     def _dispatch(self, function: Function, args: list, kwargs: dict):
         if self._backend is None:
             raise RuntimeError(
@@ -295,7 +393,25 @@ class App:
                 f"(For in-process execution without a backend, use "
                 f"{function.name}.local(...) instead.)"
             )
+        # registry.load() first: an unknown backend is the more specific
+        # error, and load() only imports a module -- nothing is provisioned.
         module = registry.load(self._backend)
+        # Checked here, not in a backend: every backend funnels through this
+        # method, and the provisioning ones would otherwise create and pay for
+        # a box before noticing that no repo could be staged to it.
+        self.require_repo_root(context=f"{function.name}.remote(...)")
+        # The backends compute the script's path *relative to* repo_root to
+        # find it on the remote. If it is not underneath, `relative_to` raises
+        # -- but only after a provisioning backend has created a paid box,
+        # waited for ssh and rsynced the whole tree up. Check it here instead.
+        script = Path(function.module_file).resolve()
+        if not script.is_relative_to(self.repo_root):
+            raise ValueError(
+                f"App.repo_root ({self.repo_root}) does not contain "
+                f"{function.name}'s script ({script}). runplz stages repo_root "
+                f"to the remote and locates the script inside it, so the script "
+                f"must live under it."
+            )
         return module.run(self, function, args, kwargs, **self._backend_kwargs)
 
 
@@ -309,7 +425,27 @@ def _ensure_json_safe(args, kwargs):
         ) from exc
 
 
-def _repo_root_for(script_path: Path) -> Path:
+def _coerce_repo_root(value, label: str) -> Path:
+    """Resolve a repo root to an absolute directory, or fail here.
+
+    `bind()` already validates `outputs_dir` this way. Without it,
+    `repo_root = ""` resolves to the process CWD and silently rsyncs whatever
+    the caller happened to be sitting in — a home directory, or `/` — up to a
+    remote box, and a typo'd path is only noticed after provisioning.
+    """
+    # os.fspath so a PathLike is checked too, not only `str`. Note the limit:
+    # `Path("")` is already `Path(".")` at construction, so it is
+    # indistinguishable from a deliberate `"."` here and resolves to the CWD.
+    # Only the raw empty/whitespace string can be caught.
+    if not os.fspath(value).strip():
+        raise ValueError(f"{label} must be a non-empty path")
+    path = Path(value).resolve()
+    if not path.is_dir():
+        raise ValueError(f"{label} must be an existing directory, got {path}")
+    return path
+
+
+def repo_root_for(script_path: Path) -> Path:
     for parent in [script_path.parent, *script_path.parents]:
         if (parent / ".git").exists():
             return parent
@@ -387,7 +523,7 @@ def _validate_resources(
 
 # Precondition keys we know how to probe. Adding a new key is a two-place
 # change: list it here so user-supplied values are validated, then teach
-# `_check_preconditions` how to probe and compare it.
+# `check_preconditions` how to probe and compare it.
 PRECONDITION_KEYS = ("shm_gb", "disk_free_gb", "gpu_count", "gpu_memory_gb")
 
 

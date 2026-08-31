@@ -190,7 +190,7 @@ def test_the_create_paths_ask_for_retries(tmp_path):
         name = "vision"
         gcp_config = GcpConfig(project="p", zone="us-central1-a")
         aws_config = AwsConfig(region="us-east-1", key_name="k")
-        _repo_root = tmp_path
+        repo_root = tmp_path
 
     class Fn:
         name = "train"
@@ -268,7 +268,7 @@ def test_gcp_treats_an_already_existing_box_as_created(tmp_path, capsys):
     class App:
         name = "vision"
         gcp_config = GcpConfig(project="p", zone="us-central1-a")
-        _repo_root = tmp_path
+        repo_root = tmp_path
 
     class Fn:
         name = "train"
