@@ -846,12 +846,30 @@ has, or push to S3 at the end of the function.
 pytest tests/
 ```
 
-~250 offline tests — DSL rendering, config validation across all four
-backends, Modal GPU-label / count-suffix translation, instance picker
-with cost-tolerance + availability tiebreaker, CLI guards + entrypoint
-arg pass-through, SSH spec-mismatch probe, Brev lifecycle (auto-start,
-ephemeral, on_finish). All backends are mocked — no cloud calls.
-CI runs on Python 3.10 / 3.11 / 3.12 via GitHub Actions.
+~880 tests, all offline and all free. CI runs Python 3.10 / 3.11 / 3.12
+via GitHub Actions. Three tiers:
+
+**Unit / mocked.** The bulk of it: DSL rendering, config validation across
+every backend, GPU-label translation, the instance picker's
+cost-tolerance and availability tiebreak, CLI guards and entrypoint
+argument pass-through, Brev lifecycle. `subprocess` is mocked.
+
+**Cloud lifecycle against stub CLIs** (`test_e2e_fake_cloud.py`). Real
+`subprocess` calls to stub `gcloud` / `aws` executables the test installs
+on `PATH`, so argv, JSON parsing, exit-code handling, retry classification
+and teardown are checked against something that can disagree with the
+author — the mocked tier can only confirm what the author already believed.
+
+**End-to-end over real ssh** (`test_e2e_localhost.py`). The test starts its
+own unprivileged `sshd` on loopback, so no Remote Login, no CI-only
+service, no configuration. Real staging, rsync, detached launch, kill and
+fetch-back. This is the tier that catches generated shell that parses but
+does not work.
+
+Nothing in any tier can spend money: `conftest.py` intercepts
+`subprocess.run` and refuses `brev` / `gcloud` / `aws` / `ssh` / `rsync`
+unless the test carries the matching `live_*` marker, or the binary
+resolves inside a stub directory the test created itself.
 
 ## License
 
