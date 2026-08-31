@@ -183,7 +183,9 @@ def test_kill_actually_stops_a_running_remote_process(target, opts, remote_run, 
     )
 
     before = sc.inspect_detached_run(target, files["pid_file"], ssh_opts=opts)
-    assert before.running, "the process should be alive before the kill"
+    assert before.process_state is sc.DetachedProcessState.RUNNING, (
+        f"expected a live process before the kill, got {before.process_state}"
+    )
 
     kill_script = sc.build_kill_command(
         remote_run.meta_shell,
@@ -193,7 +195,9 @@ def test_kill_actually_stops_a_running_remote_process(target, opts, remote_run, 
     sc.ssh_capture(target, kill_script, ssh_opts=opts)
 
     after = sc.inspect_detached_run(target, files["pid_file"], ssh_opts=opts)
-    assert not after.running, "the process survived the kill"
+    assert after.process_state is not sc.DetachedProcessState.RUNNING, (
+        f"the process survived the kill: {after.process_state}"
+    )
 
 
 def test_rsync_down_brings_outputs_back(tmp_path, target, opts, remote_run):
