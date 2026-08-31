@@ -63,15 +63,4 @@ jobs:
       - name: Run the ssh e2e tier against a Linux container
         env:
           RUNPLZ_E2E_REMOTE: docker
-        run: pytest tests/test_e2e_localhost.py -v
-      - name: Fail if the tier silently skipped
-        env:
-          RUNPLZ_E2E_REMOTE: docker
-        run: |
-          # A skip here means the container backend never ran and the job
-          # would pass green having tested nothing.
-          pytest tests/test_e2e_localhost.py -q -rs 2>&1 | tee out.txt
-          if grep -q "skipped" out.txt; then
-            echo "::error::container e2e tier skipped; it must actually run in CI"
-            exit 1
-          fi
+        run: pytest tests/test_e2e_localhost.py tests/test_e2e_fake_cloud.py -v

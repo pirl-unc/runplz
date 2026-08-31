@@ -22,47 +22,25 @@ import uuid
 from pathlib import Path
 
 import pytest
-from sshd_harness import select_backend
 
 from runplz.backends import ssh_common as sc
 
 pytestmark = pytest.mark.live_ssh
 
 
-@pytest.fixture(scope="module")
-def sshd(tmp_path_factory):
-    """An ssh-reachable box: a local sshd, or a Linux container.
-
-    `RUNPLZ_E2E_REMOTE` chooses (`local` / `docker` / `auto`). The tests
-    below do not care which they got -- they address it through `target`
-    and `opts` -- so the container variant needs no test changes, and the
-    Darwin skip resolves itself when the remote is a container.
-    """
-    root = tmp_path_factory.mktemp("sshd")
-    server, unavailable = select_backend(root)
-    if server is None:
-        pytest.skip(unavailable)
-    try:
-        server.start()
-    except Exception as exc:  # pragma: no cover - environment-dependent
-        pytest.skip(f"could not start {type(server).__name__}: {exc}")
-    yield server
-    server.stop()
-
-
 @pytest.fixture
-def target(sshd):
+def target(sshd_server):
     """Address the box exactly as the code under test will.
 
     Includes the user when the backend needs one — the container's only
     account is root, and `SshOptions` has no user field.
     """
-    return sshd.target
+    return sshd_server.target
 
 
 @pytest.fixture
-def opts(sshd):
-    return sc.SshOptions(port=sshd.port, identity_file=str(sshd.identity))
+def opts(sshd_server):
+    return sshd_server.ssh_options()
 
 
 @pytest.fixture
@@ -235,7 +213,7 @@ def test_rsync_down_brings_outputs_back(tmp_path, target, opts, remote_run):
 
 def test_preconditions_probe_parses_a_real_machine(target, opts):
     """`parse_probe_sections` against real uname/df output, not a fixture."""
-    sc.check_preconditions(target, {}, ssh_opts=opts)  # no requirements: must not raise
+    sc.check_preconditions(target, {"disk_free_gb": 0.001}, ssh_opts=opts)
 
 
 def test_wait_until_ssh_reachable_succeeds_against_a_live_host(target, opts):

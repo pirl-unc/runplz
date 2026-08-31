@@ -6,7 +6,7 @@ end-to-end tests do not depend on Remote Login being enabled, on a
 CI-only service, or on any state outside a temp directory.
 
 Everything lives in that temp dir: host key, client key, authorized_keys,
-config, pid, log. Nothing touches ~/.ssh, and the daemon binds to
+known_hosts, config, pid, log. Nothing touches ~/.ssh, and the daemon binds to
 127.0.0.1 on an ephemeral port so it is not reachable off the machine.
 """
 
@@ -56,6 +56,17 @@ class LocalSshd:
         self.root = root
         self.port = _free_port()
         self.identity = root / "id"
+        self.known_hosts = root / "known_hosts"
+
+    def ssh_options(self):
+        """Production options pointed entirely at the harness temp directory."""
+        from runplz.backends.ssh_common import SshOptions
+
+        return SshOptions(
+            port=self.port,
+            identity_file=str(self.identity),
+            known_hosts_file=str(self.known_hosts),
+        )
 
     def start(self) -> "LocalSshd":
         _keygen(self.root / "hostkey")
@@ -175,6 +186,7 @@ class DockerSshd:
     def __init__(self, root: Path):
         self.root = root
         self.identity = root / "id"
+        self.known_hosts = root / "known_hosts"
         self._image = None
         self._container = None
         self.host = "127.0.0.1"
@@ -206,6 +218,7 @@ class DockerSshd:
 
     _await_ready = LocalSshd._await_ready
     probe = LocalSshd.probe
+    ssh_options = LocalSshd.ssh_options
 
     def ssh_args(self) -> list:
         return [
@@ -243,6 +256,8 @@ def select_backend(root: Path):
     Returns (backend, reason_if_unavailable).
     """
     mode = os.environ.get("RUNPLZ_E2E_REMOTE", "auto").lower()
+    if mode not in {"auto", "local", "docker"}:
+        raise ValueError(f"RUNPLZ_E2E_REMOTE must be auto, local, or docker; got {mode!r}")
     if mode == "local":
         return (LocalSshd(root), None) if find_sshd() else (None, "no sshd binary")
     if mode == "docker":

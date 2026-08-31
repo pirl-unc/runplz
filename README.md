@@ -690,16 +690,16 @@ Depends on the backend:
 ## Install
 
 ```bash
-pip install runplz                 # core (local + brev + ssh)
-pip install 'runplz[modal]'        # add Modal support
+pip install runplz                 # includes the Modal Python SDK
 ```
 
-The core dependency set is empty. Backends shell out to system CLIs:
+The Python package includes the Modal SDK. Backends also shell out to
+system-installed CLIs:
 
 - `local` → `docker`
 - `brev`  → `brev`, `docker` (or skipped in `mode="container"`), `ssh`, `rsync`
 - `ssh`   → `ssh`, `rsync` (docker on the remote if `use_docker=True`)
-- `modal` → `modal>=1.1,<2` Python package
+- `modal` → `modal>=1.1,<2` Python package (included automatically)
 
 ## Data in and out
 

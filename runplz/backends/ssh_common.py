@@ -255,6 +255,11 @@ class SshOptions:
     # agent-loaded or named in a Host block — and a Host block cannot be
     # written in advance because the instance IP does not exist yet.
     identity_file: Optional[str] = None
+    # Override OpenSSH's known-hosts database. Primarily useful for isolated
+    # harnesses, where accepting a throwaway host key must not mutate the
+    # developer's ~/.ssh/known_hosts. Kept in the same object so ssh and
+    # rsync cannot accidentally use different trust stores.
+    known_hosts_file: Optional[str] = None
 
     @classmethod
     def coerce(cls, value) -> "SshOptions":
@@ -281,6 +286,11 @@ class SshOptions:
                 "-o",
                 "IdentitiesOnly=yes",
             ]
+        if self.known_hosts_file:
+            opts += [
+                "-o",
+                f"UserKnownHostsFile={os.path.expanduser(str(self.known_hosts_file))}",
+            ]
         return opts
 
     def to_dict(self) -> dict:
@@ -292,6 +302,8 @@ class SshOptions:
             out["port"] = int(self.port)
         if self.identity_file:
             out["identity_file"] = str(self.identity_file)
+        if self.known_hosts_file:
+            out["known_hosts_file"] = str(self.known_hosts_file)
         return out
 
     @classmethod
@@ -300,6 +312,7 @@ class SshOptions:
         return cls(
             port=data.get("port"),
             identity_file=data.get("identity_file"),
+            known_hosts_file=data.get("known_hosts_file"),
         )
 
 

@@ -1,158 +1,230 @@
-"""Are the machine shapes runplz emits real?
+"""Provider catalogues and the production resolver must agree.
 
-Every other cloud test asserts that runplz passes the argv its author
-intended. None of them can tell you whether the *values* in that argv
-exist, because a mock accepts anything and so does a stub. That is not
-hypothetical: `p3.xlarge` shipped in this repo's shape table and does not
-exist (the smallest p3 is `p3.2xlarge`), and it would have failed at
-`run-instances` time — after the retry budget, on a real account.
-
-`botocore` bundles the EC2 instance-type catalogue as a static enum in its
-service model, so this check needs no credentials, no account, no network
-and no server. It is a dev-only dependency; runplz stays stdlib-only.
-
-Note what moto does *not* give you here: driving `moto_server` with the
-real `aws` CLI, `--instance-type not-a-real-type` is accepted. An API
-emulator models the protocol, not the catalogue.
+These tests are generated from the same capability records the drivers use.
+That keeps the useful invariant central: every selected machine exists in the
+catalogue and satisfies all requested resources. Adding a shape expands the
+test surface automatically rather than requiring another hand-written case.
 """
 
 import re
+from types import SimpleNamespace
 
+import botocore.session
 import pytest
 
-from runplz.backends.aws import _cpu_size_name
-from runplz.backends.provisioning import AWS_GPUS, GCP_GPUS
-
-botocore = pytest.importorskip("botocore.session", reason="botocore is a dev dependency")
+from runplz.backends import aws, gcp
+from runplz.backends.provisioning import (
+    AWS_CPU_SHAPES,
+    AWS_GPUS,
+    GCP_CPU_SHAPES,
+    GCP_GPUS,
+    CloudCliError,
+)
 
 
 def _ec2_enum(shape_name: str) -> set:
-    model = botocore.get_session().get_service_model("ec2")
+    model = botocore.session.get_session().get_service_model("ec2")
     return set(model.shape_for(shape_name).enum)
 
 
 @pytest.fixture(scope="module")
 def real_instance_types() -> set:
     types = _ec2_enum("InstanceType")
-    # Guard the guard: if botocore ever stops shipping the enum, this test
-    # must fail loudly rather than pass against an empty set.
+    # Guard the guard: a missing botocore enum must fail, not vacuously pass.
     assert len(types) > 500, f"implausibly small instance-type catalogue: {len(types)}"
     return types
 
 
-@pytest.mark.parametrize(
-    "label, count, shape",
-    [
-        (label, count, shape)
-        for label, entry in AWS_GPUS.items()
-        for count, shape in (entry.shapes or {}).items()
-    ],
-)
-def test_every_aws_gpu_shape_is_a_real_instance_type(label, count, shape, real_instance_types):
-    assert shape in real_instance_types, (
-        f"AWS_GPUS[{label!r}] maps {count} GPU(s) to {shape!r}, which is not an EC2 "
-        f"instance type. This fails at run-instances on a real account."
+def _fn(*, gpu=None, min_gpus=None, min_cpu=None, min_memory=None):
+    return SimpleNamespace(
+        gpu=gpu,
+        min_gpus=min_gpus,
+        min_cpu=min_cpu,
+        min_memory=min_memory,
+        min_gpu_memory=None,
     )
+
+
+AWS_CFG = SimpleNamespace(instance_type=None)
+GCP_CFG = SimpleNamespace(machine_type=None, accelerator=None)
+
+
+def _offering_for_name(offerings, name, gpus=0):
+    matches = [item for item in offerings if item.name == name and item.gpus == gpus]
+    assert len(matches) == 1, f"catalogue does not uniquely describe {name} with {gpus} GPUs"
+    return matches[0]
+
+
+def test_every_aws_instance_type_is_real(real_instance_types):
+    expected = {item.name for item in AWS_CPU_SHAPES}
+    expected.update(item.name for entry in AWS_GPUS.values() for item in entry.offerings)
+    missing = expected - real_instance_types
+    assert not missing, f"runplz would emit nonexistent EC2 types: {sorted(missing)}"
+
+
+def test_every_aws_family_prefix_is_real(real_instance_types):
+    """The family is also used to recognize explicitly pinned GPU machines."""
+    families = {item.split(".", 1)[0] for item in real_instance_types}
+    missing = {entry.family for entry in AWS_GPUS.values()} - families
+    assert not missing
+
+
+@pytest.mark.parametrize("offering", AWS_CPU_SHAPES, ids=lambda item: item.name)
+def test_aws_cpu_resolver_never_underprovisions(offering):
+    picked = aws.resolve_instance_type(
+        AWS_CFG,
+        _fn(min_cpu=offering.vcpus, min_memory=offering.memory_gb),
+    )
+    selected = _offering_for_name(AWS_CPU_SHAPES, picked)
+    assert selected.satisfies(
+        min_cpu=offering.vcpus,
+        min_memory=offering.memory_gb,
+        gpus=0,
+    )
+
+
+AWS_GPU_OFFERINGS = tuple(
+    (label, offering) for label, entry in AWS_GPUS.items() for offering in entry.offerings
+)
+
+
+@pytest.mark.parametrize(
+    "label,offering",
+    AWS_GPU_OFFERINGS,
+    ids=lambda value: value.name if hasattr(value, "name") else value,
+)
+def test_aws_gpu_resolver_never_underprovisions(label, offering):
+    picked = aws.resolve_instance_type(
+        AWS_CFG,
+        _fn(
+            gpu=label,
+            min_gpus=offering.gpus,
+            min_cpu=offering.vcpus,
+            min_memory=offering.memory_gb,
+        ),
+    )
+    selected = _offering_for_name(AWS_GPUS[label].offerings, picked, offering.gpus)
+    assert selected.satisfies(
+        min_cpu=offering.vcpus,
+        min_memory=offering.memory_gb,
+        gpus=offering.gpus,
+    )
+
+
+def test_aws_cpu_resolver_rejects_more_than_the_catalogue_can_satisfy():
+    largest = max(AWS_CPU_SHAPES, key=lambda item: item.vcpus)
+    with pytest.raises(CloudCliError, match="no known CPU-only machine"):
+        aws.resolve_instance_type(AWS_CFG, _fn(min_cpu=largest.vcpus + 1))
 
 
 @pytest.mark.parametrize("label", sorted(AWS_GPUS))
-def test_every_aws_family_prefix_is_real(label, real_instance_types):
-    """The family is used to answer 'does this instance type have a GPU?'."""
-    family = AWS_GPUS[label].family
-    assert any(t.split(".", 1)[0] == family for t in real_instance_types), (
-        f"AWS_GPUS[{label!r}].family = {family!r} matches no real instance type"
+def test_aws_gpu_resolver_rejects_unknown_counts_and_oversized_minima(label):
+    entry = AWS_GPUS[label]
+    missing_count = next(
+        count for count in range(1, max(entry.gpu_counts) + 2) if count not in entry.gpu_counts
     )
+    with pytest.raises(CloudCliError, match="GPU counts"):
+        aws.resolve_instance_type(AWS_CFG, _fn(gpu=label, min_gpus=missing_count))
 
-
-class _Fn:
-    """Minimal stand-in for a Function, which is all `_cpu_size_name` reads."""
-
-    def __init__(self, min_cpu=None, min_memory=None):
-        self.min_cpu = min_cpu
-        self.min_memory = min_memory
-
-
-@pytest.mark.parametrize(
-    "fn",
-    [_Fn()]
-    + [_Fn(min_cpu=c) for c in (1, 2, 3, 4, 8, 16, 32, 48, 64, 96, 200)]
-    + [_Fn(min_memory=m) for m in (1, 8, 16, 64, 128, 256, 512, 2048)],
-    ids=lambda f: f"cpu={f.min_cpu},mem={f.min_memory}",
-)
-def test_every_cpu_only_instance_type_runplz_can_pick_is_real(fn, real_instance_types):
-    """The CPU path builds `m6i.<size>` by string concatenation.
-
-    A size name that does not exist in the m6i family produces a plausible
-    string that EC2 rejects, so drive the sizer across its whole range
-    rather than trusting the table it reads.
-    """
-    picked = f"m6i.{_cpu_size_name(fn)}"
-    assert picked in real_instance_types, (
-        f"min_cpu={fn.min_cpu} min_memory={fn.min_memory} picks {picked!r}, "
-        f"which is not an EC2 instance type"
+    count = entry.gpu_counts[0]
+    largest = max(
+        (item for item in entry.offerings if item.gpus == count),
+        key=lambda item: item.vcpus,
     )
+    with pytest.raises(CloudCliError, match="no known"):
+        aws.resolve_instance_type(
+            AWS_CFG,
+            _fn(gpu=label, min_gpus=count, min_cpu=largest.vcpus + 1),
+        )
 
 
-def test_aws_gpu_counts_are_plausible_for_the_family():
-    """Structural check on the count -> shape mapping.
-
-    botocore's model carries the instance-type *names* but not their GPU
-    counts (that needs `describe-instance-types`, which needs an account),
-    so this cannot verify that `g5.12xlarge` really has 4 GPUs. It can
-    verify the table is internally consistent: counts ascending, shapes
-    distinct, and every shape inside its declared family.
-    """
-    for label, entry in AWS_GPUS.items():
-        shapes = entry.shapes or {}
-        counts = list(shapes)
-        assert counts == sorted(counts), f"{label}: GPU counts are not ascending"
-        assert len(set(shapes.values())) == len(shapes), f"{label}: duplicate shapes"
-        for count, shape in shapes.items():
-            assert shape.split(".", 1)[0] == entry.family, (
-                f"{label}: {shape!r} is not in the declared family {entry.family!r}"
-            )
-
-
-# ---------------------------------------------------------------------------
-# GCP has no offline equivalent, so this is what can honestly be checked.
-
-# `family-series-size`, e.g. n2-standard-8, a2-highgpu-1g, g2-standard-24.
+# GCE has no bundled offline machine-type enum. Validate the registry's
+# structure, then drive every record through the real resolver.
 GCE_MACHINE_TYPE_RE = re.compile(r"[a-z]\d*[a-z]*-[a-z]+-\d+[a-z]?")
-# GCE accelerator names, e.g. nvidia-tesla-t4, nvidia-l4, nvidia-h100-80gb.
 GCE_ACCELERATOR_RE = re.compile(r"nvidia-[a-z0-9-]+")
 
 
-def test_gcp_shapes_are_well_formed():
-    """GCE machine types cannot be validated against a catalogue.
-
-    `gcloud emulators` ships only firestore and spanner, and
-    `google-cloud-compute` models MachineType as a *resource message*, not
-    an enum -- machine types are per-zone API resources with no bundled
-    list. So unlike AWS, a wrong-but-plausible GCE machine type cannot be
-    caught offline. This checks the format only, and that is the honest
-    limit of it.
-    """
+def test_gcp_catalogue_is_well_formed():
     for label, entry in GCP_GPUS.items():
-        assert GCE_ACCELERATOR_RE.fullmatch(entry.accelerator), (
-            f"GCP_GPUS[{label!r}].accelerator = {entry.accelerator!r} is not a GCE accelerator name"
-        )
-        for count, shape in (entry.shapes or {}).items():
-            assert GCE_MACHINE_TYPE_RE.fullmatch(shape), (
-                f"GCP_GPUS[{label!r}][{count}] = {shape!r} is not a well-formed GCE machine type"
-            )
-
-
-def test_gcp_bundled_gpu_shapes_encode_their_count():
-    """a2/a3/g2 machine types carry the GPU count in the name.
-
-    `a2-highgpu-4g` means four GPUs, so the table key and the name must
-    agree -- a mismatch here silently provisions the wrong-sized box.
-    """
-    for label, entry in GCP_GPUS.items():
-        for count, shape in (entry.shapes or {}).items():
-            suffix = shape.rsplit("-", 1)[-1]
+        assert GCE_ACCELERATOR_RE.fullmatch(entry.accelerator), label
+        assert entry.offerings, label
+        for offering in entry.offerings:
+            assert GCE_MACHINE_TYPE_RE.fullmatch(offering.name), (label, offering)
+            assert offering.vcpus > 0 and offering.memory_gb > 0 and offering.gpus > 0
+            suffix = offering.name.rsplit("-", 1)[-1]
             if suffix.endswith("g") and suffix[:-1].isdigit():
-                assert int(suffix[:-1]) == count, (
-                    f"GCP_GPUS[{label!r}] maps {count} GPU(s) to {shape!r}, "
-                    f"whose name says {suffix[:-1]}"
-                )
+                assert int(suffix[:-1]) == offering.gpus, (label, offering)
+
+
+@pytest.mark.parametrize("offering", GCP_CPU_SHAPES, ids=lambda item: item.name)
+def test_gcp_cpu_resolver_never_underprovisions(offering):
+    picked, accelerator = gcp.resolve_shape(
+        GCP_CFG,
+        _fn(min_cpu=offering.vcpus, min_memory=offering.memory_gb),
+    )
+    selected = _offering_for_name(GCP_CPU_SHAPES, picked)
+    assert accelerator is None
+    assert selected.satisfies(
+        min_cpu=offering.vcpus,
+        min_memory=offering.memory_gb,
+        gpus=0,
+    )
+
+
+GCP_GPU_OFFERINGS = tuple(
+    (label, offering) for label, entry in GCP_GPUS.items() for offering in entry.offerings
+)
+
+
+@pytest.mark.parametrize(
+    "label,offering",
+    GCP_GPU_OFFERINGS,
+    ids=lambda value: value.name if hasattr(value, "name") else value,
+)
+def test_gcp_gpu_resolver_never_underprovisions(label, offering):
+    picked, accelerator = gcp.resolve_shape(
+        GCP_CFG,
+        _fn(
+            gpu=label,
+            min_gpus=offering.gpus,
+            min_cpu=offering.vcpus,
+            min_memory=offering.memory_gb,
+        ),
+    )
+    selected = _offering_for_name(GCP_GPUS[label].offerings, picked, offering.gpus)
+    assert selected.satisfies(
+        min_cpu=offering.vcpus,
+        min_memory=offering.memory_gb,
+        gpus=offering.gpus,
+    )
+    if GCP_GPUS[label].attached:
+        assert accelerator == f"type={GCP_GPUS[label].accelerator},count={offering.gpus}"
+    else:
+        assert accelerator is None
+
+
+def test_gcp_cpu_resolver_rejects_more_than_the_catalogue_can_satisfy():
+    largest = max(GCP_CPU_SHAPES, key=lambda item: item.memory_gb)
+    with pytest.raises(CloudCliError, match="no known CPU-only machine"):
+        gcp.resolve_shape(GCP_CFG, _fn(min_memory=largest.memory_gb + 1))
+
+
+@pytest.mark.parametrize("label", sorted(GCP_GPUS))
+def test_gcp_gpu_resolver_rejects_unknown_counts_and_oversized_minima(label):
+    entry = GCP_GPUS[label]
+    missing_count = next(
+        count for count in range(1, max(entry.gpu_counts) + 2) if count not in entry.gpu_counts
+    )
+    with pytest.raises(CloudCliError, match="GPU counts"):
+        gcp.resolve_shape(GCP_CFG, _fn(gpu=label, min_gpus=missing_count))
+
+    count = entry.gpu_counts[0]
+    largest = max(
+        (item for item in entry.offerings if item.gpus == count),
+        key=lambda item: item.memory_gb,
+    )
+    with pytest.raises(CloudCliError, match="no known"):
+        gcp.resolve_shape(
+            GCP_CFG,
+            _fn(gpu=label, min_gpus=count, min_memory=largest.memory_gb + 1),
+        )

@@ -1294,3 +1294,62 @@ Both tiers mutation-tested rather than assumed:
   a broken sshd cannot produce a green run
 
 882 passed, 3 skipped, 32s.
+
+---
+
+## 2026-08-31 PR #94 follow-up — capability selection + executable contracts
+
+Branch: `catalogue-and-container-tier` (off `main` @ `2414202`)
+
+### Acceptance contract
+
+- [ ] A cloud-selected machine either satisfies every declared CPU, RAM, GPU model and GPU-count
+      minimum or fails locally before invoking a billed CLI. No selector silently clamps an
+      unsatisfiable request to its largest known shape.
+- [ ] AWS and GCP resolve through one capability-aware selector and one offering model. Tests are
+      generated from that model and call the production resolver; they do not rebuild production
+      names or enumerate hand-picked boundary inputs.
+- [ ] Every AWS-emitted instance type is checked against botocore's offline EC2 catalogue. The
+      catalogue is required in the dev suite and cannot silently disappear behind a module skip.
+- [ ] Fake cloud executables reject missing, duplicate and unknown arguments, derive responses from
+      inputs, and enforce lifecycle state. One schema/state-machine implementation backs both
+      providers; per-provider data contains only vocabulary and response shapes.
+- [ ] At least one AWS and one GCP lifecycle reaches the real SSH endpoint supplied by the shared
+      harness, proving provider output -> target/user/options -> SSH readiness -> teardown.
+- [ ] The live precondition test sends a real requirement and proves the remote probe/parser ran.
+      Cloud assertions cannot pass vacuously when an expected command was never called.
+- [ ] Live SSH uses an isolated temporary known-hosts file; the tier does not mutate `~/.ssh`.
+      Explicit Docker mode fails rather than skips, invalid backend modes are rejected, and CI runs
+      the container tier once.
+- [ ] Coverage measures branches and has a ratcheted floor. Remaining exclusions are limited to
+      compatibility entrypoints or genuinely platform-only defensive paths and are documented.
+
+### Implementation plan
+
+- [x] Resolve resource under-provisioning and false-positive integration coverage in this branch.
+- [x] Introduce immutable machine offerings with CPU/RAM/GPU capabilities and a shared selector.
+- [x] Migrate AWS/GCP CPU, bundled-GPU and attachable-GPU resolution to the shared selector.
+- [x] Replace catalogue spot cases with registry-generated existence/capacity/monotonicity tests.
+- [x] Replace permissive fake routes with strict declarative command schemas and duplicate/unknown argument checks.
+- [x] Add a narrow shared lifecycle dispatch seam and drive both providers into a real sshd.
+- [x] Repair vacuous assertions and isolate SSH host-key state.
+- [x] Enable branch coverage/fail-under and make the explicit container tier fail on setup failure.
+- [x] Mutation-probe invalid family names, undersized fallback, missing provider handoff, missing
+      precondition probe, and skipped container execution.
+- [ ] Run `./format.sh`, `./lint.sh`, `./test.sh`; inspect branch coverage and CI.
+
+### Review
+
+- Pending.
+## 2026-08-31 PR #94 follow-up — test contracts and resource selection
+
+- [x] Add capability-aware shape selection; reject requests larger than known offerings
+- [x] Drive catalogue tests through public resolvers and assert resource minima
+- [x] Tighten fake cloud executable validation and connect provisioning to live SSH
+- [x] Make the live precondition test actually probe and isolate SSH known-hosts state
+- [x] Make optional test dependencies and CI skip behavior fail loudly
+- [x] Bump version and run format/lint/test/branch-coverage checks
+
+### Review
+
+Implemented; verification is recorded in the final review below.
