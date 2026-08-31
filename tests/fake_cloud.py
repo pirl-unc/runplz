@@ -122,6 +122,7 @@ import json, os, sys
 
 LOG = {log!r}
 STATE = LOG + ".state"
+TOKENS = LOG + ".tokens"
 ROUTES = {routes!r}
 FAIL_TIMES = {fail_times!r}
 FAIL_MESSAGE = {fail_message!r}
@@ -137,6 +138,11 @@ try:
         state = json.load(fh)
 except FileNotFoundError:
     state = {{}}
+try:
+    with open(TOKENS) as fh:
+        tokens = json.load(fh)
+except FileNotFoundError:
+    tokens = {{}}
 
 with open(LOG, "a") as fh:
     fh.write(json.dumps({{"argv": argv}}) + "\\n")
@@ -188,7 +194,11 @@ def option_value(name):
         return None
 
 if key == ("ec2", "run-instances"):
-    instance_id = "i-fake0123456789"
+    token = option_value("--client-token")
+    instance_id = tokens.get(token)
+    if instance_id is None:
+        instance_id = "i-fake" + str(len(tokens) + 1).zfill(10)
+        tokens[token] = instance_id
     state[instance_id] = "running"
 elif key in (("ec2", "describe-instances"), ("ec2", "wait", "instance-running"),
              ("ec2", "terminate-instances"), ("ec2", "stop-instances")):
@@ -214,6 +224,8 @@ elif (
 
 with open(STATE, "w") as fh:
     json.dump(state, fh)
+with open(TOKENS, "w") as fh:
+    json.dump(tokens, fh)
 route_name = "/".join(key)
 missing = sorted(REQUIRED_OPTIONS.get("{name}", {{}}).get(route_name, set()) - option_names)
 if missing:
@@ -247,7 +259,10 @@ if "{name}" == "gcloud" and route_name == "compute/config-ssh":
 if "/".join(key) in MALFORMED:
     sys.stdout.write(MALFORMED["/".join(key)])
 else:
-    sys.stdout.write(ROUTES[key])
+    if key == ("ec2", "run-instances"):
+        sys.stdout.write(json.dumps({{"Instances": [{{"InstanceId": instance_id}}]}}))
+    else:
+        sys.stdout.write(ROUTES[key])
 sys.exit(0)
 '''
 
