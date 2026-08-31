@@ -1160,3 +1160,38 @@ with two idioms. They behave identically and are pinned by tests; a shared
 helper would need its own public home for an eight-line idiom.
 
 843 passed.
+
+---
+
+## Fail before you pay: validate the job spec locally (3.21.0)
+
+Closes #88 and #87. Both are the same defect shape and it is the shape that
+costs money: a mistake that is fully checkable on the laptop, but which
+currently surfaces only after a box has been provisioned — or not at all.
+
+- [x] **#88 env keys.** Rendered as `export KEY=<quoted value>`. Values are
+      quoted; keys cannot be, because a variable name is not a word quoting
+      applies to. A non-identifier key produces shell that *parses* — so
+      `sh -n` never catches it — and fails at runtime. The remote runs under
+      `set -euo pipefail`, so it aborts the job after provisioning and rsync,
+      with an error naming neither runplz nor the key. Validated in
+      `_normalize_env`, alongside the existing `_normalize_preconditions`.
+- [x] **#87 duplicate `@app.local_entrypoint`.** Was last-wins, so the first
+      driver became unreachable and nothing said so. Now an error, matching
+      every comparable ambiguity (multiple `App`s, multiple `@app.function`
+      with no entrypoint).
+- [x] README documents both rules
+- [x] version bump, PR, deploy
+
+### Verification
+
+- both mutation-tested: reverting either validation fails the new tests
+- `test_every_accepted_env_key_survives_a_real_shell` renders the same
+  `export` line the backends emit and runs it under `bash -euo pipefail`,
+  so the regex and bash cannot silently diverge on what an identifier is
+- end-to-end through the real console script: both errors exit 1 and the
+  traceback points at the user's own decorator line
+
+Left alone: the CLI shows a 23-line traceback for these, because they are
+raised while executing the user's script. Suppressing that would hide
+genuine user-code errors, and the user's own line is already in the trace.

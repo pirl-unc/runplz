@@ -69,7 +69,9 @@ runplz brev jobs/train.py --steps=5000   # entrypoint args parse from the tail o
 When you need to do more than fire-and-forget — multiple `.remote()`
 calls, post-processing, picking which function to run — declare an
 explicit `@app.local_entrypoint`. It runs *in the local CLI process*;
-`.remote()` dispatches to the chosen backend.
+`.remote()` dispatches to the chosen backend. Exactly one per `App` — a
+second `@app.local_entrypoint` is an error, because last-wins would leave
+the first driver unreachable with nothing printed to say so.
 
 ```python
 @app.function(image=image, gpu="A100", min_gpus=4)
@@ -432,6 +434,12 @@ otherwise select them:
 `.env`, `.env.local`, `.env.*.local`, `.env.production`, `.env.development`, `*.pem`, `*.key`, `id_rsa`, `id_rsa.*`, `id_ed25519`, `id_ed25519.*`, `credentials.json`, `.aws`, `.ssh`, `.netrc`, `.git-credentials`
 
 If you *need* a secret inside the remote environment, inject it via `@app.function(env={"X": ...})` or Modal Secrets rather than by relaxing this list.
+
+`env` keys must be valid shell identifiers (letters, digits and
+underscores, not starting with a digit) — they are rendered as
+`export KEY=...` on the remote, where a name like `MY-VAR` aborts the run
+*after* the box is provisioned. runplz rejects it at decoration time
+instead. Values need no such care; they are always quoted.
 
 ### GcpConfig
 
