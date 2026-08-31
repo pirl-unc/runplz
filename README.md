@@ -728,6 +728,32 @@ start-up. runplz's `.env` exclusion means you can ship `boto3`
 credentials via `@app.function(env=...)` without leaking them into the
 image layer.
 
+### Imports — repo root first, then the script's own directory
+
+Your job script is loaded by path, and two directories are importable from it:
+
+1. **the repo root** (what runplz stages), searched first
+2. **the script's own directory**, so a job laid out as a package of modules
+   can import its siblings
+
+```
+myrepo/
+  common.py          # import common          -> works
+  jobs/
+    train.py         # the job script
+    data.py          # import data            -> works
+```
+
+This is deliberately *not* what plain `python jobs/train.py` does: that puts
+the script's directory first and the repo root nowhere at all. Two
+consequences worth knowing:
+
+- On a name clash the **repo root wins**, unlike plain Python.
+- A sibling module is searched *after* the standard library, so a
+  `jobs/types.py` will **not** shadow `types` for your run — where plain
+  Python would let it. The trade-off is that a sibling named after a stdlib
+  module is not importable.
+
 ### Outputs — write to `$RUNPLZ_OUT`
 
 `RUNPLZ_OUT` is set to the remote's output directory (`/out` inside
