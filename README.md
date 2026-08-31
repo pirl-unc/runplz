@@ -325,6 +325,7 @@ internal that can move in a patch release.
 | `runplz.backends.registry` | What backends exist and what each accepts — the single source of truth behind the CLI's choices. |
 | `runplz.backends.ssh_common` | The shared layer every ssh-reachable backend runs on: `dispatch_to_target`, `run_on_provisioned_vm`, and the individual pipeline stages. |
 | `runplz.backends.provisioning` | Retry policy, GPU shape tables, instance naming, and teardown shared by the cloud drivers. |
+| `runplz.backends.local`, `runplz.backends.ssh`, `runplz.backends.brev`, `runplz.backends.modal`, `runplz.backends.gcp`, `runplz.backends.aws` | The backend drivers. Each exports `run` and (where the backend can enumerate jobs) `list_jobs` — the contract `registry.load()` calls. Normally reached through the CLI or `App.bind()`, not imported directly. |
 | `runplz.backends.docker` | Container labels and `docker ps` parsing, shared by the local and ssh backends. |
 | `runplz.selector` | `pick_machine` / `pick_machines` — cost-tolerance shape selection with an availability tiebreak. |
 | `runplz.excludes` | `DEFAULT_TRANSFER_EXCLUDES`, the secret-shaped patterns kept off every host -> remote transfer. |

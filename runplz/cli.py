@@ -34,6 +34,7 @@ import inspect
 import io
 import sys
 import typing
+import warnings
 from pathlib import Path
 
 from runplz.app import repo_root_for
@@ -128,7 +129,13 @@ def main(argv=None):
             # The CLI knows the script being run, which beats the module a
             # function happens to be defined in — and hands bind() the answer
             # rather than making it shell out to git a second time.
-            repo_root=repo_root_for(script_path),
+            #
+            # But only as a fallback: a bind(repo_root=...) argument outranks
+            # a standing `app.repo_root = X`, so passing it unconditionally
+            # would make that documented override a no-op on the CLI path,
+            # which is the path almost everyone uses. `app.repo_root` is None
+            # here unless the script assigned one, because bind() has not run.
+            repo_root=None if app.repo_root is not None else repo_root_for(script_path),
         )
     except (ValueError, RuntimeError) as exc:
         p.error(str(exc))
@@ -316,6 +323,12 @@ def _install_default_entrypoint_or_error(app, script_path, fail):
 
 
 def _load_app(script_path: Path):
+    # Show runplz's own DeprecationWarnings while executing the user's script.
+    # Python's default filters only surface them in `__main__`, and this loads
+    # the script as `_runplz_user_job` — so a script using a deprecated alias
+    # would get no notice at all before the alias is removed in 4.0.
+    warnings.filterwarnings("default", category=DeprecationWarning, module=r"runplz\..*")
+    warnings.filterwarnings("default", category=DeprecationWarning, module="_runplz_user_job")
     spec = importlib.util.spec_from_file_location("_runplz_user_job", script_path)
     module = importlib.util.module_from_spec(spec)
     sys.modules["_runplz_user_job"] = module

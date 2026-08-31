@@ -24,6 +24,14 @@ True)` mounted at /out, then download after the run via
 `volume.batch_iter(...)` before flipping this on for heavy training.
 """
 
+# `run` and `list_jobs` are the driver contract the registry calls; the
+# rest is this driver's own testable surface.
+__all__ = [
+    "run",
+    "list_jobs",
+]
+
+
 import io
 import json
 import os
@@ -211,12 +219,7 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
             "Modal backend requires `pip install modal` and `modal setup` (run once)."
         ) from exc
 
-    repo = app.repo_root
-    if repo is None:
-        raise RuntimeError(
-            "App repo_root not set. App._dispatch checks this first, so "
-            "reaching here means the backend was called directly."
-        )
+    repo = app.require_repo_root(context="modal.run()")
 
     host_out = (repo / outputs_dir).resolve()
     host_out.mkdir(parents=True, exist_ok=True)

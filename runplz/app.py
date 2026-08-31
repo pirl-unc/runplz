@@ -20,6 +20,7 @@ __all__ = [
 
 import inspect
 import json
+import os
 import warnings
 from pathlib import Path
 from typing import Callable, Optional
@@ -158,11 +159,11 @@ class App:
         self._backend_kwargs: dict = {}
         # Two values, because three things can set a repo root and they do
         # not have the same lifetime:
-        #   _repo_root          what dispatch uses (per-bind)
+        #   _repo_root_value    what dispatch uses (per-bind)
         #   _repo_root_assigned a standing choice made via `app.repo_root = X`
         # A bind(repo_root=...) argument overrides for that call only; it must
         # neither erase a standing choice nor survive into the next bind.
-        self._repo_root: Optional[Path] = None
+        self._repo_root_value: Optional[Path] = None
         self._repo_root_assigned: Optional[Path] = None
 
     def function(
@@ -275,20 +276,22 @@ class App:
             )
         if not outputs_dir or not str(outputs_dir).strip():
             raise ValueError("outputs_dir must be a non-empty path string.")
-        if not self.functions:
+        # Only needed to *infer* the repo root — with one handed in, or a
+        # standing assignment, there is nothing to locate.
+        if not self.functions and repo_root is None and self._repo_root_assigned is None:
             raise RuntimeError(
                 "App.bind() needs at least one @app.function() declared so we "
-                "can locate the script's repo root."
+                "can locate the script's repo root, or an explicit repo_root."
             )
         # Recomputed from scratch on every bind, in precedence order, so no
         # branch can leave a stale value behind from a previous call.
         if repo_root is not None:
-            self._repo_root = _coerce_repo_root(repo_root, "repo_root")
+            self._repo_root_value = _coerce_repo_root(repo_root, "repo_root")
         elif self._repo_root_assigned is not None:
-            self._repo_root = self._repo_root_assigned
+            self._repo_root_value = self._repo_root_assigned
         else:
             any_fn = next(iter(self.functions.values()))
-            self._repo_root = repo_root_for(Path(any_fn.module_file))
+            self._repo_root_value = repo_root_for(Path(any_fn.module_file))
         self._backend = backend
         self._backend_kwargs = {"outputs_dir": outputs_dir}
         # Which selector each backend takes comes from the registry too, so
@@ -310,16 +313,16 @@ class App:
         relative path is accepted and fails here rather than deep inside
         dispatch after a box has been paid for.
         """
-        return self._repo_root
+        return self._repo_root_value
 
     @repo_root.setter
     def repo_root(self, value) -> None:
         if value is None:
-            self._repo_root = None
+            self._repo_root_value = None
             self._repo_root_assigned = None
             return
         resolved = _coerce_repo_root(value, "App.repo_root")
-        self._repo_root = resolved
+        self._repo_root_value = resolved
         # A standing choice: it outlives any single bind(), unlike a
         # bind(repo_root=...) argument.
         self._repo_root_assigned = resolved
@@ -345,6 +348,41 @@ class App:
         )
         self.entrypoint = value
 
+    @property
+    def _repo_root(self) -> Optional[Path]:
+        """Deprecated alias for :attr:`repo_root` (renamed in 3.20.0).
+
+        Assigning the old name used to write the field directly, which now
+        also means skipping the validation the public setter added.
+        """
+        return self._repo_root_value
+
+    @_repo_root.setter
+    def _repo_root(self, value) -> None:
+        warnings.warn(
+            "App._repo_root was renamed to App.repo_root in 3.20.0; assign "
+            "that instead. This alias goes away in 4.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.repo_root = value
+
+    def require_repo_root(self, *, context: str = "dispatch") -> Path:
+        """Return `repo_root`, or raise if it is unset.
+
+        One definition of the invariant, called from `_dispatch` and from each
+        backend's `run()`. It used to be re-derived and re-worded in four
+        places, so the same state produced different guidance depending on
+        which entry point you came through.
+        """
+        if self._repo_root_value is None:
+            raise RuntimeError(
+                f"{context} needs App.repo_root, which is not set. Dispatch "
+                "through the `runplz` CLI or call App.bind(...), either of "
+                "which sets it."
+            )
+        return self._repo_root_value
+
     def _dispatch(self, function: Function, args: list, kwargs: dict):
         if self._backend is None:
             raise RuntimeError(
@@ -361,11 +399,18 @@ class App:
         # Checked here, not in a backend: every backend funnels through this
         # method, and the provisioning ones would otherwise create and pay for
         # a box before noticing that no repo could be staged to it.
-        if self.repo_root is None:
-            raise RuntimeError(
-                f"{function.name}.remote(...) was called but App.repo_root is "
-                "not set. Dispatch through the `runplz` CLI or call "
-                "App.bind(...), either of which sets it."
+        self.require_repo_root(context=f"{function.name}.remote(...)")
+        # The backends compute the script's path *relative to* repo_root to
+        # find it on the remote. If it is not underneath, `relative_to` raises
+        # -- but only after a provisioning backend has created a paid box,
+        # waited for ssh and rsynced the whole tree up. Check it here instead.
+        script = Path(function.module_file).resolve()
+        if not script.is_relative_to(self.repo_root):
+            raise ValueError(
+                f"App.repo_root ({self.repo_root}) does not contain "
+                f"{function.name}'s script ({script}). runplz stages repo_root "
+                f"to the remote and locates the script inside it, so the script "
+                f"must live under it."
             )
         return module.run(self, function, args, kwargs, **self._backend_kwargs)
 
@@ -388,7 +433,11 @@ def _coerce_repo_root(value, label: str) -> Path:
     the caller happened to be sitting in — a home directory, or `/` — up to a
     remote box, and a typo'd path is only noticed after provisioning.
     """
-    if isinstance(value, str) and not value.strip():
+    # os.fspath so a PathLike is checked too, not only `str`. Note the limit:
+    # `Path("")` is already `Path(".")` at construction, so it is
+    # indistinguishable from a deliberate `"."` here and resolves to the CWD.
+    # Only the raw empty/whitespace string can be caught.
+    if not os.fspath(value).strip():
         raise ValueError(f"{label} must be a non-empty path")
     path = Path(value).resolve()
     if not path.is_dir():

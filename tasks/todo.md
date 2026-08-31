@@ -915,9 +915,19 @@ module an `__all__`.
       a dead patch target is the exact failure this plan is designed to avoid)
 - [x] version bump + PR + deploy
 
-**Not in this PR:** the 3 correctness-sweep findings (`sys.exit(main())`,
-bootstrap `sys.path`, env-key validation). Mechanical rename and behavior change
-should not share a diff.
+**Not in this PR (as planned):** the 3 correctness-sweep findings
+(`sys.exit(main())`, bootstrap `sys.path`, env-key validation).
+
+**Superseded — read this instead.** `sys.exit(main())` *did* ship, in round 2:
+this PR newly advertised `python -m runplz.cli` in the README while that path
+silently discarded exit codes, so promoting it and leaving it broken was not a
+defensible split. Rounds 2-5 added further behavior changes — `SSH_OPTS`
+list->tuple, `App.repo_root` validation and precedence, `App._dispatch`
+preconditions, brev's deprecating `__getattr__`, the CLI no longer overriding a
+standing `repo_root`. The "mechanical rename only" framing stopped being
+accurate after round 2; this is a rename **plus** the API hardening the rename
+exposed. Still deferred: the bootstrap `sys.path` divergence and env-key
+validation.
 
 ### Review
 
@@ -1092,3 +1102,61 @@ can leave a stale value. The whole matrix is now one test.
   decision: those were never an invocation path.
 
 809 passed.
+
+### Review round 5
+
+**Process failure worth recording.** Two "fixed" claims in round 4 were
+false: the dead `text.count("-m", 0)` expression was never deleted (the
+formatter had reflowed my anchor line, so `str.replace` matched nothing and
+I never re-grepped), and the todo.md scope note was edited with an anchor
+that likewise did not match. Both were then written up as done. Every fix
+this round was verified by a re-grep/execution pass afterwards, and that
+pass caught nothing outstanding.
+
+Round-5 findings, all confirmed by running them first:
+
+- **the CLI discarded a standing `app.repo_root`.** It passed
+  `repo_root=repo_root_for(script_path)` unconditionally, and a bind
+  argument outranks a standing assignment — so the override this PR
+  documented was a no-op on the path almost everyone uses. Now passed only
+  as a fallback. Mutation-tested.
+- `repo_root` was validated for existence but not for *containing the
+  function's script*, so `relative_to()` still raised inside
+  `dispatch_to_target` — after the box was created, ssh waited out and the
+  tree rsynced. Checked in `_dispatch` now, before any provisioning.
+- `_coerce_repo_root`'s empty check was `isinstance(value, str)`, so a
+  PathLike bypassed it. Uses `os.fspath` now. Documented limit: `Path("")`
+  is already `Path(".")` at construction and cannot be distinguished from a
+  deliberate `"."`.
+- `App._repo_root` got no alias while `App._entrypoint` did, so the old
+  spelling still wrote the field and skipped all the new validation.
+- **brev's compat set was exactly inverted.** It forwarded the eleven
+  *public* stage names, which never existed on brev, and dropped the eleven
+  *underscore* spellings that did — verified against
+  `git show origin/main:runplz/backends/brev.py`. Both spellings now map to
+  ssh_common.
+- both DeprecationWarnings were invisible where they matter: the CLI
+  executes user scripts as `_runplz_user_job`, and Python only surfaces
+  DeprecationWarning in `__main__`. The CLI now enables them for runplz and
+  for the loaded script; verified the warning appears against the user's
+  own line number.
+- `test_readme_lists_every_exported_name` ended in `or len(row) > 40`,
+  true of every row — it asserted nothing. Replaced with a check that no
+  row names a symbol absent from every public `__all__`; mutation-tested.
+- `PUBLIC_MODULES` omitted the six backend drivers even though
+  `registry.load()` calls `run`/`list_jobs` across a module line. All six
+  now declare `__all__` (brev's `["run"]` had omitted `list_jobs`) and have
+  a README row.
+- the private-import guard derived a module's own name from `path.stem`
+  without its package, and had no non-vacuity assertion — the test it
+  replaced asserted the directory existed for exactly that reason.
+- the `repo_root is None` invariant existed in four places with three
+  wordings; now one `App.require_repo_root()` with four call sites.
+- `bind()`'s "declare a function so we can locate the repo root" fired even
+  when a repo_root was handed in, where the reason is false.
+
+Not addressed: the three legacy shims still implement attribute forwarding
+with two idioms. They behave identically and are pinned by tests; a shared
+helper would need its own public home for an eight-line idiom.
+
+843 passed.

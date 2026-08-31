@@ -2826,11 +2826,7 @@ def dispatch_to_target(
     gone. Provisioning backends wrap this in their own try/finally for the box
     itself; see :func:`run_on_provisioned_vm`.
     """
-    repo = app.repo_root
-    if repo is None:
-        raise RuntimeError(
-            "App repo_root not set. Call App.bind() (or the runplz CLI) before dispatching."
-        )
+    repo = app.require_repo_root(context="dispatch_to_target()")
     host_out = (repo / outputs_dir).resolve()
     host_out.mkdir(parents=True, exist_ok=True)
 

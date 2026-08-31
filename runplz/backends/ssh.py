@@ -28,7 +28,12 @@ from runplz.backends.ssh_common import (
     wait_until_ssh_reachable,
 )
 
-__all__ = ["run", "list_jobs"]
+# `run` and `list_jobs` are the driver contract the registry calls; the
+# rest is this driver's own testable surface.
+__all__ = [
+    "run",
+    "list_jobs",
+]
 
 
 def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):

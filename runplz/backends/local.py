@@ -9,6 +9,15 @@ and `Image.from_registry(...).apt_install/pip_install/...` (synthesize
 a Dockerfile on the fly, build from repo root as context).
 """
 
+# `run` and `list_jobs` are the driver contract the registry calls; the
+# rest is this driver's own testable surface.
+__all__ = [
+    "run",
+    "list_jobs",
+    "IMAGE_TAG_DEFAULT",
+]
+
+
 import json
 import subprocess
 from pathlib import Path
@@ -28,12 +37,7 @@ def run(
     build: bool = True,
     outputs_dir: str = "out",
 ):
-    repo = app.repo_root
-    if repo is None:
-        raise RuntimeError(
-            "App repo_root not set. App._dispatch checks this first, so "
-            "reaching here means the backend was called directly."
-        )
+    repo = app.require_repo_root(context="local.run()")
 
     host_out = (repo / outputs_dir).resolve()
     host_out.mkdir(parents=True, exist_ok=True)

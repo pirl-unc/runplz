@@ -20,16 +20,20 @@ SHARED_MODULES = (
 # table (test_readme_documents_every_public_module below pins that). The
 # __all__ guards run over all of them: the README states "not in __all__ means
 # internal", so a public module with a stale __all__ mislabels its own surface.
-PUBLIC_MODULES = SHARED_MODULES + (
-    "runplz.app",
-    "runplz.config",
-    "runplz.image",
-    "runplz.cli",
-    "runplz.runs",
-    "runplz.bootstrap",
-    "runplz.excludes",
-    "runplz.selector",
-    "runplz.logcapture",
+PUBLIC_MODULES = (
+    SHARED_MODULES
+    + (
+        "runplz.app",
+        "runplz.config",
+        "runplz.image",
+        "runplz.cli",
+        "runplz.runs",
+        "runplz.bootstrap",
+        "runplz.excludes",
+        "runplz.selector",
+        "runplz.logcapture",
+    )
+    + tuple(f"runplz.backends.{name}" for name in ("local", "ssh", "brev", "modal", "gcp", "aws"))
 )
 
 
@@ -72,9 +76,12 @@ def test_nothing_imports_a_private_name_or_module_across_a_module_line():
     # exempting them by name would only hide a future regression in the three
     # files most likely to reach for a private module.
     offenders = []
+    scanned = 0
     for path in sorted(root.rglob("*.py")):
         tree = ast.parse(path.read_text())
-        package = ".".join(path.relative_to(root.parent).with_suffix("").parts[:-1])
+        scanned += 1
+        dotted = ".".join(path.relative_to(root.parent).with_suffix("").parts)
+        package = dotted.rsplit(".", 1)[0]
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 # Resolve relative imports first: `from . import _x` has
@@ -85,7 +92,11 @@ def test_nothing_imports_a_private_name_or_module_across_a_module_line():
                     module = f"{package}.{module}" if module else package
                 if not module.startswith("runplz"):
                     continue
-                own = {f"runplz.backends.{path.stem}", f"runplz.{path.stem}"}
+                # The module's real dotted name, not a stem-based guess:
+                # `{f"runplz.backends.{stem}", f"runplz.{stem}"}` would have
+                # exempted `backends/local.py` importing privates from a
+                # hypothetical top-level `runplz.local`.
+                own = {dotted}
                 if module not in own and any(part.startswith("_") for part in module.split(".")):
                     offenders.append(f"{path.name}: from {module} import ...")
                 if module in own:
@@ -101,6 +112,9 @@ def test_nothing_imports_a_private_name_or_module_across_a_module_line():
                     ):
                         offenders.append(f"{path.name}: import {name}")
 
+    # The predecessor asserted the directory existed so the check could not
+    # pass on an empty glob; keep an equivalent here.
+    assert scanned > 15, f"only scanned {scanned} files — the walk is not finding the package"
     assert not offenders, "private cross-module references:\n  " + "\n  ".join(offenders)
 
 
@@ -233,13 +247,11 @@ def test_emitted_bootstrap_path_is_the_legacy_one():
     }
     for rel, expected in emitters.items():
         text = (root / rel).read_text()
-        emits = text.count("-m", 0) and text.count("runplz._bootstrap")
         invocations = text.count('"-m", "runplz._bootstrap"') + text.count("-m runplz._bootstrap")
         assert invocations == expected, (
             f"{rel}: expected {expected} `python -m runplz._bootstrap` "
             f"invocation(s), found {invocations}"
         )
-        assert emits  # the path must still appear at all
         # Substring-free check that no emit switched to the new path.
         assert '"runplz.bootstrap"' not in text and "-m runplz.bootstrap" not in text, (
             f"{rel} emits the new bootstrap path"
@@ -282,17 +294,25 @@ def test_brev_forwards_its_moved_names_to_ssh_common():
     from runplz.backends import brev, ssh_common
 
     assert brev._MOVED_TO_SSH_COMMON, "the compat set should not be empty"
-    for name in sorted(brev._MOVED_TO_SSH_COMMON):
-        assert hasattr(ssh_common, name), f"brev forwards {name}, which ssh_common lacks"
+    for old_name, new_name in sorted(brev._MOVED_TO_SSH_COMMON.items()):
+        assert hasattr(ssh_common, new_name), (
+            f"brev forwards {old_name} to ssh_common.{new_name}, which does not exist"
+        )
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            assert getattr(brev, name) is getattr(ssh_common, name), name
-        assert caught, f"{name} forwarded without a DeprecationWarning"
-        assert issubclass(caught[0].category, DeprecationWarning), name
+            assert getattr(brev, old_name) is getattr(ssh_common, new_name), old_name
+        assert caught, f"{old_name} forwarded without a DeprecationWarning"
+        assert issubclass(caught[0].category, DeprecationWarning), old_name
+
+    # The underscore spellings are the ones that were actually importable from
+    # brev before 3.20.0; forwarding only the new public names would have been
+    # backwards -- covering names nobody could have used while dropping the
+    # ones they could.
+    for stage in brev._STAGES_RENAMED_IN_3_20:
+        assert f"_{stage}" in brev._MOVED_TO_SSH_COMMON, stage
 
     # dir() must agree with what actually resolves.
-    listed = set(dir(brev))
-    assert brev._MOVED_TO_SSH_COMMON <= listed
+    assert set(brev._MOVED_TO_SSH_COMMON) <= set(dir(brev))
 
     with pytest.raises(AttributeError):
         brev.definitely_not_a_real_name
@@ -325,31 +345,43 @@ def test_legacy_shim_dir_lists_the_target_module():
 
 
 @pytest.mark.parametrize("name", PUBLIC_MODULES)
-def test_readme_lists_every_exported_name(name):
-    """The table must name what each module exports, not just the module.
+def test_readme_rows_name_no_dead_exports(name):
+    """A backticked symbol in a module's row must still be in its __all__.
 
-    The README's rule covers one direction ("not in __all__ means internal")
-    but says nothing about a name that IS in __all__ and missing from the
-    table, so a reader cannot tell whether it is semver-covered.
+    Scoped deliberately: rows are allowed to summarize rather than enumerate,
+    so this does not demand every export appear. What it does catch is the
+    README naming a symbol that was renamed or removed — the drift that makes
+    the table actively wrong rather than merely incomplete.
+
+    (The previous version of this test ended in `or len(row) > 40`, which is
+    true of every row in the table, so it asserted nothing at all.)
     """
     import importlib
     from pathlib import Path
 
-    module = importlib.import_module(name)
+    importlib.import_module(name)  # a row for an unimportable module is worse
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
     table = readme.split("## Public API", 1)[1].split("\n## ", 1)[0]
     row = next((ln for ln in table.splitlines() if f"`{name}`" in ln), None)
     assert row, f"{name} has no row in the Public API table"
 
-    # A row may summarize rather than enumerate, but if it names any export it
-    # must not name a stale one.
-    named = [n for n in module.__all__ if f"`{n}`" in row]
+    # A row may legitimately backtick: a symbol from another public module
+    # (cross-reference), a filename, or one of the documented RUNPLZ_* env
+    # vars, which are contract but not Python exports. Anything else that
+    # looks like an identifier should resolve somewhere.
+    every_export = set()
+    for other in PUBLIC_MODULES:
+        every_export |= set(importlib.import_module(other).__all__)
+    known_modules = set(PUBLIC_MODULES) | {"runplz"}
+
     stale = [
-        n
-        for n in row.split("`")[1::2]
-        if n.startswith(("App", "Function", "Image", "pick_", "DEFAULT_", "PRECONDITION"))
-        and n not in module.__all__
-        and n != name
+        token
+        for token in row.split("`")[1::2]
+        if token not in known_modules
+        and token not in every_export
+        and not token.startswith("RUNPLZ_")
+        and "." not in token
+        and "/" not in token
+        and token.replace("_", "").isalnum()
     ]
-    assert not stale, f"{name} row names {stale}, absent from its __all__"
-    assert named or "—" in row or len(row) > 40, f"{name} row is uninformative"
+    assert not stale, f"{name} row names {stale}, which no public __all__ exports"

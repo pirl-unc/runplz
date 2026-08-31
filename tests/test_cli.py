@@ -553,3 +553,34 @@ def test_cli_function_less_script_error_beats_the_generic_bind_error(tmp_path, c
     err = capsys.readouterr().err
     assert "declares no @app.function" in err
     assert str(script) in err
+
+
+def test_cli_does_not_override_a_script_assigned_repo_root(tmp_path):
+    """`app.repo_root = X` is documented as an override; the CLI must honor it.
+
+    The CLI passes repo_root to bind(), and a bind argument outranks a
+    standing assignment — so passing it unconditionally silently discarded
+    the override on the path almost everyone uses.
+    """
+    monorepo = tmp_path / "monorepo"
+    monorepo.mkdir()
+    jobs = tmp_path / "proj" / "jobs"
+    jobs.mkdir(parents=True)
+    script = jobs / "job.py"
+    script.write_text(
+        "from runplz import App, Image\n"
+        "app = App('t')\n"
+        f"app.repo_root = {str(monorepo)!r}\n"
+        "@app.function(image=Image.from_registry('ubuntu:22.04'))\n"
+        "def go(): pass\n"
+        "@app.local_entrypoint()\n"
+        "def main(): print('SEEN:', app.repo_root)\n"
+    )
+
+    with mock.patch("runplz.backends.local.run"):
+        cli.main(["local", str(script), "--no-log-file"])
+
+    import sys
+
+    loaded = sys.modules["_runplz_user_job"]
+    assert loaded.app.repo_root == monorepo.resolve()

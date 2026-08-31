@@ -253,7 +253,7 @@ def test_dispatch_refuses_before_provisioning_when_repo_root_is_unset(tmp_path):
     """
     app, _ = _app_with_fn(tmp_path)
     app.bind("local")
-    app._repo_root = None
+    app.repo_root = None
     fn = next(iter(app.functions.values()))
     with pytest.raises(RuntimeError, match="repo_root"):
         app._dispatch(fn, [], {})
@@ -328,3 +328,53 @@ def test_legacy_entrypoint_attribute_still_installs_a_driver(tmp_path):
     assert app.entrypoint is driver
     assert app._entrypoint is driver
     assert caught and issubclass(caught[0].category, DeprecationWarning)
+
+
+def test_dispatch_rejects_a_repo_root_that_does_not_contain_the_script(tmp_path):
+    """`relative_to` would otherwise raise after the box is paid for.
+
+    The backends locate the script *inside* repo_root to find it on the
+    remote. When it is not underneath, the failure used to land in
+    dispatch_to_target — after provision(), the ssh wait, and rsync_up.
+    """
+    app, _ = _app_with_fn(tmp_path)
+    elsewhere = (tmp_path / "elsewhere").resolve()
+    elsewhere.mkdir()
+    app.repo_root = elsewhere
+    app.bind("local")
+
+    fn = next(iter(app.functions.values()))
+    with pytest.raises(ValueError, match="does not contain"):
+        app._dispatch(fn, [], {})
+
+
+def test_legacy_repo_root_attribute_validates_like_the_new_one(tmp_path):
+    """`app._repo_root = X` used to write the field and skip every check."""
+    import warnings
+
+    app, repo = _app_with_fn(tmp_path)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        app._repo_root = repo
+    assert app.repo_root == repo
+    assert caught and issubclass(caught[0].category, DeprecationWarning)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(ValueError, match="existing directory"):
+            app._repo_root = "/definitely/not/here"
+
+
+def test_bind_without_functions_is_fine_when_repo_root_is_supplied(tmp_path):
+    """The 'declare a function so we can locate the repo root' error only
+    applies when the repo root actually has to be inferred."""
+    target = (tmp_path / "given").resolve()
+    target.mkdir()
+
+    app = App("x")
+    app.bind("local", repo_root=target)
+    assert app.repo_root == target
+
+    with pytest.raises(RuntimeError, match="at least one"):
+        App("y").bind("local")
