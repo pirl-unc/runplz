@@ -22,3 +22,29 @@ def test_none_environment_normalizes_to_empty_mapping():
         return None
 
     assert job.env == {}
+
+
+def test_invalid_min_gpus_is_rejected_early():
+    app = App("coverage")
+    try:
+        decorator = app.function(
+            image=Image.from_registry("python:3.12-slim"), gpu="T4", min_gpus=0
+        )
+        decorator(lambda: None)
+    except ValueError as exc:
+        assert "positive int" in str(exc)
+    else:
+        raise AssertionError("invalid min_gpus must fail")
+
+
+def test_conflicting_gpu_aliases_are_rejected():
+    app = App("coverage")
+    try:
+        decorator = app.function(
+            image=Image.from_registry("python:3.12-slim"), gpu="T4", min_gpus=4, num_gpus=2
+        )
+        decorator(lambda: None)
+    except ValueError as exc:
+        assert "conflicting" in str(exc)
+    else:
+        raise AssertionError("conflicting GPU aliases must fail")
