@@ -54,3 +54,40 @@ def test_malformed_create_response_is_visible(sandbox_bin):
     )
     assert result.returncode == 0
     assert result.stdout == "{not-json"
+
+
+def test_aws_create_is_idempotent_and_distinguishes_tokens(sandbox_bin):
+    log = fake_cloud.install(sandbox_bin, name="aws")
+    base = [
+        "aws",
+        "ec2",
+        "run-instances",
+        "--region",
+        "us-east-1",
+        "--image-id",
+        "ami-x",
+        "--instance-type",
+        "t3.micro",
+        "--key-name",
+        "k",
+        "--count",
+        "1",
+        "--tag-specifications",
+        "x",
+        "--output",
+        "json",
+    ]
+
+    def create(token):
+        result = subprocess.run(
+            [*base, "--client-token", token], capture_output=True, text=True, check=True
+        )
+        return result.stdout
+
+    first = create("same-token")
+    retry = create("same-token")
+    distinct = create("new-token")
+
+    assert first == retry
+    assert first != distinct
+    assert len(fake_cloud.calls_matching(log, "run-instances")) == 3
