@@ -78,6 +78,19 @@ def remote_run(target, opts):
     sc.ssh_capture(target, f"rm -rf {ctx.run_root_shell}", ssh_opts=opts)
 
 
+def _wrapped(command: str, remote_run) -> str:
+    """Wrap a command the way every production caller does.
+
+    `launch_detached_and_wait`'s parameter is literally named
+    `wrapped_command`: the caller is expected to have run the command
+    through the logging wrapper, which is what records the start event and
+    the exit code. Passing a raw command produces a run that starts, exits,
+    and is then correctly reported as "never started" -- there is no start
+    event and no exit-code file for the reader to find.
+    """
+    return sc._wrap_remote_command_for_logging(command, remote_run)
+
+
 def _run_files(remote_run):
     """The same three paths `launch_detached_and_wait` derives internally."""
     meta = remote_run.meta_shell
@@ -143,7 +156,7 @@ def test_a_detached_run_reports_its_real_exit_code(
 
     code = sc.launch_detached_and_wait(
         target=target,
-        wrapped_command="sleep 0.5; echo done; exit 7",
+        wrapped_command=_wrapped("sleep 0.5; echo done; exit 7", remote_run),
         remote_run=remote_run,
         ssh_opts=opts,
     )
@@ -163,7 +176,7 @@ def test_kill_actually_stops_a_running_remote_process(target, opts, remote_run, 
     sc.prepare_remote_run(target, remote_run, manifest={}, ssh_opts=opts)
     files = _run_files(remote_run)
     # Launch, but do not wait: this test is about killing a live process.
-    launcher = sc.build_detached_launcher(remote_run, "sleep 300")
+    launcher = sc.build_detached_launcher(remote_run, _wrapped("sleep 300", remote_run))
     sc.ssh_exec(target, launcher, ssh_opts=opts)
     assert sc.wait_for_detached_start(
         target, files["pid_file"], files["events_file"], ssh_opts=opts
