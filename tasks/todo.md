@@ -1353,3 +1353,9 @@ Branch: `catalogue-and-container-tier` (off `main` @ `2414202`)
 ### Review
 
 Implemented; verification is recorded in the final review below.
+# Coverage follow-up — shared runtime failure paths
+
+- [x] Inventory uncovered `ssh_common`/CLI branches and map each to public behavior.
+- [x] Add behavior-driven tests for reusable SSH wait/command and staging failure semantics.
+- [x] Run format, lint, and full test/coverage gates; record measured result (1025 passed, 3 skips, 93.92% branch coverage).
+- [ ] Open, review, merge, and deploy a versioned PR if the change is validated.

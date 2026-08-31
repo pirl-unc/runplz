@@ -55,6 +55,28 @@ def test_select_source_paths_returns_none_outside_git(tmp_path):
     assert ssh_common.select_source_paths(tmp_path) is None
 
 
+def test_local_ssh_options_round_trip_and_stale_cleanup(tmp_path):
+    host_out = tmp_path / "out"
+    options = ssh_common.SshOptions(identity_file="/tmp/key", port=2222)
+    ssh_common.write_local_ssh_options(host_out, options)
+
+    assert ssh_common.read_local_ssh_options(host_out) == options
+    recorded = host_out / ssh_common.REMOTE_META_DIRNAME / ssh_common.LOCAL_SSH_OPTIONS_FILENAME
+    assert recorded.exists()
+
+    ssh_common.write_local_ssh_options(host_out, None)
+    assert not recorded.exists()
+    assert ssh_common.read_local_ssh_options(host_out) == ssh_common.SshOptions()
+
+
+def test_local_ssh_options_ignores_corrupt_private_metadata(tmp_path):
+    metadata = tmp_path / ssh_common.REMOTE_META_DIRNAME
+    metadata.mkdir()
+    (metadata / ssh_common.LOCAL_SSH_OPTIONS_FILENAME).write_text("not-json")
+
+    assert ssh_common.read_local_ssh_options(tmp_path) == ssh_common.SshOptions()
+
+
 def test_select_source_paths_omits_sparse_checkout_entries(tmp_path):
     repo = tmp_path / "repo"
     _init_repo(repo)
