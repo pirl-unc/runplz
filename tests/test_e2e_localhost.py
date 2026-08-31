@@ -22,7 +22,7 @@ import uuid
 from pathlib import Path
 
 import pytest
-from sshd_harness import LocalSshd, find_sshd
+from sshd_harness import select_backend
 
 from runplz.backends import ssh_common as sc
 
@@ -31,22 +31,28 @@ pytestmark = pytest.mark.live_ssh
 
 @pytest.fixture(scope="module")
 def sshd(tmp_path_factory):
-    """A private sshd for this module. Skips if the machine has no sshd."""
-    if find_sshd() is None:
-        pytest.skip("no sshd binary on this machine")
+    """An ssh-reachable box: a local sshd, or a Linux container.
+
+    `RUNPLZ_E2E_REMOTE` chooses (`local` / `docker` / `auto`). The tests
+    below do not care which they got -- they address it through `target`
+    and `opts` -- so the container variant needs no test changes, and the
+    Darwin skip resolves itself when the remote is a container.
+    """
     root = tmp_path_factory.mktemp("sshd")
-    server = LocalSshd(root)
+    server, unavailable = select_backend(root)
+    if server is None:
+        pytest.skip(unavailable)
     try:
         server.start()
     except Exception as exc:  # pragma: no cover - environment-dependent
-        pytest.skip(f"could not start a local sshd: {exc}")
+        pytest.skip(f"could not start {type(server).__name__}: {exc}")
     yield server
     server.stop()
 
 
 @pytest.fixture
 def target(sshd):
-    return "127.0.0.1"
+    return getattr(sshd, "host", "127.0.0.1")
 
 
 @pytest.fixture
@@ -61,9 +67,12 @@ def remote_is_linux(target, opts):
     macOS `nohup` refuses to detach in a non-interactive ssh session
     ("can't detach from console: Inappropriate ioctl for device"), and
     macOS has no `setsid`, so detached launch does not work there at all --
-    issue #92. Every documented remote is Linux, and CI is Linux, so the
-    detached tests run where it matters and skip on a Mac dev box rather
-    than reporting a runplz bug that only exists on the harness's platform.
+    issue #92. Every documented remote is Linux, so the detached tests run
+    where it matters and skip rather than reporting a runplz bug that only
+    exists on the harness's platform.
+
+    Start Docker and this stops skipping anywhere: the container backend
+    makes the remote Linux regardless of the host.
     """
     return "Linux" in sc.ssh_capture(target, "uname -s", ssh_opts=opts)
 

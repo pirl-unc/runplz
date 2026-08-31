@@ -37,6 +37,16 @@ dev = [
     "pytest",
     "pytest-cov",
     "ruff",
+    # Test-only. botocore bundles the authoritative EC2 instance-type
+    # catalogue offline, so tests/test_cloud_catalogue.py can prove every
+    # shape runplz emits is a real instance type without an AWS account.
+    # runplz itself stays stdlib-only at runtime.
+    "botocore",
+    # Test-only. Backs the optional container variant of the ssh end-to-end
+    # tier, which gives a Linux remote on a macOS dev box so the detached
+    # tests run there instead of skipping. Falls back to a local sshd when
+    # Docker is not available.
+    "testcontainers",
 ]
 
 [project.scripts]

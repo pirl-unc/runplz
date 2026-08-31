@@ -10,6 +10,8 @@ config, pid, log. Nothing touches ~/.ssh, and the daemon binds to
 127.0.0.1 on an ephemeral port so it is not reachable off the machine.
 """
 
+import os
+import platform
 import shutil
 import socket
 import subprocess
@@ -126,3 +128,122 @@ class LocalSshd:
             subprocess.run(["kill", pid_file.read_text().strip()], capture_output=True, timeout=10)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Optional container backend.
+#
+# The local sshd runs the tests against *this* machine, so on a Mac the
+# "remote" is macOS -- which is not what anyone deploys to, and where
+# detached launch is broken outright (issue #92). A Linux container makes
+# the remote match production on any host, so the detached tests run on a
+# Mac instead of skipping. It costs a Docker daemon, so it is not the
+# default: `RUNPLZ_E2E_REMOTE` selects, and `auto` only reaches for Docker
+# where the local sshd would be the wrong platform.
+
+DOCKERFILE = """\
+FROM debian:stable-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssh-server rsync procps \
+ && apt-get clean \
+ && mkdir -p /run/sshd /root/.ssh \
+ && chmod 700 /root/.ssh
+COPY authorized_keys /root/.ssh/authorized_keys
+RUN chmod 600 /root/.ssh/authorized_keys \
+ && sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+CMD ["/usr/sbin/sshd", "-D", "-e"]
+"""
+
+
+def docker_available() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    try:
+        return subprocess.run(["docker", "info"], capture_output=True, timeout=30).returncode == 0
+    except Exception:
+        return False
+
+
+class DockerSshd:
+    """A Debian container running sshd, addressed like LocalSshd."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.identity = root / "id"
+        self._image = None
+        self._container = None
+        self.host = "127.0.0.1"
+        self.port = None
+
+    def start(self) -> "DockerSshd":
+        from testcontainers.core.container import DockerContainer
+        from testcontainers.core.image import DockerImage
+
+        _keygen(self.identity)
+        context = self.root / "ctx"
+        context.mkdir(parents=True, exist_ok=True)
+        (context / "Dockerfile").write_text(DOCKERFILE)
+        (context / "authorized_keys").write_bytes((self.root / "id.pub").read_bytes())
+        self.identity.chmod(0o600)
+
+        self._image = DockerImage(path=str(context), tag="runplz-e2e-sshd:test").build()
+        self._container = DockerContainer(str(self._image)).with_exposed_ports(22).start()
+        self.host = self._container.get_container_host_ip()
+        self.port = int(self._container.get_exposed_port(22))
+        self._await_ready()
+        return self
+
+    _await_ready = LocalSshd._await_ready
+    probe = LocalSshd.probe
+
+    def ssh_args(self) -> list:
+        return [
+            "-i",
+            str(self.identity),
+            "-p",
+            str(self.port),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "User=root",
+        ]
+
+    def stop(self) -> None:
+        for resource in (self._container, self._image):
+            try:
+                if resource is not None:
+                    resource.stop()
+            except Exception:
+                pass
+
+
+def select_backend(root: Path):
+    """Pick an ssh backend, honouring RUNPLZ_E2E_REMOTE.
+
+    `local` (a real sshd on this machine, no daemon needed), `docker` (a
+    Linux container, matching production), or `auto` -- which uses Docker
+    only where the local sshd would give the wrong platform, so Linux CI
+    keeps the faster path and a Mac gets Linux fidelity when Docker is up.
+
+    Returns (backend, reason_if_unavailable).
+    """
+    mode = os.environ.get("RUNPLZ_E2E_REMOTE", "auto").lower()
+    if mode == "local":
+        return (LocalSshd(root), None) if find_sshd() else (None, "no sshd binary")
+    if mode == "docker":
+        if not docker_available():
+            return None, "RUNPLZ_E2E_REMOTE=docker but no Docker daemon is reachable"
+        return DockerSshd(root), None
+    if platform.system() != "Linux" and docker_available():
+        return DockerSshd(root), None
+    if find_sshd():
+        return LocalSshd(root), None
+    if docker_available():
+        return DockerSshd(root), None
+    return None, "neither an sshd binary nor a Docker daemon is available"

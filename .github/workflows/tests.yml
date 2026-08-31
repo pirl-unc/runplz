@@ -43,3 +43,35 @@ jobs:
           pip install -e ".[dev,modal]"
       - name: Run tests
         run: pytest tests/ -v --cov=runplz --cov-report=xml
+
+  # The default ssh end-to-end run uses a local sshd, which on Linux is
+  # already the production platform. This job exercises the *container*
+  # backend instead, which is the path a macOS developer gets — otherwise
+  # it would only ever run on someone's laptop and break unnoticed.
+  e2e-container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Run the ssh e2e tier against a Linux container
+        env:
+          RUNPLZ_E2E_REMOTE: docker
+        run: pytest tests/test_e2e_localhost.py -v
+      - name: Fail if the tier silently skipped
+        env:
+          RUNPLZ_E2E_REMOTE: docker
+        run: |
+          # A skip here means the container backend never ran and the job
+          # would pass green having tested nothing.
+          pytest tests/test_e2e_localhost.py -q -rs 2>&1 | tee out.txt
+          if grep -q "skipped" out.txt; then
+            echo "::error::container e2e tier skipped; it must actually run in CI"
+            exit 1
+          fi
