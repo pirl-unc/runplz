@@ -20,6 +20,7 @@ __all__ = [
 
 import inspect
 import json
+import warnings
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -155,10 +156,14 @@ class App:
         # Runtime-populated by the CLI before local_entrypoint fires.
         self._backend: Optional[str] = None
         self._backend_kwargs: dict = {}
+        # Two values, because three things can set a repo root and they do
+        # not have the same lifetime:
+        #   _repo_root          what dispatch uses (per-bind)
+        #   _repo_root_assigned a standing choice made via `app.repo_root = X`
+        # A bind(repo_root=...) argument overrides for that call only; it must
+        # neither erase a standing choice nor survive into the next bind.
         self._repo_root: Optional[Path] = None
-        # Whether `repo_root` was chosen by the caller rather than inferred.
-        # Inference must re-run on every bind(); a caller's choice must not.
-        self._repo_root_explicit = False
+        self._repo_root_assigned: Optional[Path] = None
 
     def function(
         self,
@@ -275,15 +280,13 @@ class App:
                 "App.bind() needs at least one @app.function() declared so we "
                 "can locate the script's repo root."
             )
+        # Recomputed from scratch on every bind, in precedence order, so no
+        # branch can leave a stale value behind from a previous call.
         if repo_root is not None:
-            # A per-call argument, so it applies to this bind only — going
-            # through the property setter would mark it "caller chose this"
-            # and leak it into every later bind() that omits the argument.
-            self._repo_root = Path(repo_root).resolve()
-        elif not self._repo_root_explicit:
-            # Infer afresh on every bind. Assigning `app.repo_root` is honored
-            # (it is public, so a caller's choice must not be discarded), but a
-            # repo_root passed to one bind() must not leak into the next.
+            self._repo_root = _coerce_repo_root(repo_root, "repo_root")
+        elif self._repo_root_assigned is not None:
+            self._repo_root = self._repo_root_assigned
+        else:
             any_fn = next(iter(self.functions.values()))
             self._repo_root = repo_root_for(Path(any_fn.module_file))
         self._backend = backend
@@ -313,10 +316,34 @@ class App:
     def repo_root(self, value) -> None:
         if value is None:
             self._repo_root = None
-            self._repo_root_explicit = False
+            self._repo_root_assigned = None
             return
-        self._repo_root = Path(value).resolve()
-        self._repo_root_explicit = True
+        resolved = _coerce_repo_root(value, "App.repo_root")
+        self._repo_root = resolved
+        # A standing choice: it outlives any single bind(), unlike a
+        # bind(repo_root=...) argument.
+        self._repo_root_assigned = resolved
+
+    @property
+    def _entrypoint(self):
+        """Deprecated alias for :attr:`entrypoint` (renamed in 3.20.0).
+
+        Kept because the failure without it is silent, not loud: a script
+        doing `app._entrypoint = driver` would leave `entrypoint` unset, and
+        the CLI would synthesize a default from the single @app.function and
+        dispatch *that* instead — a different job, no error.
+        """
+        return self.entrypoint
+
+    @_entrypoint.setter
+    def _entrypoint(self, value) -> None:
+        warnings.warn(
+            "App._entrypoint was renamed to App.entrypoint in 3.20.0; "
+            "assign that instead. This alias goes away in 4.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.entrypoint = value
 
     def _dispatch(self, function: Function, args: list, kwargs: dict):
         if self._backend is None:
@@ -351,6 +378,22 @@ def _ensure_json_safe(args, kwargs):
             "Function.remote(...) args must be JSON-serializable. "
             "Use primitives/lists/dicts, not closures or custom objects."
         ) from exc
+
+
+def _coerce_repo_root(value, label: str) -> Path:
+    """Resolve a repo root to an absolute directory, or fail here.
+
+    `bind()` already validates `outputs_dir` this way. Without it,
+    `repo_root = ""` resolves to the process CWD and silently rsyncs whatever
+    the caller happened to be sitting in — a home directory, or `/` — up to a
+    remote box, and a typo'd path is only noticed after provisioning.
+    """
+    if isinstance(value, str) and not value.strip():
+        raise ValueError(f"{label} must be a non-empty path")
+    path = Path(value).resolve()
+    if not path.is_dir():
+        raise ValueError(f"{label} must be an existing directory, got {path}")
+    return path
 
 
 def repo_root_for(script_path: Path) -> Path:

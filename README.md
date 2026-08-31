@@ -316,7 +316,7 @@ internal that can move in a patch release.
 | Module | What it is |
 |---|---|
 | `runplz` | Re-exports everything below that a job script needs: `App`, `Function`, `Image`, `ImageOp`, and the five backend configs. The only import most scripts need. |
-| `runplz.app` | `App`, `Function`, `repo_root_for`. |
+| `runplz.app` | `App`, `Function`, `repo_root_for`, `validate_image_vs_brev_mode`, `PRECONDITION_KEYS`. |
 | `runplz.config` | `BrevConfig`, `SshConfig`, `ModalConfig`, `GcpConfig`, `AwsConfig`. |
 | `runplz.image` | `Image` and the `ImageOp` DSL. |
 | `runplz.cli` | The `runplz` console script (`main`). Also reachable as `python -m runplz.cli`. |

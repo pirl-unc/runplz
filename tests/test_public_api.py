@@ -67,14 +67,12 @@ def test_nothing_imports_a_private_name_or_module_across_a_module_line():
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1] / "runplz"
-    # Deliberate legacy entry points; their whole job is to alias a public
-    # module, and the reasons are in their docstrings.
-    allowed = {"_cli.py", "_bootstrap.py", "_ssh_common.py"}
-
+    # No allowlist. The legacy shims (_cli, _bootstrap, _ssh_common) alias
+    # *public* modules, so they pass this check on their own merits —
+    # exempting them by name would only hide a future regression in the three
+    # files most likely to reach for a private module.
     offenders = []
     for path in sorted(root.rglob("*.py")):
-        if path.name in allowed:
-            continue
         tree = ast.parse(path.read_text())
         package = ".".join(path.relative_to(root.parent).with_suffix("").parts[:-1])
         for node in ast.walk(tree):
@@ -269,3 +267,89 @@ def test_readme_documents_every_public_module():
     table = readme.split("## Public API", 1)[1].split("\n## ", 1)[0]
     missing = [name for name in PUBLIC_MODULES if f"`{name}`" not in table]
     assert not missing, "not in the README Public API table: " + ", ".join(missing)
+
+
+def test_brev_forwards_its_moved_names_to_ssh_common():
+    """The back-compat shim must be exercised, not just written.
+
+    Nothing else imports a moved name from brev, so a typo in
+    `_MOVED_TO_SSH_COMMON`, or a name that never existed on ssh_common,
+    would ship green — and the ImportError this shim exists to prevent
+    would surface only in a downstream repo.
+    """
+    import warnings
+
+    from runplz.backends import brev, ssh_common
+
+    assert brev._MOVED_TO_SSH_COMMON, "the compat set should not be empty"
+    for name in sorted(brev._MOVED_TO_SSH_COMMON):
+        assert hasattr(ssh_common, name), f"brev forwards {name}, which ssh_common lacks"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assert getattr(brev, name) is getattr(ssh_common, name), name
+        assert caught, f"{name} forwarded without a DeprecationWarning"
+        assert issubclass(caught[0].category, DeprecationWarning), name
+
+    # dir() must agree with what actually resolves.
+    listed = set(dir(brev))
+    assert brev._MOVED_TO_SSH_COMMON <= listed
+
+    with pytest.raises(AttributeError):
+        brev.definitely_not_a_real_name
+
+
+def test_moved_private_modules_are_gone_on_purpose():
+    """`_excludes`/`_selector`/`_logcapture` moved with no compat shim.
+
+    Unlike `_cli`/`_bootstrap`, these were never an invocation path — the
+    leading underscore is Python's own "do not import this" marker, so a
+    minor bump may drop them. Pinned so the asymmetry reads as a decision
+    rather than an oversight.
+    """
+    for gone in ("runplz._excludes", "runplz._selector", "runplz._logcapture"):
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(gone)
+
+    # ...while the two that ARE invocation paths keep working.
+    for kept in ("runplz._cli", "runplz._bootstrap"):
+        assert importlib.import_module(kept) is not None
+
+
+def test_legacy_shim_dir_lists_the_target_module():
+    """__dir__ on the shims is otherwise never executed by the suite."""
+    import runplz._bootstrap
+    import runplz._cli
+
+    assert "main" in dir(runplz._cli)
+    assert "main" in dir(runplz._bootstrap)
+
+
+@pytest.mark.parametrize("name", PUBLIC_MODULES)
+def test_readme_lists_every_exported_name(name):
+    """The table must name what each module exports, not just the module.
+
+    The README's rule covers one direction ("not in __all__ means internal")
+    but says nothing about a name that IS in __all__ and missing from the
+    table, so a reader cannot tell whether it is semver-covered.
+    """
+    import importlib
+    from pathlib import Path
+
+    module = importlib.import_module(name)
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    table = readme.split("## Public API", 1)[1].split("\n## ", 1)[0]
+    row = next((ln for ln in table.splitlines() if f"`{name}`" in ln), None)
+    assert row, f"{name} has no row in the Public API table"
+
+    # A row may summarize rather than enumerate, but if it names any export it
+    # must not name a stale one.
+    named = [n for n in module.__all__ if f"`{n}`" in row]
+    stale = [
+        n
+        for n in row.split("`")[1::2]
+        if n.startswith(("App", "Function", "Image", "pick_", "DEFAULT_", "PRECONDITION"))
+        and n not in module.__all__
+        and n != name
+    ]
+    assert not stale, f"{name} row names {stale}, absent from its __all__"
+    assert named or "—" in row or len(row) > 40, f"{name} row is uninformative"

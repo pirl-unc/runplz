@@ -89,6 +89,13 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def __dir__():
+    # Without this the forwarded names resolve but are invisible to dir(),
+    # inspect.getmembers and tab completion, so anyone auditing what still
+    # works concludes the aliases are already gone.
+    return sorted(set(globals()) | _MOVED_TO_SSH_COMMON)
+
+
 # Brev instance names must be slug-ish. Lowercase, ASCII, hyphen-separated.
 # Some providers cap names around 30-40 chars; keep the generated part short
 # enough that typical app/function names fit comfortably.

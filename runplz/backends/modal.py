@@ -213,7 +213,10 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
 
     repo = app.repo_root
     if repo is None:
-        raise RuntimeError("App repo_root not set (CLI should have set this).")
+        raise RuntimeError(
+            "App repo_root not set. App._dispatch checks this first, so "
+            "reaching here means the backend was called directly."
+        )
 
     host_out = (repo / outputs_dir).resolve()
     host_out.mkdir(parents=True, exist_ok=True)

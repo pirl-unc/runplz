@@ -896,7 +896,12 @@ module an `__all__`.
 - [x] `_runs.py` → `runs.py` — owns the on-disk manifest format read back by
       `ps`/`kill` across versions
 - [x] write real contract docstrings on each (this is the "clear semantics" half)
-- [x] stays private: `_excludes.py`, `_logcapture.py`, `_selector.py`
+- [x] ~~stays private: `_excludes.py`, `_logcapture.py`, `_selector.py`~~
+      **Reversed in round 2** — all three are imported across a module line
+      by a public module, so they were promoted to `excludes.py`,
+      `logcapture.py`, `selector.py`. The original call was wrong because
+      the audit behind it only detected private *names*, not private
+      *modules*.
 
 ### Phase 3 — `app.py` backend-facing contract
 - [x] `_repo_root_for` → `repo_root_for`
@@ -932,7 +937,8 @@ reached into `app.py` for four more. An AST sweep now finds none.
 - README gained a "Public API" section; AGENTS.md scope list updated
 
 **Underscores that stayed, and why.** `_excludes`, `_logcapture`,
-`_selector` are genuinely file-local. `_bootstrap`, `_cli`, `_ssh_common`
+`_selector` are genuinely file-local (**superseded — see round 2, all three
+were promoted**). `_bootstrap`, `_cli`, `_ssh_common`
 are compat entry points, documented as such in their own docstrings.
 
 **The one thing that changed the plan.** `_bootstrap` looked like the
@@ -1045,3 +1051,44 @@ Also fixed:
 
 Filed rather than fixed: #87 (two `@local_entrypoint` decorators silently
 last-wins). Real, but a behavior change, and this PR is a rename.
+
+### Review round 4
+
+`repo_root` broke a third time, in a new way: `app.repo_root = X` then
+`bind(repo_root=Y)` then `bind()` yielded Y — the per-call argument both
+destroyed the standing assignment and leaked forward, violating both
+invariants the round-3 comments claimed. Each earlier fix passed its own
+single-branch test, so the model was replaced rather than patched again:
+two fields (`_repo_root` effective, `_repo_root_assigned` standing), and
+bind() recomputes from scratch in precedence order every call, so no branch
+can leave a stale value. The whole matrix is now one test.
+
+- the public setter validated nothing: `repo_root = ""` resolved to the
+  process CWD, so rsync_up would stage whatever directory the caller
+  happened to be in — a home dir, or `/` — onto a remote box. Empty,
+  whitespace, nonexistent and non-directory values now raise, matching the
+  validation `bind()` already did for `outputs_dir`.
+- `App._entrypoint` -> `App.entrypoint` had no alias, and the failure was
+  *silent*: `app._entrypoint = driver` left `entrypoint` unset, so the CLI
+  synthesized a default from the lone @app.function and dispatched a
+  different job. Deprecating property alias added — a silent wrong-job run
+  is worse than the ImportError the brev shim exists to prevent.
+- the brev forwarder had zero coverage; a typo in `_MOVED_TO_SSH_COMMON`
+  would have shipped green. Now asserted name-by-name against ssh_common,
+  including the warning and `dir()`.
+- brev's `__getattr__` had no `__dir__`, so the 24 compat names resolved
+  but were invisible to introspection.
+- the private-import guard's allowlist exempted nothing today but would
+  have exempted the three highest-risk files forever. Removed — the shims
+  alias public modules and pass on their own merits.
+- `text.count("-m", 0) and ...` in the wire guard read as two checks and
+  was one. Deleted.
+- **tasks/todo.md contradicted the diff**: a checked-off "stays private:
+  _excludes/_logcapture/_selector" survived round 2's reversal. Marked.
+- README's `runplz.app` row omitted two `__all__` names; a new test pins
+  rows against each module's exports.
+- the removal of `_excludes`/`_selector`/`_logcapture` (no shim, unlike
+  `_cli`/`_bootstrap`) is now pinned by a test so the asymmetry reads as a
+  decision: those were never an invocation path.
+
+809 passed.

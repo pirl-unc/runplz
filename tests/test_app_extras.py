@@ -197,7 +197,7 @@ def test_registry_rejects_an_unknown_backend():
 
 def _app_with_fn(tmp_path):
     repo = tmp_path / "repo"
-    repo.mkdir()
+    repo.mkdir(parents=True, exist_ok=True)
     (repo / "job.py").write_text("# job\n")
     app = App("v")
 
@@ -257,3 +257,74 @@ def test_dispatch_refuses_before_provisioning_when_repo_root_is_unset(tmp_path):
     fn = next(iter(app.functions.values()))
     with pytest.raises(RuntimeError, match="repo_root"):
         app._dispatch(fn, [], {})
+
+
+def test_repo_root_precedence_matrix(tmp_path):
+    """All three sources, in every order that previously went wrong.
+
+    This got fixed twice and broke twice: first a bind()-scoped repo_root
+    leaked into the next bind, then a per-call argument silently destroyed a
+    standing `app.repo_root = X` assignment. The whole matrix is pinned here
+    rather than one branch at a time, since each earlier fix passed its own
+    single-branch test.
+    """
+    app, repo = _app_with_fn(tmp_path)
+    chosen = (tmp_path / "chosen").resolve()
+    percall = (tmp_path / "percall").resolve()
+    chosen.mkdir()
+    percall.mkdir()
+
+    # bind argument wins for its own call...
+    app.repo_root = chosen
+    app.bind("ssh", host="h", repo_root=percall)
+    assert app.repo_root == percall
+
+    # ...but does not outlive it, and does not erase the standing choice.
+    app.bind("local")
+    assert app.repo_root == chosen
+
+    # with no standing choice, a bind argument still does not leak.
+    app2, repo2 = _app_with_fn(tmp_path / "b")
+    app2.bind("ssh", host="h", repo_root=percall)
+    app2.bind("local")
+    assert app2.repo_root == repo2
+
+
+@pytest.mark.parametrize(
+    "bad, reason",
+    [("", "empty"), ("   ", "whitespace"), ("/definitely/not/here", "nonexistent")],
+)
+def test_repo_root_rejects_unusable_values(tmp_path, bad, reason):
+    """`repo_root = ''` used to resolve to the CWD and stage it to a remote."""
+    app, _ = _app_with_fn(tmp_path)
+    with pytest.raises(ValueError, match="repo_root"):
+        app.repo_root = bad
+
+
+def test_repo_root_rejects_a_file(tmp_path):
+    app, repo = _app_with_fn(tmp_path)
+    with pytest.raises(ValueError, match="existing directory"):
+        app.repo_root = repo / "job.py"
+
+
+def test_legacy_entrypoint_attribute_still_installs_a_driver(tmp_path):
+    """`app._entrypoint = fn` was the pre-3.20 programmatic path.
+
+    Without the alias the assignment lands on a fresh attribute, `entrypoint`
+    stays None, and the CLI synthesizes a default from the single
+    @app.function and dispatches *that* — a different job, silently.
+    """
+    import warnings
+
+    app, _ = _app_with_fn(tmp_path)
+
+    def driver():
+        pass
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        app._entrypoint = driver
+
+    assert app.entrypoint is driver
+    assert app._entrypoint is driver
+    assert caught and issubclass(caught[0].category, DeprecationWarning)
