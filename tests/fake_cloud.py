@@ -193,7 +193,7 @@ if key == ("ec2", "run-instances"):
 elif key in (("ec2", "describe-instances"), ("ec2", "wait", "instance-running"),
              ("ec2", "terminate-instances"), ("ec2", "stop-instances")):
     instance_id = option_value("--instance-ids")
-    if instance_id not in state:
+    if instance_id not in state or state[instance_id] in {{"terminated", "DELETED"}}:
         sys.stderr.write("InvalidInstanceID.NotFound: instance does not exist\\n")
         sys.exit(1)
     if key == ("ec2", "terminate-instances"):
