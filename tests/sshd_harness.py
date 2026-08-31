@@ -69,8 +69,10 @@ class LocalSshd:
         )
 
     def start(self) -> "LocalSshd":
-        _keygen(self.root / "hostkey")
-        _keygen(self.identity)
+        if not (self.root / "hostkey").exists():
+            _keygen(self.root / "hostkey")
+        if not self.identity.exists():
+            _keygen(self.identity)
         (self.root / "authorized_keys").write_bytes((self.root / "id.pub").read_bytes())
         for name in ("authorized_keys", "id", "hostkey"):
             (self.root / name).chmod(0o600)
@@ -144,6 +146,14 @@ class LocalSshd:
             subprocess.run(["kill", pid_file.read_text().strip()], capture_output=True, timeout=10)
         except Exception:
             pass
+
+    def refuse_connections(self) -> None:
+        """Stop accepting connections while preserving the endpoint options."""
+        self.stop()
+
+    def drop_connection(self) -> None:
+        """Alias used by fault tests to simulate a transport disappearing."""
+        self.stop()
 
 
 # ---------------------------------------------------------------------------
