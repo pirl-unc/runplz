@@ -47,6 +47,11 @@ def _keygen(path: Path) -> None:
 class LocalSshd:
     """A private sshd on 127.0.0.1. Address it with `.port` / `.identity`."""
 
+    #: How to address this box. `SshOptions` carries the port and identity
+    #: but not the user, so any user must live in the target string --
+    #: otherwise the code under test connects as whoever is running pytest.
+    target = "127.0.0.1"
+
     def __init__(self, root: Path):
         self.root = root
         self.port = _free_port()
@@ -96,7 +101,7 @@ class LocalSshd:
     def probe(self) -> bool:
         try:
             proc = subprocess.run(
-                ["ssh", *self.ssh_args(), "127.0.0.1", "true"],
+                ["ssh", *self.ssh_args(), self.target, "true"],
                 capture_output=True,
                 timeout=20,
             )
@@ -174,6 +179,7 @@ class DockerSshd:
         self._container = None
         self.host = "127.0.0.1"
         self.port = None
+        self.target = "root@127.0.0.1"
 
     def start(self) -> "DockerSshd":
         from testcontainers.core.container import DockerContainer
@@ -190,6 +196,11 @@ class DockerSshd:
         self._container = DockerContainer(str(self._image)).with_exposed_ports(22).start()
         self.host = self._container.get_container_host_ip()
         self.port = int(self._container.get_exposed_port(22))
+        # The container's only account is root. `SshOptions` cannot express
+        # a user, so it has to ride in the target -- and the harness probe
+        # must use the same address, or it will report a healthy box that
+        # the code under test cannot reach.
+        self.target = f"root@{self.host}"
         self._await_ready()
         return self
 
@@ -210,8 +221,6 @@ class DockerSshd:
             "UserKnownHostsFile=/dev/null",
             "-o",
             "IdentitiesOnly=yes",
-            "-o",
-            "User=root",
         ]
 
     def stop(self) -> None:

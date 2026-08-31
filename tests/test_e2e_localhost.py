@@ -52,7 +52,12 @@ def sshd(tmp_path_factory):
 
 @pytest.fixture
 def target(sshd):
-    return getattr(sshd, "host", "127.0.0.1")
+    """Address the box exactly as the code under test will.
+
+    Includes the user when the backend needs one — the container's only
+    account is root, and `SshOptions` has no user field.
+    """
+    return sshd.target
 
 
 @pytest.fixture
