@@ -191,6 +191,29 @@ def test_status_returns_ssh_failure_code(tmp_path, capsys):
     assert "ssh to my-gpu-box failed" in out
 
 
+@pytest.mark.parametrize(
+    "heartbeat, expected",
+    [
+        ("not-json", "(unparsed)"),
+        (json.dumps({}), "(unparsed)"),
+        (json.dumps({"ts": "bad"}), "bad"),
+    ],
+)
+def test_status_renders_malformed_heartbeat_without_failing(tmp_path, capsys, heartbeat, expected):
+    _write_manifest(tmp_path, _manifest())
+    fake = mock.Mock(
+        returncode=0,
+        stdout=f"---LAST_EVENT---\nnot-json\n---LAST_HEARTBEAT---\n{heartbeat}\n"
+        "---EVENT_COUNT---\n0\n---END---\n",
+        stderr="",
+    )
+    with mock.patch("runplz.runs.subprocess.run", return_value=fake):
+        assert runs.status(outputs_dir=tmp_path, host_override=None, run_id_override=None) == 0
+    out = capsys.readouterr().out
+    assert "last event (unparsed)" in out
+    assert f"last heartbeat: {expected}" in out
+
+
 # ---------------------------------------------------------------------------
 # CLI integration
 
