@@ -2846,6 +2846,23 @@ def test_verify_post_action_state_warns_when_delete_still_present(capsys):
     assert "status=RUNNING" in out
 
 
+@pytest.mark.parametrize(
+    "action, snapshot, marker",
+    [
+        ("create", {"name": "box", "status": "RUNNING"}, "verified create"),
+        ("start", {"name": "box", "status": "RUNNING"}, "verified start"),
+        ("stop", {"name": "box", "status": "STOPPED"}, "verified stop"),
+        ("delete", None, "verified delete"),
+    ],
+)
+def test_verify_post_action_state_accepts_expected_terminal_states(
+    action, snapshot, marker, capsys
+):
+    with mock.patch("runplz.backends.brev._instance_snapshot", return_value=snapshot):
+        brev._verify_post_action_state(action, "box", timeout_s=0, poll_interval_s=0)
+    assert marker in capsys.readouterr().out
+
+
 # -- run_native and run_container_mode remote commands ------------------
 
 
