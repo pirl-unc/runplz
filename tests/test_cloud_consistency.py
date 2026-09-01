@@ -12,13 +12,55 @@ def test_describe_eventual_consistency_is_scriptable(sandbox_bin):
         fail_times={"ec2/describe-instances": 2},
         fail_message="InvalidInstanceID.NotFound",
     )
-    result = subprocess.run(
-        ["aws", "ec2", "describe-instances", "--region", "us-east-1", "--instance-ids", "i-x"],
+    create = subprocess.run(
+        [
+            "aws",
+            "ec2",
+            "run-instances",
+            "--region",
+            "us-east-1",
+            "--image-id",
+            "ami-x",
+            "--instance-type",
+            "t3.micro",
+            "--key-name",
+            "k",
+            "--count",
+            "1",
+            "--client-token",
+            "seed",
+            "--tag-specifications",
+            "x",
+            "--output",
+            "json",
+        ],
         capture_output=True,
         text=True,
+        check=True,
     )
-    assert result.returncode != 0
-    assert len(fake_cloud.calls_matching(log, "describe-instances")) == 1
+    instance_id = "i-fake0000000001"
+    assert instance_id in create.stdout
+    command = [
+        "aws",
+        "ec2",
+        "describe-instances",
+        "--region",
+        "us-east-1",
+        "--instance-ids",
+        instance_id,
+        "--query",
+        "Reservations",
+        "--output",
+        "text",
+    ]
+    first = subprocess.run(command, capture_output=True, text=True)
+    second = subprocess.run(command, capture_output=True, text=True)
+    third = subprocess.run(command, capture_output=True, text=True)
+    assert first.returncode != 0
+    assert second.returncode != 0
+    assert third.returncode == 0
+    assert third.stdout.strip() == "127.0.0.1"
+    assert len(fake_cloud.calls_matching(log, "describe-instances")) == 3
 
 
 def test_malformed_create_response_is_visible(sandbox_bin):
