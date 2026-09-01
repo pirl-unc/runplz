@@ -26,6 +26,44 @@ def test_candidate_parser_handles_incomplete_search_rows(row):
         assert candidate is None
 
 
+def test_pick_instance_types_returns_empty_for_cli_failure(tmp_path):
+    app = _app(tmp_path)
+    fn = _function(app, Image("python:3.12"))
+    capture = mock.Mock(return_value=mock.Mock(returncode=17, stdout="", stderr="quota"))
+    with mock.patch.object(brev, "_brev_capture", capture):
+        assert brev._pick_instance_types(fn) == []
+    capture.assert_called_once()
+    assert capture.call_args.args[0][:4] == ["brev", "search", "cpu", "--json"]
+
+
+@pytest.mark.parametrize("stdout", ["not-json", "{}", "[]"])
+def test_pick_instance_types_returns_empty_for_invalid_or_empty_response(tmp_path, stdout):
+    app = _app(tmp_path)
+    fn = _function(app, Image("python:3.12"))
+    capture = mock.Mock(return_value=mock.Mock(returncode=0, stdout=stdout, stderr=""))
+    with mock.patch.object(brev, "_brev_capture", capture):
+        assert brev._pick_instance_types(fn) == []
+    capture.assert_called_once()
+
+
+def test_pick_instance_types_excludes_all_candidates_before_ranking(tmp_path):
+    app = _app(tmp_path)
+    fn = _function(app, Image("python:3.12"))
+    rows = [{"type": "oci.gpu"}, {"type": "oci.cpu"}]
+    capture = mock.Mock(return_value=mock.Mock(returncode=0, stdout=json.dumps(rows), stderr=""))
+    with mock.patch.object(brev, "_brev_capture", capture):
+        assert brev._pick_instance_types(fn, exclude_providers=("oci",)) == []
+
+
+def test_pick_instance_types_falls_back_to_brev_order_without_prices(tmp_path):
+    app = _app(tmp_path)
+    fn = _function(app, Image("python:3.12"))
+    rows = [{"name": "cpu.first"}, {"type": "cpu.second"}, {"type": ""}]
+    capture = mock.Mock(return_value=mock.Mock(returncode=0, stdout=json.dumps(rows), stderr=""))
+    with mock.patch.object(brev, "_brev_capture", capture):
+        assert brev._pick_instance_types(fn, n=2) == ["cpu.first", "cpu.second"]
+
+
 # -- helpers ---------------------------------------------------------------
 
 
