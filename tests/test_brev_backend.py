@@ -15,6 +15,17 @@ import pytest
 from runplz import App, BrevConfig, Image
 from runplz.backends import brev, ssh_common
 
+
+@pytest.mark.parametrize("row", [{}, {"name": ""}, {"type": ""}, {"type": "a100", "price": "bad"}])
+def test_candidate_parser_handles_incomplete_search_rows(row):
+    candidate = brev._candidate_from_brev_row(row)
+    if row.get("type") == "a100":
+        assert candidate is not None
+        assert candidate.hourly_usd is None
+    else:
+        assert candidate is None
+
+
 # -- helpers ---------------------------------------------------------------
 
 
