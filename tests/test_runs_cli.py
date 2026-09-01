@@ -21,7 +21,14 @@ from runplz import cli, runs
 )
 def test_age_rendering_uses_human_scale_boundaries(delta, expected):
     timestamp = (datetime.now(timezone.utc) - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
-    assert expected in runs._age_str(timestamp)
+    rendered = runs._age_str(timestamp)
+    # Timestamps are serialized to whole seconds; a slow test process can
+    # cross exactly one second between formatting and parsing. Accept that
+    # representation-level rounding without weakening the unit boundaries.
+    if delta == timedelta(seconds=10):
+        assert rendered in {" (10s ago)", " (11s ago)"}
+    else:
+        assert expected in rendered
 
 
 def _write_manifest(outputs_dir: Path, manifest: dict) -> Path:
