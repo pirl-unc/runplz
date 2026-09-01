@@ -150,6 +150,42 @@ def test_detached_probe_without_events_file_omits_start_marker():
     assert "remote_command_start" not in probe
 
 
+@pytest.mark.parametrize(
+    "result, expected",
+    [
+        (
+            mock.Mock(returncode=0, stdout="alive", stderr=""),
+            ssh_common.DetachedProcessState.RUNNING,
+        ),
+        (
+            mock.Mock(returncode=0, stdout="no-pid", stderr=""),
+            ssh_common.DetachedProcessState.MISSING,
+        ),
+        (
+            mock.Mock(returncode=0, stdout="mystery", stderr=""),
+            ssh_common.DetachedProcessState.UNKNOWN,
+        ),
+        (
+            mock.Mock(returncode=255, stdout="", stderr="refused"),
+            ssh_common.DetachedProcessState.UNKNOWN,
+        ),
+    ],
+)
+def test_inspect_detached_run_preserves_transport_and_legacy_states(result, expected):
+    with mock.patch("runplz.backends.ssh_common.subprocess.run", return_value=result):
+        observed = ssh_common.inspect_detached_run("box", "$HOME/run/pid")
+    assert observed.process_state is expected
+
+
+def test_inspect_detached_run_maps_timeout_to_unknown():
+    with mock.patch(
+        "runplz.backends.ssh_common.subprocess.run",
+        side_effect=subprocess.TimeoutExpired("ssh", 30),
+    ):
+        observed = ssh_common.inspect_detached_run("box", "$HOME/run/pid")
+    assert observed == ssh_common.DetachedRunStatus(ssh_common.DetachedProcessState.UNKNOWN, False)
+
+
 def test_rsync_up_passes_git_selection_as_nul_delimited_stdin(tmp_path):
     repo = tmp_path / "repo"
     _init_repo(repo)
