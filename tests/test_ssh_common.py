@@ -307,6 +307,43 @@ def test_wait_for_detached_start_returns_promptly_for_zombie():
     sleep.assert_not_called()
 
 
+def test_wait_for_detached_start_returns_unknown_at_deadline():
+    unknown = ssh_common.DetachedRunStatus(
+        ssh_common.DetachedProcessState.UNKNOWN,
+        False,
+    )
+    with mock.patch(
+        "runplz.backends.ssh_common.inspect_detached_run", return_value=unknown
+    ) as inspect:
+        with mock.patch("runplz.backends.ssh_common.time.monotonic", side_effect=[0.0, 2.0]):
+            with mock.patch("runplz.backends.ssh_common.time.sleep") as sleep:
+                status = ssh_common.wait_for_detached_start(
+                    "box",
+                    "/run/bootstrap.pid",
+                    "/run/events.ndjson",
+                    timeout_s=1.0,
+                )
+    assert status is unknown
+    inspect.assert_called_once_with(
+        "box", "/run/bootstrap.pid", events_file="/run/events.ndjson", ssh_opts=None
+    )
+    sleep.assert_not_called()
+
+
+def test_detached_launch_diagnostics_observes_remote_command():
+    remote_run = ssh_common.make_remote_run_context(
+        backend="brev", target="box", function_name="train"
+    )
+    capture = mock.Mock(return_value="detached bootstrap diagnostics:\nprocess state: dead\n")
+    with mock.patch("runplz.backends.ssh_common.ssh_capture", capture):
+        result = ssh_common.detached_launch_diagnostics("box", remote_run)
+    assert "process state: dead" in result
+    capture.assert_called_once()
+    command = capture.call_args.args[1]
+    assert "detached bootstrap diagnostics:" in command
+    assert "run_driver.log" in command
+
+
 def test_detached_launcher_ignores_hup_before_spawn_and_in_child(tmp_path):
     remote_run = ssh_common.make_remote_run_context(
         backend="brev",
