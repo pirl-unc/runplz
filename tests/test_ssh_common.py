@@ -7,6 +7,8 @@ import subprocess
 import time
 from unittest import mock
 
+import pytest
+
 from runplz.backends import ssh_common
 
 
@@ -135,6 +137,17 @@ def test_private_module_path_remains_a_compatibility_import():
 
     assert _ssh_common.rsync_up is ssh_common.rsync_up
     assert _ssh_common.select_source_paths is ssh_common.select_source_paths
+
+
+@pytest.mark.parametrize("value", ["relative/path", "$HOME/$(touch pwned)", "/tmp/a b"])
+def test_remote_path_validation_rejects_shell_metacharacters(value):
+    with pytest.raises(ValueError):
+        ssh_common.remote_shell_path(value)
+
+
+def test_detached_probe_without_events_file_omits_start_marker():
+    probe = ssh_common.build_detached_status_probe("$HOME/run/bootstrap.pid")
+    assert "remote_command_start" not in probe
 
 
 def test_rsync_up_passes_git_selection_as_nul_delimited_stdin(tmp_path):
