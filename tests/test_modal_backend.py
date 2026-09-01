@@ -29,6 +29,26 @@ def test_modal_gpu_string_passthrough_when_no_min_vram():
     assert modal_backend._modal_gpu_string(None, 80) == "A100-80GB"
 
 
+def test_list_jobs_falls_back_to_text_and_rejects_cli_failure(monkeypatch):
+    monkeypatch.setitem(sys.modules, "modal", types.ModuleType("modal"))
+    responses = [
+        mock.Mock(returncode=1, stdout="not json", stderr="old cli"),
+        mock.Mock(returncode=0, stdout="id  runplz-app-train  running", stderr=""),
+    ]
+    with mock.patch.object(modal_backend.subprocess, "run", side_effect=responses) as run:
+        jobs = modal_backend.list_jobs()
+    assert jobs[0]["function"] == "train"
+    assert run.call_count == 2
+
+    with mock.patch.object(
+        modal_backend.subprocess,
+        "run",
+        return_value=mock.Mock(returncode=2, stdout="", stderr="boom"),
+    ):
+        with pytest.raises(RuntimeError, match="failed"):
+            modal_backend.list_jobs()
+
+
 def test_modal_gpu_string_appends_suffix():
     assert modal_backend._modal_gpu_string("A100", 80) == "A100-80GB"
     assert modal_backend._modal_gpu_string("H100", 40) == "H100-40GB"
