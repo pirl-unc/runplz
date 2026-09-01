@@ -85,6 +85,19 @@ def test_resolve_raises_clean_when_no_manifest(tmp_path):
         runs.resolve_target_and_meta(outputs_dir=tmp_path, host_override=None, run_id_override=None)
 
 
+@pytest.mark.parametrize(
+    "manifest, message",
+    [
+        ({"target": "box", "remote_paths": {}, "run_id": ""}, "missing both"),
+        ({"remote_paths": {}}, "no target host"),
+    ],
+)
+def test_resolve_rejects_incomplete_manifest(tmp_path, manifest, message):
+    _write_manifest(tmp_path, manifest)
+    with pytest.raises(RuntimeError, match=message):
+        runs.resolve_target_and_meta(outputs_dir=tmp_path, host_override=None, run_id_override=None)
+
+
 # ---------------------------------------------------------------------------
 # tail
 
