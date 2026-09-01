@@ -846,7 +846,7 @@ has, or push to S3 at the end of the function.
 pytest tests/
 ```
 
-~880 tests, all offline and all free. CI runs Python 3.10 / 3.11 / 3.12
+1,062 tests, all offline and all free. CI runs Python 3.10 / 3.11 / 3.12
 via GitHub Actions. Three tiers:
 
 **Unit / mocked.** The bulk of it: DSL rendering, config validation across
@@ -885,6 +885,16 @@ Nothing in any tier can spend money: `conftest.py` intercepts
 `subprocess.run` and refuses `brev` / `gcloud` / `aws` / `ssh` / `rsync`
 unless the test carries the matching `live_*` marker, or the binary
 resolves inside a stub directory the test created itself.
+
+The test names and markers make the runtime layer explicit. Tests using
+`mock.patch` exercise Python-level control flow only; tests using the
+`sandbox_bin` fixture exercise the real CLI subprocess boundary against an
+input-derived stub; tests marked `live_ssh` exercise a real SSH transport
+and are the only tier that can be skipped when the host cannot provide a
+local/container SSH service. A skip reports that environmental limitation
+and is never counted as a passing integration assertion. Failure scenarios
+also assert the command or probe that was observed, so a mock cannot pass
+solely because the production call was accidentally bypassed.
 
 ## License
 
