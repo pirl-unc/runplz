@@ -196,6 +196,21 @@ def test_status_handles_empty_event_log(tmp_path, capsys):
     assert "last heartbeat: (none yet)" in out
 
 
+def test_status_formats_exit_code_and_trailing_section(capsys):
+    rendered = runs._format_status(
+        target="box",
+        manifest={},
+        sections={
+            "LAST_EVENT": json.dumps({"event": "finished", "ts": "bad", "exit_code": 17}),
+            "LAST_HEARTBEAT": "",
+            "EVENT_COUNT": "3",
+        },
+    )
+    assert "finished exit_code=17" in rendered
+    assert "last heartbeat: (none yet)" in rendered
+    assert runs._parse_status_sections("---TRAILING---\nvalue\n")["TRAILING"] == "value"
+
+
 def test_status_returns_ssh_failure_code(tmp_path, capsys):
     _write_manifest(tmp_path, _manifest())
     fake = mock.Mock(returncode=255, stdout="", stderr="ssh: connect refused")
