@@ -1,12 +1,27 @@
 """Coverage for ``runplz tail`` / ``runplz status`` (issue #57)."""
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
 from runplz import cli, runs
+
+
+@pytest.mark.parametrize(
+    "delta, expected",
+    [
+        (timedelta(seconds=10), "10s ago"),
+        (timedelta(minutes=2, seconds=3), "2m 3s ago"),
+        (timedelta(hours=2, minutes=4), "2h 4m ago"),
+        (timedelta(seconds=-10), ""),
+    ],
+)
+def test_age_rendering_uses_human_scale_boundaries(delta, expected):
+    timestamp = (datetime.now(timezone.utc) - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert expected in runs._age_str(timestamp)
 
 
 def _write_manifest(outputs_dir: Path, manifest: dict) -> Path:
