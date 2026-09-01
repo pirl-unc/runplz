@@ -1,5 +1,9 @@
 # Project Lessons
 
+- Wall-clock timestamps serialized at second precision make boundary tests
+  flaky under parallel CI; assert the bounded rounding representation rather
+  than coupling correctness to scheduler timing.
+
 - `nohup` alone does not close the fork-to-exec SIGHUP race: install the ignored disposition in
   the launching parent before spawning, and retain it in long-lived child wrappers as defense in
   depth. Test detachment with the real wrapper shape and an actual signal, not only string checks
