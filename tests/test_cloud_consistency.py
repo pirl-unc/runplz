@@ -91,3 +91,40 @@ def test_aws_create_is_idempotent_and_distinguishes_tokens(sandbox_bin):
     assert first == retry
     assert first != distinct
     assert len(fake_cloud.calls_matching(log, "run-instances")) == 3
+
+
+def test_fake_aws_rejects_unknown_options_instead_of_accepting_any_argv(sandbox_bin):
+    log = fake_cloud.install(sandbox_bin, name="aws")
+    result = subprocess.run(
+        [
+            "aws",
+            "ec2",
+            "describe-instances",
+            "--region",
+            "us-east-1",
+            "--instance-ids",
+            "i-fake",
+            "--query",
+            "Reservations",
+            "--output",
+            "text",
+            "--definitely-not-an-aws-option",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+    assert "unknown option" in result.stderr
+    assert len(fake_cloud.calls_matching(log, "describe-instances")) == 1
+
+
+def test_fake_aws_rejects_missing_required_options(sandbox_bin):
+    log = fake_cloud.install(sandbox_bin, name="aws")
+    result = subprocess.run(
+        ["aws", "ec2", "run-instances", "--region", "us-east-1"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+    assert "missing required option" in result.stderr
+    assert len(fake_cloud.calls_matching(log, "run-instances")) == 1
