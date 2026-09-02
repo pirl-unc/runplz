@@ -72,6 +72,54 @@ def test_describe_eventual_consistency_is_scriptable(sandbox_bin):
     fake_cloud.assert_observed(log, "describe-instances", count=3)
 
 
+def test_fake_describe_address_is_derived_from_requested_instance(sandbox_bin):
+    log = fake_cloud.install(sandbox_bin, name="aws")
+    common = [
+        "aws",
+        "ec2",
+        "run-instances",
+        "--region",
+        "us-east-1",
+        "--image-id",
+        "ami-x",
+        "--instance-type",
+        "t3.micro",
+        "--key-name",
+        "k",
+        "--count",
+        "1",
+        "--client-token",
+    ]
+    for token in ("one", "two"):
+        subprocess.run(
+            common + [token, "--tag-specifications", "x", "--output", "json"], check=True
+        )
+    for instance_id, expected in (
+        ("i-fake0000000001", "127.0.0.1"),
+        ("i-fake0000000002", "127.0.0.2"),
+    ):
+        result = subprocess.run(
+            [
+                "aws",
+                "ec2",
+                "describe-instances",
+                "--region",
+                "us-east-1",
+                "--instance-ids",
+                instance_id,
+                "--query",
+                "Reservations",
+                "--output",
+                "text",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert result.stdout.strip() == expected
+    fake_cloud.assert_observed(log, "describe-instances", count=2)
+
+
 def test_malformed_create_response_is_visible(sandbox_bin):
     fake_cloud.install(
         sandbox_bin,
