@@ -3,6 +3,15 @@
 import subprocess
 
 import fake_cloud
+import pytest
+
+
+def test_command_observation_contract_rejects_silent_paths(tmp_path):
+    """The fidelity helper itself must fail when a path never invoked the CLI."""
+    log = tmp_path / "aws-calls.jsonl"
+    log.write_text('{"argv": ["ec2", "describe-instances"]}\n')
+    with pytest.raises(AssertionError, match="observed no command"):
+        fake_cloud.assert_observed(log, "terminate-instances")
 
 
 def test_describe_eventual_consistency_is_scriptable(sandbox_bin):
