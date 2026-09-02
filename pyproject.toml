@@ -70,10 +70,9 @@ testpaths = ["tests"]
 branch = true
 
 [tool.coverage.report]
-# Current branch coverage is 93.85%; keep the gate just below the measured
-# value and ratchet it upward as the remaining environment-dependent branches
-# gain focused tests.
-fail_under = 93.8
+# Keep the release gate at the measured 95%+ line. Branch gaps should be
+# closed by shared behavior and parameterized tests, not exclusions.
+fail_under = 95.0
 
 [tool.ruff]
 line-length = 100

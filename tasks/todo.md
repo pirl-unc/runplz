@@ -1374,3 +1374,7 @@ Implemented; verification is recorded in the final review below.
 - [ ] Add mutation probes for each failure scenario and document exercised runtime layers.
 - [ ] Distinguish sandbox-unavailable skips from passing integration tests.
 - [ ] Run format, lint, tests, review, merge, and deploy.
+# PR E — Coverage ratchet
+- [ ] Raise the coverage floor to 95%+ and verify CI across supported Python versions.
+- [ ] Add/retain parameterized lifecycle coverage where shared logic has branches.
+- [ ] Run format, lint, tests, review, merge, and deploy.
