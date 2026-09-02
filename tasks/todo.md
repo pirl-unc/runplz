@@ -1359,3 +1359,13 @@ Implemented; verification is recorded in the final review below.
 - [x] Add behavior-driven tests for reusable SSH wait/command and staging failure semantics.
 - [x] Run format, lint, and full test/coverage gates; record measured result (1025 passed, 3 skips, 93.92% branch coverage).
 - [ ] Open, review, merge, and deploy a versioned PR if the change is validated.
+# Issue #122 — Detached inactivity watchdog
+
+- [ ] Add opt-in `max_inactivity_seconds` and `inactivity_action` to SSH/Brev
+      configuration with validation; default disabled.
+- [ ] Thread the options through dispatch and detached/container monitoring.
+- [ ] Use heartbeat/progress timestamps (not stdout silence alone), bounded
+      diagnostics, and exact-run termination when requested.
+- [ ] Add tests for healthy silence, diagnose, terminate, reconnect, and output
+      preservation; verify event and command observation.
+- [ ] Run format, lint, full tests, review, merge, and deploy as its own PR.
