@@ -1369,3 +1369,8 @@ Implemented; verification is recorded in the final review below.
 - [ ] Add tests for healthy silence, diagnose, terminate, reconnect, and output
       preservation; verify event and command observation.
 - [ ] Run format, lint, full tests, review, merge, and deploy as its own PR.
+# PR 0 — Test-fidelity audit
+- [ ] Add shared command-observation assertions to every subprocess fake.
+- [ ] Add mutation probes for each failure scenario and document exercised runtime layers.
+- [ ] Distinguish sandbox-unavailable skips from passing integration tests.
+- [ ] Run format, lint, tests, review, merge, and deploy.

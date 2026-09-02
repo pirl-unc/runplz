@@ -301,6 +301,22 @@ def calls_matching(log: Path, *tokens: str) -> list:
     return [argv for argv in calls(log) if all(t in argv for t in tokens)]
 
 
+def assert_observed(log: Path, *tokens: str, count: int | None = None) -> list:
+    """Assert that the real stub observed a command containing ``tokens``.
+
+    Keeping this assertion beside the subprocess fake makes tests fail when a
+    production path is accidentally replaced by a mock or silently skipped.
+    ``count`` optionally pins the number of observations for retry tests.
+    """
+    observed = calls_matching(log, *tokens)
+    assert observed, (
+        f"fake {log.stem.removesuffix('-calls')} observed no command containing {tokens!r}"
+    )
+    if count is not None:
+        assert len(observed) == count, (tokens, observed)
+    return observed
+
+
 def install_unreachable_ssh(bin_dir: Path) -> Path:
     """An `ssh` that always fails, standing in for a box that never came up.
 
