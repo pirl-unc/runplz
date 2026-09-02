@@ -59,6 +59,13 @@ def _first_token(cmd) -> str:
 # so the real `gcloud` stays blocked even while a fake one is installed.
 _SANDBOX_BINS: set = set()
 
+_ENVIRONMENT_SKIP_PREFIX = "ENVIRONMENT_UNAVAILABLE:"
+
+
+def _skip_environment(reason: str) -> None:
+    """Emit a machine-distinguishable skip for unavailable infrastructure."""
+    pytest.skip(f"{_ENVIRONMENT_SKIP_PREFIX} {reason}")
+
 
 def _resolves_into_sandbox(prog: str) -> bool:
     if not _SANDBOX_BINS:
@@ -199,11 +206,11 @@ def sshd_server(tmp_path_factory):
     except Exception as exc:
         message = f"could not initialize SSH test backend: {exc}"
         if mode == "auto":
-            pytest.skip(message)
+            _skip_environment(message)
         pytest.fail(message)
     if server is None:
         if mode == "auto":
-            pytest.skip(unavailable)
+            _skip_environment(unavailable)
         pytest.fail(unavailable)
     try:
         server.start()
@@ -211,7 +218,7 @@ def sshd_server(tmp_path_factory):
         server.stop()
         message = f"could not start {type(server).__name__}: {exc}"
         if mode == "auto":
-            pytest.skip(message)
+            _skip_environment(message)
         pytest.fail(message)
     try:
         yield server
