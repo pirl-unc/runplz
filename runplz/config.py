@@ -80,6 +80,10 @@ class BrevConfig:
     # forever. Distinct from `Function(timeout=...)` which applies only
     # to Modal — this is a Brev-specific kill-switch enforced by runplz.
     max_runtime_seconds: Optional[int] = None
+    # Optional application-progress watchdog for detached runs. Disabled by
+    # default because legitimate build/download phases can be quiet.
+    max_inactivity_seconds: Optional[int] = None
+    inactivity_action: str = "diagnose"
     # How long to wait for the freshly-provisioned Brev box to become
     # SSH-reachable before giving up. Default 1800s (30 min) covers
     # 8×A100/H100 cold boots on Denvr / OCI (observed 15-18 min). Bump
@@ -173,6 +177,8 @@ class SshConfig:
     # Wall-clock kill-switch on the remote run. Same semantics as
     # BrevConfig.max_runtime_seconds.
     max_runtime_seconds: Optional[int] = None
+    max_inactivity_seconds: Optional[int] = None
+    inactivity_action: str = "diagnose"
     # How long to wait for the SSH box to become reachable before giving
     # up. Default 1800s (30 min). Mostly matters when the user is
     # booting the box themselves just before the runplz invocation;
@@ -393,6 +399,18 @@ def _validate_remote_common(
         raise ValueError(
             f"{cls_name}.max_runtime_seconds must be a positive int (or None); "
             f"got {cfg.max_runtime_seconds!r}."
+        )
+    inactivity_seconds = getattr(cfg, "max_inactivity_seconds", None)
+    if inactivity_seconds is not None and inactivity_seconds <= 0:
+        raise ValueError(
+            f"{cls_name}.max_inactivity_seconds must be a positive int (or None); "
+            f"got {inactivity_seconds!r}."
+        )
+    inactivity_action = getattr(cfg, "inactivity_action", "diagnose")
+    if inactivity_action not in ("diagnose", "terminate"):
+        raise ValueError(
+            f"{cls_name}.inactivity_action must be 'diagnose' or 'terminate'; "
+            f"got {inactivity_action!r}."
         )
     if not isinstance(cfg.ssh_ready_wait_seconds, int) or cfg.ssh_ready_wait_seconds <= 0:
         raise ValueError(
