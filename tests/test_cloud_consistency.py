@@ -60,7 +60,7 @@ def test_describe_eventual_consistency_is_scriptable(sandbox_bin):
     assert second.returncode != 0
     assert third.returncode == 0
     assert third.stdout.strip() == "127.0.0.1"
-    assert len(fake_cloud.calls_matching(log, "describe-instances")) == 3
+    fake_cloud.assert_observed(log, "describe-instances", count=3)
 
 
 def test_malformed_create_response_is_visible(sandbox_bin):
