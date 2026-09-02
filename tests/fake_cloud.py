@@ -261,6 +261,14 @@ if "/".join(key) in MALFORMED:
 else:
     if key == ("ec2", "run-instances"):
         sys.stdout.write(json.dumps({{"Instances": [{{"InstanceId": instance_id}}]}}))
+    elif key == ("ec2", "describe-instances"):
+        # Keep the fake response tied to the requested resource.  A
+        # production bug that asks about the wrong instance must not still
+        # receive a universal localhost address.
+        requested = option_value("--instance-ids") or ""
+        digits = "".join(ch for ch in requested if ch.isdigit())
+        octet = (int(digits[-3:]) if digits else 1) % 254 or 1
+        sys.stdout.write("127.0.0." + str(octet))
     else:
         sys.stdout.write(ROUTES[key])
 sys.exit(0)
