@@ -143,7 +143,9 @@ def test_a_detached_run_reports_its_real_exit_code(
 ):
     """The detachment contract: the job outlives the ssh that started it."""
     if not remote_is_linux:
-        pytest.skip("detached launch is broken on a macOS remote — issue #92")
+        pytest.skip(
+            "ENVIRONMENT_UNAVAILABLE: detached launch is broken on a macOS remote — issue #92"
+        )
     sc.prepare_remote_run(target, remote_run, manifest={}, ssh_opts=opts)
 
     code = sc.launch_detached_and_wait(
@@ -164,7 +166,9 @@ def test_kill_actually_stops_a_running_remote_process(target, opts, remote_run, 
     running the script against a real process.
     """
     if not remote_is_linux:
-        pytest.skip("detached launch is broken on a macOS remote — issue #92")
+        pytest.skip(
+            "ENVIRONMENT_UNAVAILABLE: detached launch is broken on a macOS remote — issue #92"
+        )
     sc.prepare_remote_run(target, remote_run, manifest={}, ssh_opts=opts)
     files = _run_files(remote_run)
     # Launch, but do not wait: this test is about killing a live process.
