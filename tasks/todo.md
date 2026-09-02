@@ -1378,3 +1378,6 @@ Implemented; verification is recorded in the final review below.
 - [ ] Raise the coverage floor to 95%+ and verify CI across supported Python versions.
 - [ ] Add/retain parameterized lifecycle coverage where shared logic has branches.
 - [ ] Run format, lint, tests, review, merge, and deploy.
+# PR 0 follow-up — runtime-layer fidelity documentation
+- [ ] Document test harness layers and mutation-probe interpretation.
+- [ ] Run format, lint, tests, review, merge, and deploy.
