@@ -108,7 +108,10 @@ def list_jobs() -> list[dict]:
     try:
         import modal  # noqa: F401
     except ImportError:
-        return []
+        raise RuntimeError(
+            "Modal backend requires the optional dependency; install it with "
+            "`pip install 'runplz[modal]'` and run `modal setup`."
+        ) from None
 
     r = subprocess.run(
         ["modal", "app", "list", "--json"],

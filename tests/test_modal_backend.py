@@ -49,6 +49,12 @@ def test_list_jobs_falls_back_to_text_and_rejects_cli_failure(monkeypatch):
             modal_backend.list_jobs()
 
 
+def test_list_jobs_requires_modal_package(monkeypatch):
+    monkeypatch.setitem(sys.modules, "modal", None)
+    with pytest.raises(RuntimeError, match=r"runplz\[modal\].*modal setup"):
+        modal_backend.list_jobs()
+
+
 def test_modal_gpu_string_appends_suffix():
     assert modal_backend._modal_gpu_string("A100", 80) == "A100-80GB"
     assert modal_backend._modal_gpu_string("H100", 40) == "H100-40GB"
