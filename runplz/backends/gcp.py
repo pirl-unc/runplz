@@ -14,6 +14,9 @@ if the default VPC isn't right; runplz will not open firewall rules for
 you, and a VPC with no inbound 22 will simply hang the ssh wait.
 """
 
+import json
+import os
+import subprocess
 from typing import Optional
 
 from runplz.backends.provisioning import (
@@ -40,7 +43,51 @@ __all__ = [
     "resolve_shape",
     "build_create_command",
     "apply_on_finish",
+    "list_jobs",
 ]
+
+
+def list_jobs(*, project: str | None = None, zone: str | None = None) -> list[dict]:
+    """List active runplz-labelled GCE instances through the real gcloud CLI."""
+    project = project or os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCLOUD_PROJECT")
+    zone = zone or os.environ.get("CLOUDSDK_COMPUTE_ZONE")
+    if not project:
+        raise RuntimeError("GCP project is required; pass --project or set GOOGLE_CLOUD_PROJECT")
+    cmd = [
+        "gcloud",
+        "compute",
+        "instances",
+        "list",
+        f"--project={project}",
+        "--filter=labels.runplz=1",
+        "--format=json",
+    ]
+    if zone:
+        cmd.append(f"--zones={zone}")
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError(
+            f"gcloud instances list failed (rc={r.returncode}): {(r.stderr or '').strip()[:300]}"
+        )
+    try:
+        instances = json.loads(r.stdout)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("gcloud instances list returned malformed JSON") from exc
+    rows = []
+    for instance in instances if isinstance(instances, list) else []:
+        name = instance.get("name", "")
+        parts = name.split("-", 2)
+        rows.append(
+            {
+                "backend": "gcp",
+                "name": name,
+                "app": parts[1] if len(parts) > 1 else "",
+                "function": parts[2] if len(parts) > 2 else "",
+                "started": instance.get("creationTimestamp", ""),
+                "status": instance.get("status", ""),
+            }
+        )
+    return rows
 
 
 def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
