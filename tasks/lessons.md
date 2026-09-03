@@ -23,3 +23,20 @@
 - A Git index is not a flat list of copyable files: sparse entries may be absent and submodules are
   gitlinks. Validate working-tree presence and recurse through initialized submodule Git selections
   before handing paths to rsync.
+- Do not derive a capability flag from a property that merely correlates with it today.
+  "Is this backend in the default fan-out" and "does every required field have an env
+  fallback" agreed for all six backends by coincidence, and inferring one from the other
+  reads as a rule while being an accident. State the capability; let the correlation be
+  a coincidence.
+- When a refactor moves a filter, check what the old filter was *rejecting*, not just what
+  it accepted. `[h for h in raw.split(",") if h.strip()]` silently encoded "blank and
+  separator-only input means no targets at all"; re-expressing it as a split lost that and
+  sent an empty hostname to ssh. Behaviour living in a comprehension's `if` is still
+  behaviour, and usually has no test.
+- Resolution and normalization of one value belong in one place. Splitting them — blank
+  handling in one layer, comma-splitting in another — makes the two disagree the moment a
+  value arrives from a source only one of them sees (an env var rather than a flag).
+- A test that passes because unrelated code happens to fail is not passing for its stated
+  reason. `runplz ps` CLI tests patched three of five fan-out backends and relied on the
+  other two erroring on a dev machine with no cloud credentials. Patch the whole surface a
+  test claims to control.

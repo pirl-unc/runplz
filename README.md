@@ -333,7 +333,7 @@ internal that can move in a patch release.
 | `runplz.backends.provisioning` | Retry policy, GPU shape tables, instance naming, and teardown shared by the cloud drivers. |
 | `runplz.backends.local`, `runplz.backends.ssh`, `runplz.backends.brev`, `runplz.backends.modal`, `runplz.backends.gcp`, `runplz.backends.aws` | The backend drivers. Each exports `run` and — where the backend declares a `ListingSpec` — `list_jobs`, returning `JobRecord`s. The contract `registry.load()` calls. Normally reached through the CLI or `App.bind()`, not imported directly. |
 
-#### 4.0.0: `list_jobs` takes its scope, it no longer finds it
+### 4.0.0: `list_jobs` takes its scope, it no longer finds it
 
 `aws.list_jobs()` and `gcp.list_jobs()` used to read `AWS_DEFAULT_REGION` /
 `GOOGLE_CLOUD_PROJECT` themselves. That fallback now lives once, in the
