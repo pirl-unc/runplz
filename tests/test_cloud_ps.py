@@ -486,3 +486,16 @@ def test_scope_fields_refuses_two_fields_that_share_an_option_string(monkeypatch
     monkeypatch.setitem(registry.BACKENDS, "clashing", clashing)
     with pytest.raises(ValueError, match=r"option --ssh is claimed by both ssh and clashing"):
         registry.scope_fields()
+
+
+def test_a_value_the_field_cannot_type_is_reported_as_bad_scope():
+    """All three ways scope can be wrong — absent, unusable, out of range —
+    reach a caller of the entry point in one vocabulary. A bare
+    `invalid literal for int()` names Python's problem, not the user's."""
+    from runplz.backends import ssh
+    from runplz.backends.listing import InvalidScope
+
+    with mock.patch.object(ssh, "list_jobs") as list_jobs:
+        with pytest.raises(InvalidScope, match="ssh port is not usable"):
+            registry.list_jobs("ssh", host="a.box", port="abc")
+    list_jobs.assert_not_called()

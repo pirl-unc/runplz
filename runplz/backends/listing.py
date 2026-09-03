@@ -232,7 +232,15 @@ class ListingSpec:
         """
         resolved = {}
         for f in self.scope:
-            value = f.resolve(values.get(f.name))
+            try:
+                value = f.resolve(values.get(f.name))
+            except (TypeError, ValueError) as exc:
+                # `type` coercion failing is still the scope being wrong, and
+                # a caller of `registry.list_jobs` should hear that in the same
+                # vocabulary as the other two rejections rather than getting a
+                # bare "invalid literal for int()". argparse catches this first
+                # on the CLI path, so only a direct call reaches here.
+                raise InvalidScope(f"{backend} {f.name} is not usable: {exc}") from None
             if value is None and f.required:
                 raise MissingScope(f.missing_message(backend))
             if value is not None and f.validate is not None:
