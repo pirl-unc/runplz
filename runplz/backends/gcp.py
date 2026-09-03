@@ -32,6 +32,7 @@ from runplz.backends.provisioning import (
     resolve_gpu_label,
     run_cli,
     select_machine,
+    split_instance_name,
 )
 from runplz.backends.ssh_common import run_on_provisioned_vm
 
@@ -76,13 +77,13 @@ def list_jobs(*, project: str | None = None, zone: str | None = None) -> list[di
     rows = []
     for instance in instances if isinstance(instances, list) else []:
         name = instance.get("name", "")
-        parts = name.split("-", 2)
+        app_name, fn_name = split_instance_name(name)
         rows.append(
             {
                 "backend": "gcp",
                 "name": name,
-                "app": parts[1] if len(parts) > 1 else "",
-                "function": parts[2] if len(parts) > 2 else "",
+                "app": app_name,
+                "function": fn_name,
                 "started": instance.get("creationTimestamp", ""),
                 "status": instance.get("status", ""),
             }

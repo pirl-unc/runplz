@@ -30,6 +30,7 @@ from runplz.backends.provisioning import (
     resolve_gpu_label,
     run_cli,
     select_machine,
+    split_instance_name,
 )
 from runplz.backends.ssh_common import SshOptions, run_on_provisioned_vm
 
@@ -93,13 +94,13 @@ def list_jobs(*, region: str | None = None) -> list[dict]:
         for instance in reservation.get("Instances", []):
             tags = {tag.get("Key"): tag.get("Value") for tag in instance.get("Tags", [])}
             name = tags.get("Name") or instance.get("InstanceId", "")
-            parts = name.split("-", 2)
+            app_name, fn_name = split_instance_name(name)
             rows.append(
                 {
                     "backend": "aws",
                     "name": name,
-                    "app": parts[1] if len(parts) > 1 else "",
-                    "function": parts[2] if len(parts) > 2 else "",
+                    "app": app_name,
+                    "function": fn_name,
                     "started": instance.get("LaunchTime", ""),
                     "status": instance.get("State", {}).get("Name", ""),
                 }
