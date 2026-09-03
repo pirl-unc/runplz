@@ -1,3 +1,209 @@
+## 2026-09-03 PR Plan — Typed JobRecord + backend listing capabilities (#133)
+
+Branch: `feat/typed-job-records` (off `main` @ `917d1e6`)
+
+- [x] New public `runplz/backends/listing.py`: `JobRecord`, `ScopeField`,
+      `ListingSpec`, `MissingScope`, `ListingUnsupported`
+- [x] `registry.BackendSpec.lists_jobs` -> `listing: ListingSpec | None`;
+      add `listable_names()`, `scope_fields()`, `list_jobs()` dispatch
+- [x] Every driver returns `JobRecord`; aws/gcp stop resolving their own scope
+- [x] `cli._ps_main` generates flags + selection from the registry
+- [x] Guard `runplz.backends.aws` / `.gcp` in `tests/conftest.py`
+- [x] Bump `runplz/version.py` to 4.0.0 (breaking: see below)
+- [x] `./format.sh`, `./lint.sh`, `./test.sh`
+- [ ] Review, merge, deploy
+
+### The problem
+
+`runplz ps` grew per-provider by accretion:
+
+- Six independent dict literals (`local`, `brev` x1, `modal` x2, `aws`, `gcp`,
+  `docker.parse_ps_rows`) all had to agree with `_print_ps_table`'s
+  `row.get(key, "")`. Nothing checked that they did.
+- `_collect_backend_jobs` mapped CLI args to driver kwargs through an
+  `if backend == ...` chain, and the flags themselves were hardcoded.
+- `aws.list_jobs` / `gcp.list_jobs` each resolved their own env fallbacks and
+  raised after dispatch, so "what scope does this backend need" was written
+  twice, in two shapes, in the wrong layer.
+- `ssh` was excluded from `lists_jobs`, so `_ps_main` carried a second loop
+  just for it and `runplz ps ssh` was an "invalid choice".
+
+### Design
+
+`listing.py` holds pure data with no provider knowledge and no argparse
+import, so the dependency graph stays a DAG:
+`listing` <- `docker` / `registry` / every driver.
+
+- `JobRecord` — the one row shape. `_print_ps_table` derives its headers from
+  `dataclasses.fields()`, so a renamed field can't drift from the table.
+- `ScopeField` — `name` (the driver kwarg) / `flag` + `aliases` (CLI spelling)
+  / `help` / `env` / `required` / `multiple` / `type`. `name` and `flag`
+  decouple on purpose: `--ssh-key` feeds `ssh_key_path`.
+- `ListingSpec` — `scope` plus an explicit `default_fan_out`. Explicit, not
+  inferred from "every required field has an env fallback": those two
+  correlate today by coincidence, and inferring would have put `ssh` in the
+  bare fan-out and added a third warning line to the most common invocation.
+- `resolve()` applies env fallbacks and raises `MissingScope` **before** any
+  provider CLI is spawned — the acceptance criterion that scope is validated
+  ahead of dispatch, not inside the driver.
+- `BackendSpec.listing = None` is the explicit "cannot enumerate jobs";
+  `registry.list_jobs` raises `ListingUnsupported` rather than returning `[]`.
+
+### Compatibility notes
+
+Four behaviours that a naive unification would have broken, all now pinned by
+tests:
+
+- The ssh probe runs **independently of the positional**: `runplz ps local
+  --host box` lists local jobs *and* the box's. Selection is therefore
+  "positional (or the fan-out set), plus any non-fan-out backend whose
+  required scope the user supplied" — not "scope implies backend", which
+  would make `runplz ps local --region r` start querying AWS.
+- Missing scope stays a per-backend warning with rc 1, not a parser error
+  (which would return 2 with different stderr).
+- `registry.list_jobs` does not wrap provider errors, so the
+  `warning: <backend> listing failed: <ExcName>: ...` line is unchanged for
+  every real provider failure.
+- Unset optional scope is passed explicitly as `None`, matching the ssh call
+  shape the existing tests assert.
+
+Deliberately not done: rejecting a scope flag that no selected backend accepts
+(today it is silently ignored; erroring is a new failure mode the issue does
+not ask for).
+
+### Sequencing
+
+`listing.py` first (nothing depends on it), then `registry`, then the six
+drivers, then `cli`, then tests and docs. Tests stay green at each step
+except for the intentional record-access churn.
+
+### Review
+
+Landed as designed. 1104 passing, coverage 95.39% (floor 95.0), with
+`listing.py`, `registry.py` and `docker.py` each at 100%.
+
+What the change actually removed: `_collect_backend_jobs`'s if-chain, the
+second dispatch loop in `_ps_main`, six hardcoded flag declarations, two
+copies of the env-fallback logic, and one of the two duplicated
+`--ssh-port` range checks. `runplz ps --help` renders the same text as
+before, generated — including the `[aws]` tags and the `Or set
+AWS_DEFAULT_REGION / AWS_REGION` hints, both derived from the registry.
+
+Behaviour added, both small:
+
+- `runplz ps ssh` is now a valid target. It used to be `invalid choice:
+  'ssh'`, which said the backend could not be listed when it only needed a
+  host; it now reports the host.
+- An empty table names the backends that went unasked. That is the moment
+  "nothing is running" and "nobody asked" are indistinguishable, and ssh
+  jobs are invisible to a bare `runplz ps`. Suppressed once rows exist or
+  once a positional narrowed the selection.
+
+Fixed in passing: `runplz.backends.aws` and `.gcp` were missing from
+`tests/conftest.py`'s `_MODULES_TO_GUARD`, so `list_jobs` reached the real
+`aws` / `gcloud` binaries whenever a test drove `runplz ps` on a machine
+with the provider env vars set — the billed-CLI call that guard exists to
+stop. Pre-existing, and this PR's tests would have widened it.
+
+### Second review pass
+
+The fix commits were themselves reviewed, and the first fix turned out to be
+half a fix. `--host ,` was still reaching ssh with a hostname of "," on the
+*positional* path: `invited_by` asked `resolve_all` ("how many targets?")
+while the required-field check asked `resolve` ("is it supplied?"), and for
+"," those two disagreed. The fan-out path was guarded, `runplz ps ssh
+--host ,` was not, and neither was `registry.list_jobs("ssh", host=",")`.
+
+`resolve` is now defined in terms of `resolve_all`, so the two cannot
+disagree by construction, and a test asserts that invariant directly across
+every blank/separator input rather than only at the CLI.
+
+Also from that pass:
+
+- The 4.0.0 migration block had been inserted *between* table rows, orphaning
+  four of them — they would have rendered as literal pipe-delimited text on
+  the PyPI project page for this release. Moved below the table.
+- `resolve` applied the field's `type` to environment values but not explicit
+  ones, so `registry.list_jobs("ssh", port="2200")` handed the driver a
+  string while the same field from an env var gave an int. Applied to both.
+- The `validate` hook only ran in the CLI's argparse loop, so it was a check
+  on one spelling of the input rather than on the value. It runs in
+  `ListingSpec.resolve` now, which is the path every caller takes.
+- `gcp.list_jobs` silently returned `[]` for valid-JSON-but-not-a-list (`{}`,
+  `null`) — reporting "no jobs", the one answer a listing must never invent,
+  and the exact failure this issue exists to prevent. It raises now, matching
+  aws. The aws comment claiming parity with gcp was written before that was
+  true; corrected.
+- `scope_fields` guarded `flag` and `name` but not `aliases`. All three keys
+  are one guard now, which also removed a branch the flag/name guards had
+  made unreachable.
+
+### Version: 4.0.0, not 3.25.0
+
+`aws.list_jobs()` and `gcp.list_jobs()` are in their modules' `__all__`, and
+the README's Public API table — which it says is semver-covered — lists both
+modules. Moving their env fallbacks up into the registry made `region` and
+`project` required keyword arguments, so a downstream `aws.list_jobs()` with
+`AWS_DEFAULT_REGION` set now raises TypeError. That is a major break by the
+repo's own stated rule, whatever the usual patch-bump habit, so it ships as
+one, with a migration note in the README pointing at
+`registry.list_jobs(name, **scope)`.
+
+### Code review follow-up
+
+Twelve findings addressed. The one real regression I had introduced:
+`--host ''` and `--host ,` reached ssh with a garbage hostname, because the
+pre-3.25 CLI filtered them with `if h.strip()` and my `_ps_targets` split
+turned "no targets" into "one empty target". The user saw
+`Could not resolve hostname` — an error about their network rather than
+their command.
+
+Root cause was that resolution and splitting had been separated: `resolve`
+treated a blank *explicit* value as supplied while correctly treating a
+blank *environment* value as unset, and the comma split lived in the CLI
+where an environment-supplied value never reached it. Both now live on
+`ScopeField` (`resolve` / `resolve_all`), so a value is treated the same
+way whichever source it came from. That also fixed `--region ''` reaching
+the provider as `--region ''`.
+
+The rest, briefly:
+
+- `scope_fields` guarded flag collisions but not `name` collisions, so two
+  backends could claim one driver keyword under different flags — argparse
+  accepts that and cross-feeds them. Both halves are guarded now.
+- `has_required_scope` answered True by vacuous `all([])`, so a backend
+  declaring `default_fan_out=False` with no required scope rejoined the
+  fan-out it opted out of. Renamed to `invited_by` and made explicit.
+- The `--ssh-port` range check reached into the scope dict by the literal
+  key `"port"`, so renaming the field would have silently disabled it. It
+  is a `validate` hook on the field now, one definition shared with
+  `tail`/`status`/`kill`.
+- `registry.list_jobs` silently dropped undeclared keywords, turning a typo
+  into "aws region is required". It raises TypeError naming what it accepts.
+- Environment values skipped the field's `type`, so a typed field with an
+  env fallback would have handed the driver a string.
+- The "not listed" note printed even when every backend errored and no
+  table was drawn, burying the warnings that explained the failure. Gated
+  on the table having been printed.
+- `aws.list_jobs` died with AttributeError on valid-JSON-but-not-an-object
+  (`[]`, `null`), escaping its own malformed-JSON handler. Pre-existing;
+  fixed to match the guard gcp already had.
+- The seven pre-existing `runplz ps` CLI tests were passing only because
+  gcp/aws happen to error on a machine with no cloud env. Migrated onto the
+  `quiet_fan_out` fixture that was added for exactly that hazard.
+
+Two near-misses worth keeping, both caught in design review rather than by
+a test, because no test pinned either:
+
+- The ssh probe has always run *independently of the positional*, so
+  `runplz ps local --host box` lists both. The obvious "positional means
+  only that backend" selection rule silently drops half the answer. Now
+  pinned by `test_ps_probes_an_ssh_host_even_when_a_positional_narrows_the_rest`.
+- Deriving "is in the default fan-out" from "every required field has an
+  env fallback" gives the right answer for all six backends today purely by
+  coincidence, and would have added a third warning line to the most common
+  invocation. `default_fan_out` is stated instead.
+
 ## 2026-08-27 PR Plan — Retry idempotent SSH preparation (#84)
 
 Branch: `fix/retry-ssh-preparation` (off `main` @ `1182715`)

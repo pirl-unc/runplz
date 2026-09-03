@@ -244,7 +244,8 @@ aliases or remembering remote run IDs:
 ```bash
 runplz ps                          # list runplz jobs across all backends
 runplz ps brev                     # one backend
-runplz ps --host my.gpu.box        # also probe an SSH host
+runplz ps --host my.gpu.box        # also probe an SSH host (alongside the rest)
+runplz ps ssh --host my.gpu.box    # that host and nothing else
 
 runplz tail                        # tail remote driver log of the most recent run
 runplz tail -n 500                 # last N lines (default 120)
@@ -267,7 +268,9 @@ what you want when targeting `--host`/`--run-id` with no local manifest.
 reading the local `out/.runplz/run.json` manifest the dispatch path
 writes. Pass `--outputs-dir <path>` to point at a different one, or
 `--host <h> --run-id <id>` to target a specific run by ID. SSH has no
-host registry, so `runplz ps` skips it unless you pass `--host`.
+host registry, so a bare `runplz ps` skips it and says so; pass
+`--host` to include it, alongside the other backends or on its own as
+`runplz ps ssh --host <h>`.
 
 #### What `kill` actually stops
 
@@ -325,13 +328,31 @@ internal that can move in a patch release.
 | `runplz.runs` | The `tail` / `status` / `kill` verbs, plus the reader for the `run.json` manifest that `rsync_down` leaves in your outputs dir. |
 | `runplz.bootstrap` | The in-container loader and its **environment contract** — `RUNPLZ_SCRIPT`, `RUNPLZ_FUNCTION`, `RUNPLZ_OUT`, `RUNPLZ_ARGS`, `RUNPLZ_KWARGS`. |
 | `runplz.backends.registry` | What backends exist and what each accepts — the single source of truth behind the CLI's choices. |
+| `runplz.backends.listing` | The shape of a listed job and the scope a backend needs to produce one: `JobRecord`, `ScopeField`, `ListingSpec`, `MissingScope`, `InvalidScope`, `ListingUnsupported`. |
 | `runplz.backends.ssh_common` | The shared layer every ssh-reachable backend runs on: `dispatch_to_target`, `run_on_provisioned_vm`, and the individual pipeline stages. |
 | `runplz.backends.provisioning` | Retry policy, GPU shape tables, instance naming, and teardown shared by the cloud drivers. |
-| `runplz.backends.local`, `runplz.backends.ssh`, `runplz.backends.brev`, `runplz.backends.modal`, `runplz.backends.gcp`, `runplz.backends.aws` | The backend drivers. Each exports `run` and (where the backend can enumerate jobs) `list_jobs` — the contract `registry.load()` calls. Normally reached through the CLI or `App.bind()`, not imported directly. |
+| `runplz.backends.local`, `runplz.backends.ssh`, `runplz.backends.brev`, `runplz.backends.modal`, `runplz.backends.gcp`, `runplz.backends.aws` | The backend drivers. Each exports `run` and — where the backend declares a `ListingSpec` — `list_jobs`, returning `JobRecord`s. The contract `registry.load()` calls. Normally reached through the CLI or `App.bind()`, not imported directly. |
 | `runplz.backends.docker` | Container labels and `docker ps` parsing, shared by the local and ssh backends. |
 | `runplz.selector` | `pick_machine` / `pick_machines` — cost-tolerance shape selection with an availability tiebreak. |
 | `runplz.excludes` | `DEFAULT_TRANSFER_EXCLUDES`, the secret-shaped patterns kept off every host -> remote transfer. |
 | `runplz.logcapture` | Tees the driver's stdout/stderr to a log file (what `--log-file` drives). |
+
+### 4.0.0: `list_jobs` takes its scope, it no longer finds it
+
+`aws.list_jobs()` and `gcp.list_jobs()` used to read `AWS_DEFAULT_REGION` /
+`GOOGLE_CLOUD_PROJECT` themselves. That fallback now lives once, in the
+registry's `ListingSpec`, and both take their scope as a required keyword:
+
+```python
+# before (3.x)                      # after (4.0)
+aws.list_jobs()                     registry.list_jobs("aws")
+gcp.list_jobs()                     registry.list_jobs("gcp")
+```
+
+`registry.list_jobs(name, **scope)` is the entry point to prefer: it reads
+the same environment variables, validates before spawning a provider CLI,
+and works the same way for every backend. Calling a driver directly still
+works — `aws.list_jobs(region="us-east-1")` — but you supply the region.
 
 Writing a new backend means answering three questions — how do I create a
 box, what ssh target do I hand over, how do I tear it down — and passing
@@ -825,8 +846,10 @@ has, or push to S3 at the end of the function.
 - `runplz ps` lists AWS/GCP instances carrying runplz's tag/label. Pass
   `--region` (or set `AWS_DEFAULT_REGION`) and `--project`/`--zone` (or set
   the corresponding gcloud environment variables) when querying those
-  providers. `runplz tail` / `status` / `kill` work as usual once a run has
-  written its manifest.
+  providers; each backend declares what it needs, and missing scope is
+  reported before the provider CLI is called rather than after.
+  `runplz tail` / `status` / `kill` work as usual once a run has written its
+  manifest.
 - Spot capacity (`spot=True`) is a plain passthrough on both clouds: if the
   provider reclaims the box mid-run, the run fails. No retry loop yet.
 - Provisioning calls retry transient control-plane failures (a 503, a

@@ -139,6 +139,12 @@ _MODULES_TO_GUARD = (
     "runplz.backends.ssh",
     "runplz.backends.modal",
     "runplz.backends.local",
+    # aws/gcp were missing until 3.25.0, so `list_jobs` reached the real
+    # `aws` / `gcloud` binaries whenever a test drove `runplz ps` on a machine
+    # with the provider env vars set — exactly the billed-CLI call this guard
+    # exists to stop.
+    "runplz.backends.aws",
+    "runplz.backends.gcp",
     "runplz.cli",
 )
 

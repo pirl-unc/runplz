@@ -41,6 +41,7 @@ import tarfile
 import tempfile
 from pathlib import Path
 
+from runplz.backends.listing import JobRecord
 from runplz.excludes import DEFAULT_TRANSFER_EXCLUDES
 
 _ENTRYPOINT_TEMPLATE = '''\
@@ -93,7 +94,7 @@ def main():
 '''
 
 
-def list_jobs() -> list[dict]:
+def list_jobs() -> list[JobRecord]:
     """Return Modal apps created by runplz.
 
     Filters on the ``runplz-`` prefix that the entrypoint generator stamps on
@@ -134,7 +135,7 @@ def list_jobs() -> list[dict]:
     return _jobs_from_modal_text(r.stdout)
 
 
-def _jobs_from_modal_json(stdout: str) -> list[dict]:
+def _jobs_from_modal_json(stdout: str) -> list[JobRecord]:
     try:
         data = json.loads(stdout)
     except json.JSONDecodeError:
@@ -155,19 +156,19 @@ def _jobs_from_modal_json(stdout: str) -> list[dict]:
             continue
         app_name, fn_name = _split_modal_app_name(name)
         jobs.append(
-            {
-                "backend": "modal",
-                "name": name,
-                "app": app_name,
-                "function": fn_name,
-                "started": row.get("created_at") or row.get("Created at") or "",
-                "status": str(state),
-            }
+            JobRecord(
+                backend="modal",
+                name=name,
+                app=app_name,
+                function=fn_name,
+                started=row.get("created_at") or row.get("Created at") or "",
+                status=str(state),
+            )
         )
     return jobs
 
 
-def _jobs_from_modal_text(stdout: str) -> list[dict]:
+def _jobs_from_modal_text(stdout: str) -> list[JobRecord]:
     """Parse the plain-text `modal app list` table.
 
     Format is column-delimited; we look for lines containing ``runplz-`` and
@@ -190,14 +191,14 @@ def _jobs_from_modal_text(stdout: str) -> list[dict]:
         if state.lower() in {"stopped", "finished", "terminated"}:
             continue
         jobs.append(
-            {
-                "backend": "modal",
-                "name": name,
-                "app": app_name,
-                "function": fn_name,
-                "started": "",
-                "status": state,
-            }
+            JobRecord(
+                backend="modal",
+                name=name,
+                app=app_name,
+                function=fn_name,
+                started="",
+                status=state,
+            )
         )
     return jobs
 
