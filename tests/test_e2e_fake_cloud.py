@@ -354,3 +354,187 @@ def test_fake_gcp_control_plane_hands_off_to_live_ssh(
     assert config_path.exists()
     assert fake_cloud.calls_matching(log, "create")
     assert fake_cloud.calls_matching(log, "delete")
+
+
+# ---------------------------------------------------------------------------
+# listing (issue #135)
+#
+# Until 4.0.2 the stubs could not reach `list_jobs` at all: `--filter`,
+# `--filters` and `--zones` were outside the option vocabulary, and
+# `ec2 describe-instances` was modelled as one call when production makes two
+# of it. So every listing test in the suite was `mock.patch`-based, asserting
+# argv the author believed the CLIs accept. These assert argv they do.
+
+
+def test_gcp_lists_the_instance_it_just_created(tmp_path, sandbox_bin):
+    """The round trip, not a fixture: the stub reports what it created, and
+    the app and function names come back out of the generated instance name."""
+    fake_cloud.install(sandbox_bin, name="gcloud")
+    fake_cloud.install_unreachable_ssh(sandbox_bin)
+    app, fn = _app(
+        tmp_path,
+        gcp_config=GcpConfig(project="p", zone="z", on_finish="leave", ssh_ready_wait_seconds=1),
+    )
+    _run_until_dispatch_fails(gcp, app, fn)
+
+    rows = gcp.list_jobs(project="p")
+    assert [(r.backend, r.app, r.function) for r in rows] == [("gcp", "vision", "train")]
+    assert rows[0].name.startswith("runplz-vision-train-")
+    assert rows[0].status == "RUNNING"
+
+
+def test_aws_lists_the_instance_it_just_created(tmp_path, sandbox_bin):
+    """Same round trip on EC2, where the name only ever existed inside
+    `--tag-specifications` at create time and has to come back off the tag."""
+    fake_cloud.install(sandbox_bin, name="aws")
+    fake_cloud.install_unreachable_ssh(sandbox_bin)
+    app, fn = _app(
+        tmp_path,
+        aws_config=AwsConfig(
+            region="us-east-1", key_name="k", on_finish="leave", ssh_ready_wait_seconds=1
+        ),
+    )
+    _run_until_dispatch_fails(aws, app, fn)
+
+    rows = aws.list_jobs(region="us-east-1")
+    assert [(r.backend, r.app, r.function) for r in rows] == [("aws", "vision", "train")]
+    assert rows[0].name.startswith("runplz-vision-train-")
+    assert rows[0].status == "running"
+
+
+def test_listing_argv_is_what_the_cli_actually_receives(tmp_path, sandbox_bin):
+    """The filter is the whole point of the command. gcloud joins its flags
+    with `=`, so this asserts the flag whole -- a listing that dropped the
+    label filter would report every instance in the project as a runplz job."""
+    log = fake_cloud.install(sandbox_bin, name="gcloud")
+    gcp.list_jobs(project="proj", zone="us-central1-a")
+
+    lists = fake_cloud.calls_matching(log, "list")
+    assert len(lists) == 1, fake_cloud.calls(log)
+    assert "--filter=labels.runplz=1" in lists[0]
+    assert "--project=proj" in lists[0]
+    assert "--zones=us-central1-a" in lists[0]
+    assert "--format=json" in lists[0]
+
+
+def test_aws_listing_argv_is_what_the_cli_actually_receives(sandbox_bin):
+    """aws splits its flags, so the filter values are separate argv elements."""
+    log = fake_cloud.install(sandbox_bin, name="aws")
+    aws.list_jobs(region="us-east-1")
+
+    describes = fake_cloud.calls_matching(log, "describe-instances")
+    assert len(describes) == 1, fake_cloud.calls(log)
+    assert "Name=tag:runplz,Values=1" in describes[0]
+    assert "--filters" in describes[0]
+
+
+def test_nothing_created_lists_as_no_jobs(sandbox_bin):
+    fake_cloud.install(sandbox_bin, name="gcloud")
+    fake_cloud.install(sandbox_bin, name="aws")
+    assert gcp.list_jobs(project="p") == []
+    assert aws.list_jobs(region="us-east-1") == []
+
+
+@pytest.mark.parametrize("on_finish", ["delete", "stop"])
+def test_a_torn_down_gcp_instance_stops_being_listed(tmp_path, sandbox_bin, on_finish):
+    """The other half of the round trip. A run that tore itself down must not
+    keep showing up as a live job."""
+    fake_cloud.install(sandbox_bin, name="gcloud")
+    fake_cloud.install_unreachable_ssh(sandbox_bin)
+    app, fn = _app(
+        tmp_path,
+        gcp_config=GcpConfig(project="p", zone="z", on_finish=on_finish, ssh_ready_wait_seconds=1),
+    )
+    _run_until_dispatch_fails(gcp, app, fn)
+
+    assert gcp.list_jobs(project="p") == []
+
+
+@pytest.mark.parametrize(
+    "on_finish, still_listed, expected_status",
+    [
+        # `delete` terminates the box, and a terminated instance is outside the
+        # state filter production asks for. `stop` is inside it on purpose: a
+        # stopped box is still costing money and still the user's to clean up,
+        # so `runplz ps` is supposed to keep showing it.
+        ("delete", False, None),
+        ("stop", True, "stopped"),
+    ],
+)
+def test_aws_listing_follows_the_state_filter_production_asks_for(
+    tmp_path, sandbox_bin, on_finish, still_listed, expected_status
+):
+    fake_cloud.install(sandbox_bin, name="aws")
+    fake_cloud.install_unreachable_ssh(sandbox_bin)
+    app, fn = _app(
+        tmp_path,
+        aws_config=AwsConfig(
+            region="us-east-1", key_name="k", on_finish=on_finish, ssh_ready_wait_seconds=1
+        ),
+    )
+    _run_until_dispatch_fails(aws, app, fn)
+
+    rows = aws.list_jobs(region="us-east-1")
+    assert [r.status for r in rows] == ([expected_status] if still_listed else [])
+
+
+@pytest.mark.parametrize(
+    "name, route, call",
+    [
+        ("gcloud", "compute/instances/list", lambda: gcp.list_jobs(project="p")),
+        (
+            "aws",
+            "ec2/describe-instances#by-filter",
+            lambda: aws.list_jobs(region="us-east-1"),
+        ),
+    ],
+)
+def test_a_malformed_listing_response_is_an_error_not_an_empty_list(sandbox_bin, name, route, call):
+    """The failure this whole issue exists to prevent: a degraded provider
+    must not be read as "your jobs are gone". The aws case also pins that
+    `malformed` can target one call shape of a subcommand -- the by-id form
+    that fetches an instance's IP is left alone."""
+    fake_cloud.install(sandbox_bin, name=name, malformed={route: "{not-json"})
+    with pytest.raises(RuntimeError, match="malformed JSON"):
+        call()
+
+
+@pytest.mark.parametrize(
+    "name, route, call",
+    [
+        ("gcloud", "compute/instances/list", lambda: gcp.list_jobs(project="p")),
+        ("aws", "ec2/describe-instances", lambda: aws.list_jobs(region="us-east-1")),
+    ],
+)
+def test_a_failing_provider_cli_surfaces_rather_than_listing_nothing(
+    sandbox_bin, name, route, call
+):
+    fake_cloud.install(
+        sandbox_bin, name=name, fail_times={route: 1}, fail_message="ServiceUnavailable"
+    )
+    with pytest.raises(RuntimeError, match="failed"):
+        call()
+
+
+def test_stub_rejects_a_listing_that_dropped_its_filter(sandbox_bin):
+    """The harness has to be able to fail the production argv, or these tests
+    prove nothing. Both halves: a listing missing its filter is refused, and
+    `ec2 describe-instances` with neither discriminator is ambiguous."""
+    fake_cloud.install(sandbox_bin, name="gcloud")
+    fake_cloud.install(sandbox_bin, name="aws")
+
+    unfiltered = subprocess.run(
+        ["gcloud", "compute", "instances", "list", "--project=p", "--format=json"],
+        capture_output=True,
+        text=True,
+    )
+    assert unfiltered.returncode == 2
+    assert "missing required option" in unfiltered.stderr
+
+    ambiguous = subprocess.run(
+        ["aws", "ec2", "describe-instances", "--region", "us-east-1", "--output", "json"],
+        capture_output=True,
+        text=True,
+    )
+    assert ambiguous.returncode == 2
+    assert "needs exactly one of" in ambiguous.stderr
