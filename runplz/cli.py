@@ -38,7 +38,7 @@ import warnings
 from pathlib import Path
 
 from runplz.app import repo_root_for
-from runplz.backends import registry
+from runplz.backends import listing, registry
 from runplz.backends.listing import JobRecord
 
 
@@ -383,7 +383,13 @@ def _ps_main(argv):
         )
     args = p.parse_args(argv)
     scope = {field.name: getattr(args, field.name) for field, _ in fields}
-    _require_valid_port(scope.get("port"), p.error)
+    for field, _ in fields:
+        if field.validate is None or scope[field.name] is None:
+            continue
+        try:
+            field.validate(scope[field.name])
+        except ValueError as exc:
+            p.error(f"{field.flag} {exc}")
 
     backends = _ps_selection(args.backend, scope)
     rows = []
@@ -402,7 +408,7 @@ def _ps_main(argv):
     # information the user asked for.
     if rows or successes > 0:
         _print_ps_table(rows)
-    if not rows and args.backend is None:
+    if successes > 0 and not rows and args.backend is None:
         _note_backends_not_listed(backends)
     for name, exc in errors:
         print(f"warning: {name} listing failed: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -426,7 +432,7 @@ def _ps_selection(chosen: str, scope: dict) -> list:
     for name in registry.listable_names():
         if name in selected or name in fan_out:
             continue
-        if registry.get(name).listing.has_required_scope(scope):
+        if registry.get(name).listing.invited_by(scope):
             selected.append(name)
     return selected
 
@@ -443,9 +449,7 @@ def _ps_targets(backends: list, scope: dict):
         spec = registry.get(backend).listing
         base = {f.name: scope.get(f.name) for f in spec.scope}
         fan = next((f for f in spec.scope if f.multiple), None)
-        values = (
-            [v.strip() for v in (base.get(fan.name) or "").split(",") if v.strip()] if fan else []
-        )
+        values = fan.resolve_all(base.get(fan.name)) if fan else []
         if not values:
             # No fan-out field, or nothing supplied for it. Ask once and let
             # scope resolution report a required field the user left out.
@@ -466,8 +470,13 @@ def _note_backends_not_listed(selected: list) -> None:
     for name in registry.listable_names():
         if name in selected:
             continue
-        flags = " ".join(f.flag for f in registry.get(name).listing.required_fields())
-        print(f"note: {name} was not listed; pass {flags} to include it", file=sys.stderr)
+        required = registry.get(name).listing.required_fields()
+        # A backend kept out of the fan-out without required scope cannot be
+        # invited by a flag, so "pass  to include it" would name nothing.
+        how = (
+            f"pass {' '.join(f.flag for f in required)}" if required else f"run `runplz ps {name}`"
+        )
+        print(f"note: {name} was not listed; {how} to include it", file=sys.stderr)
 
 
 def _print_ps_table(rows: list[JobRecord]) -> None:
@@ -608,17 +617,6 @@ def _kill_main(argv, *, prog="kill"):
         return 2
 
 
-def _require_valid_port(port, fail) -> None:
-    """Reject an out-of-range `--ssh-port` before it reaches ssh.
-
-    One check for both spellings of the flag — `runplz ps --ssh-port` and the
-    `tail`/`status`/`kill` override — which drifted apart as two copies of the
-    same three lines.
-    """
-    if port is not None and not (0 < port < 65536):
-        fail(f"--ssh-port must be a valid TCP port (1-65535); got {port}.")
-
-
 def _ssh_overrides_from_args(args, fail):
     """The ssh fields the user pinned on the command line, if any.
 
@@ -628,7 +626,11 @@ def _ssh_overrides_from_args(args, fail):
     """
     key = getattr(args, "ssh_key", None)
     port = getattr(args, "ssh_port", None)
-    _require_valid_port(port, fail)
+    if port is not None:
+        try:
+            listing.tcp_port_range(port)
+        except ValueError as exc:
+            fail(f"--ssh-port {exc}")
     overrides = {}
     if key:
         overrides["identity_file"] = key

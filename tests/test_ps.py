@@ -258,7 +258,21 @@ def test_ssh_list_jobs_requires_host_and_parses_remote_docker_ps():
 # CLI
 
 
-def test_ps_cli_fans_out_and_prints_rows(capsys):
+@pytest.fixture
+def quiet_fan_out(monkeypatch):
+    """Silence every fan-out backend so a test can assert on one of them.
+
+    gcp/aws are in the default fan-out, so a test that patches only
+    local/brev/modal is really asserting against whatever cloud credentials
+    the developer's shell happens to export.
+    """
+    from runplz.backends import aws, gcp
+
+    for module in (local, brev, modal, gcp, aws):
+        monkeypatch.setattr(module, "list_jobs", lambda **kw: [], raising=False)
+
+
+def test_ps_cli_fans_out_and_prints_rows(capsys, quiet_fan_out):
     rows_local = [
         JobRecord(
             backend="local",
@@ -279,7 +293,7 @@ def test_ps_cli_fans_out_and_prints_rows(capsys):
     assert "runplz-demo-train" in out
 
 
-def test_ps_cli_reports_empty_when_no_jobs(capsys):
+def test_ps_cli_reports_empty_when_no_jobs(capsys, quiet_fan_out):
     with mock.patch.object(local, "list_jobs", return_value=[]):
         with mock.patch.object(brev, "list_jobs", return_value=[]):
             with mock.patch.object(modal, "list_jobs", return_value=[]):
@@ -288,7 +302,7 @@ def test_ps_cli_reports_empty_when_no_jobs(capsys):
     assert "no runplz jobs running" in capsys.readouterr().out
 
 
-def test_ps_cli_single_backend_filter(capsys):
+def test_ps_cli_single_backend_filter(capsys, quiet_fan_out):
     with mock.patch.object(local, "list_jobs", return_value=[]) as local_mock:
         with mock.patch.object(brev, "list_jobs") as brev_mock:
             with mock.patch.object(modal, "list_jobs") as modal_mock:
@@ -298,7 +312,7 @@ def test_ps_cli_single_backend_filter(capsys):
     modal_mock.assert_not_called()
 
 
-def test_ps_cli_surfaces_errors_as_warnings(capsys):
+def test_ps_cli_surfaces_errors_as_warnings(capsys, quiet_fan_out):
     """Errors from one backend show up as warnings on stderr while the
     others' results still print. 3.15.2: rc is 0 as long as at least one
     backend succeeded (errors are partial, not total)."""
@@ -313,7 +327,7 @@ def test_ps_cli_surfaces_errors_as_warnings(capsys):
     assert rc == 0
 
 
-def test_ps_cli_accepts_host_flag_3_15_1():
+def test_ps_cli_accepts_host_flag_3_15_1(quiet_fan_out):
     """3.15.1: `--host` is the canonical name (matches `runplz tail`/`status`/`ssh`).
     `--ssh` is kept as a back-compat alias since pre-3.15.1 used it here."""
     from runplz.backends import ssh as ssh_backend
@@ -326,7 +340,7 @@ def test_ps_cli_accepts_host_flag_3_15_1():
     ssh_mock.assert_called_once_with(host="my.gpu.box", port=None, ssh_key_path=None)
 
 
-def test_ps_cli_prints_no_jobs_when_some_backend_succeeds(capsys):
+def test_ps_cli_prints_no_jobs_when_some_backend_succeeds(capsys, quiet_fan_out):
     """3.15.2: don't suppress the table just because ONE backend errored.
     If at least one backend was queryable, an empty result is real
     information ('no jobs running anywhere reachable')."""
@@ -341,17 +355,32 @@ def test_ps_cli_prints_no_jobs_when_some_backend_succeeds(capsys):
     assert rc == 0
 
 
-def test_ps_cli_returns_1_only_when_all_backends_fail(capsys):
-    with mock.patch.object(local, "list_jobs", side_effect=RuntimeError("a")):
-        with mock.patch.object(brev, "list_jobs", side_effect=RuntimeError("b")):
-            with mock.patch.object(modal, "list_jobs", side_effect=RuntimeError("c")):
-                rc = cli.main(["ps"])
+def test_ps_cli_returns_1_only_when_all_backends_fail(capsys, monkeypatch):
+    """Every fan-out backend is failed explicitly, not left to fail by luck.
+
+    Patching only local/brev/modal reached rc=1 because gcp/aws happened to
+    raise MissingScope on a machine with no cloud env — which makes the test
+    pass for a reason it does not state, and stop testing anything the day
+    that changes.
+    """
+    from runplz.backends import aws, gcp
+
+    def boom(**kw):
+        raise RuntimeError("unreachable")
+
+    for module in (local, brev, modal, gcp, aws):
+        monkeypatch.setattr(module, "list_jobs", boom, raising=False)
+    rc = cli.main(["ps"])
     out = capsys.readouterr()
     assert "no runplz jobs running" not in out.out
+    # The table was suppressed, so the note explaining an empty table would
+    # only bury the five warnings that say what actually went wrong.
+    assert "was not listed" not in out.err
+    assert out.err.count("listing failed") == 5
     assert rc == 1
 
 
-def test_ps_cli_back_compat_ssh_flag_still_works():
+def test_ps_cli_back_compat_ssh_flag_still_works(quiet_fan_out):
     from runplz.backends import ssh as ssh_backend
 
     with mock.patch.object(local, "list_jobs", return_value=[]):
@@ -421,20 +450,6 @@ def test_ps_row_parsing_skips_garbage_rather_than_failing():
 
 # ---------------------------------------------------------------------------
 # selection: who gets asked, and who says they weren't
-
-
-@pytest.fixture
-def quiet_fan_out(monkeypatch):
-    """Silence every fan-out backend so a test can assert on one of them.
-
-    gcp/aws are in the default fan-out, so a test that patches only
-    local/brev/modal is really asserting against whatever cloud credentials
-    the developer's shell happens to export.
-    """
-    from runplz.backends import aws, gcp
-
-    for module in (local, brev, modal, gcp, aws):
-        monkeypatch.setattr(module, "list_jobs", lambda **kw: [], raising=False)
 
 
 def test_ps_probes_an_ssh_host_even_when_a_positional_narrows_the_rest(quiet_fan_out):
@@ -556,3 +571,68 @@ def test_ps_table_prints_a_null_field_as_blank_not_the_word_none(capsys):
     body = capsys.readouterr().out.splitlines()[1]
     assert "None" not in body
     assert body.split() == ["aws", "i-1"]
+
+
+# ---------------------------------------------------------------------------
+# scope that resolves to nothing is scope the user did not supply
+
+
+@pytest.mark.parametrize("raw", ["", "   ", ",", " , "])
+def test_a_host_flag_naming_no_host_does_not_reach_ssh(raw, quiet_fan_out):
+    """`--host ''` and `--host ,` name zero hosts.
+
+    The pre-3.25 CLI filtered these out with `if h.strip()` and never called
+    ssh. Splitting them into "one target" instead sends the empty string to
+    `ssh`, which answers `Could not resolve hostname` — an error about the
+    user's network rather than about their command.
+    """
+    from runplz.backends import ssh as ssh_backend
+
+    with mock.patch.object(ssh_backend, "list_jobs") as ssh_mock:
+        rc = cli.main(["ps", "--host", raw])
+    ssh_mock.assert_not_called()
+    assert rc == 0
+
+
+def test_naming_ssh_with_an_empty_host_reports_the_missing_scope(capsys):
+    """Asked for explicitly, ssh still has to say what it needs rather than
+    quietly succeeding against a hostname of ''."""
+    rc = cli.main(["ps", "ssh", "--host", ""])
+    assert "ssh host is required" in capsys.readouterr().err
+    assert rc == 1
+
+
+def test_blank_scope_is_refused_from_the_flag_as_well_as_the_environment(monkeypatch):
+    """`--region ''` and `AWS_DEFAULT_REGION=` are the same statement.
+
+    Only the environment half was treated as unset, so the flag half reached
+    the provider as `aws ec2 describe-instances --region ''`.
+    """
+    from runplz.backends import aws, registry
+    from runplz.backends.listing import MissingScope
+
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    with mock.patch.object(aws.subprocess, "run") as run:
+        with pytest.raises(MissingScope, match="aws region is required"):
+            registry.list_jobs("aws", region="")
+    run.assert_not_called()
+
+
+def test_surrounding_whitespace_is_stripped_from_a_host(quiet_fan_out):
+    from runplz.backends import ssh as ssh_backend
+
+    with mock.patch.object(ssh_backend, "list_jobs", return_value=[]) as ssh_mock:
+        cli.main(["ps", "--host", " a.box , b.box "])
+    assert [c.kwargs["host"] for c in ssh_mock.call_args_list] == ["a.box", "b.box"]
+
+
+def test_ps_rejects_an_out_of_range_ssh_port(capsys):
+    """The range check is declared on the field now, so this pins that the
+    CLI still runs it — and still says it the same way."""
+    for bad in ("0", "70000"):
+        with pytest.raises(SystemExit):
+            cli.main(["ps", "--ssh-port", bad])
+        assert f"--ssh-port must be a valid TCP port (1-65535); got {bad}." in (
+            capsys.readouterr().err
+        )

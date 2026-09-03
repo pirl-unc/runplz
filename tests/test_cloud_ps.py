@@ -286,3 +286,121 @@ def test_ssh_is_listable_but_stays_out_of_the_default_fan_out():
     assert "ssh" in registry.listable_names()
     assert "ssh" not in registry.ps_names()
     assert set(registry.ps_names()) <= set(registry.listable_names())
+
+
+def test_scope_fields_refuses_one_keyword_claimed_under_two_flags(monkeypatch):
+    """The other half of a field's identity.
+
+    The CLI keys argparse's `dest` — and the scope dict — by `name` while
+    keying the option by `flag`, so guarding only the flag lets two backends
+    claim `region` under `--region` and `--dup-region`. argparse accepts that
+    and then feeds whichever option was parsed last into both backends.
+    """
+    clashing = registry.BackendSpec(
+        name="clashing",
+        module="runplz.backends.local",
+        listing=ListingSpec(
+            scope=(ScopeField(name="region", flag="--dup-region", help="Another region."),)
+        ),
+    )
+    monkeypatch.setitem(registry.BACKENDS, "clashing", clashing)
+    with pytest.raises(ValueError, match=r"scope 'region' is declared differently"):
+        registry.scope_fields()
+
+
+def test_list_jobs_refuses_scope_the_backend_does_not_declare():
+    """A dropped keyword becomes "aws region is required" — an error naming
+    the right fix while hiding that a value was passed and thrown away."""
+    with pytest.raises(TypeError, match="does not take regoin"):
+        registry.list_jobs("aws", regoin="us-east-1")
+
+
+def test_list_jobs_refuses_scope_for_a_backend_that_takes_none():
+    with pytest.raises(TypeError, match="accepts no scope"):
+        registry.list_jobs("local", host="somewhere")
+
+
+def test_a_backend_kept_out_of_the_fan_out_stays_out_without_required_scope(monkeypatch):
+    """`default_fan_out=False` has to mean it.
+
+    `invited_by` asks "did the user's flags request this backend", and a
+    backend with no required fields has no flag to request it with. Answering
+    True by vacuous `all([])` returned it to the fan-out it opted out of —
+    queried unprompted on every bare `runplz ps`.
+    """
+    from runplz import cli
+
+    opted_out = registry.BackendSpec(
+        name="optout",
+        module="runplz.backends.local",
+        listing=ListingSpec(default_fan_out=False),
+    )
+    monkeypatch.setitem(registry.BACKENDS, "optout", opted_out)
+    assert "optout" not in registry.ps_names()
+    assert "optout" not in cli._ps_selection(None, {})
+    # Naming it positionally is still how you get it.
+    assert cli._ps_selection("optout", {}) == ["optout"]
+
+
+def test_the_unasked_note_names_a_command_when_there_is_no_flag_to_pass(monkeypatch, capsys):
+    """Such a backend would otherwise be told to "pass  to include it"."""
+    from runplz import cli
+
+    opted_out = registry.BackendSpec(
+        name="optout",
+        module="runplz.backends.local",
+        listing=ListingSpec(default_fan_out=False),
+    )
+    monkeypatch.setitem(registry.BACKENDS, "optout", opted_out)
+    cli._note_backends_not_listed(list(registry.ps_names()))
+    err = capsys.readouterr().err
+    assert "note: optout was not listed; run `runplz ps optout` to include it" in err
+
+
+def test_an_environment_value_is_parsed_by_the_field_type(monkeypatch):
+    """Environment values arrive as strings however the field is declared, so
+    a typed field has to apply its parser here or the driver gets "2222"."""
+    monkeypatch.setenv("MYPORT", "2222")
+    field = ScopeField(name="port", flag="--p", help="", type=int, env=("MYPORT",))
+    assert field.resolve(None) == 2222
+
+
+def test_a_multiple_field_is_split_however_it_was_supplied(monkeypatch):
+    """Splitting lives with the field, not on the flag path, so a value that
+    arrives from the environment is split the same way one typed as a flag
+    is — otherwise `a.box,b.box` becomes a single host named `a.box,b.box`."""
+    monkeypatch.setenv("MYHOSTS", "a.box, b.box")
+    field = ScopeField(name="host", flag="--host", help="", multiple=True, env=("MYHOSTS",))
+    assert field.resolve_all(None) == ["a.box", "b.box"]
+    assert field.resolve_all("c.box,d.box") == ["c.box", "d.box"]
+
+
+def test_the_port_constraint_travels_with_the_field_not_the_cli():
+    """A check keyed off the literal string "port" in the CLI stops running
+    the day the field is renamed. Declared here, it moves with it."""
+    field = next(f for f in registry.get("ssh").listing.scope if f.flag == "--ssh-port")
+    assert field.validate is not None
+    field.validate(22)
+    for bad in (0, 70000):
+        with pytest.raises(ValueError, match="valid TCP port"):
+            field.validate(bad)
+
+
+def test_aws_rejects_valid_json_that_is_not_an_object():
+    """`[]` and `null` parse fine and then die on `.get` with an
+    AttributeError that escapes the malformed-JSON handler."""
+    for payload in ("[]", "null"):
+        with mock.patch.object(
+            aws.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=payload, stderr="")
+        ):
+            with pytest.raises(RuntimeError, match="malformed JSON"):
+                aws.list_jobs(region="r")
+
+
+def test_a_single_valued_field_resolves_to_exactly_one_target():
+    """`resolve_all` is the one path the CLI fans out over, so a non-multiple
+    field has to answer in the same shape — one target, not a split of it.
+    A `--ssh-key` naming a path with a comma in it must stay one path."""
+    field = ScopeField(name="ssh_key_path", flag="--ssh-key", help="")
+    assert field.resolve_all("/keys/a,b.pem") == ["/keys/a,b.pem"]
+    assert field.resolve_all(None) == []

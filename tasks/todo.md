@@ -105,6 +105,49 @@ Fixed in passing: `runplz.backends.aws` and `.gcp` were missing from
 with the provider env vars set — the billed-CLI call that guard exists to
 stop. Pre-existing, and this PR's tests would have widened it.
 
+### Code review follow-up
+
+Twelve findings addressed. The one real regression I had introduced:
+`--host ''` and `--host ,` reached ssh with a garbage hostname, because the
+pre-3.25 CLI filtered them with `if h.strip()` and my `_ps_targets` split
+turned "no targets" into "one empty target". The user saw
+`Could not resolve hostname` — an error about their network rather than
+their command.
+
+Root cause was that resolution and splitting had been separated: `resolve`
+treated a blank *explicit* value as supplied while correctly treating a
+blank *environment* value as unset, and the comma split lived in the CLI
+where an environment-supplied value never reached it. Both now live on
+`ScopeField` (`resolve` / `resolve_all`), so a value is treated the same
+way whichever source it came from. That also fixed `--region ''` reaching
+the provider as `--region ''`.
+
+The rest, briefly:
+
+- `scope_fields` guarded flag collisions but not `name` collisions, so two
+  backends could claim one driver keyword under different flags — argparse
+  accepts that and cross-feeds them. Both halves are guarded now.
+- `has_required_scope` answered True by vacuous `all([])`, so a backend
+  declaring `default_fan_out=False` with no required scope rejoined the
+  fan-out it opted out of. Renamed to `invited_by` and made explicit.
+- The `--ssh-port` range check reached into the scope dict by the literal
+  key `"port"`, so renaming the field would have silently disabled it. It
+  is a `validate` hook on the field now, one definition shared with
+  `tail`/`status`/`kill`.
+- `registry.list_jobs` silently dropped undeclared keywords, turning a typo
+  into "aws region is required". It raises TypeError naming what it accepts.
+- Environment values skipped the field's `type`, so a typed field with an
+  env fallback would have handed the driver a string.
+- The "not listed" note printed even when every backend errored and no
+  table was drawn, burying the warnings that explained the failure. Gated
+  on the table having been printed.
+- `aws.list_jobs` died with AttributeError on valid-JSON-but-not-an-object
+  (`[]`, `null`), escaping its own malformed-JSON handler. Pre-existing;
+  fixed to match the guard gcp already had.
+- The seven pre-existing `runplz ps` CLI tests were passing only because
+  gcp/aws happen to error on a machine with no cloud env. Migrated onto the
+  `quiet_fan_out` fixture that was added for exactly that hazard.
+
 Two near-misses worth keeping, both caught in design review rather than by
 a test, because no test pinned either:
 

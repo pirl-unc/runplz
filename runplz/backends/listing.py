@@ -35,7 +35,19 @@ __all__ = [
     "ListingSpec",
     "MissingScope",
     "ListingUnsupported",
+    "tcp_port_range",
 ]
+
+
+def tcp_port_range(port) -> None:
+    """Reject a port outside 1-65535.
+
+    Phrased to read as a continuation of whichever flag carries it, so one
+    definition serves `runplz ps --ssh-port` and the `tail`/`status`/`kill`
+    override that used to keep its own copy of these three lines.
+    """
+    if not 0 < port < 65536:
+        raise ValueError(f"must be a valid TCP port (1-65535); got {port}.")
 
 
 class MissingScope(RuntimeError):
@@ -112,20 +124,50 @@ class ScopeField:
     # there is no registry, so the user names the targets, and each one is
     # queried (and can fail) on its own.
     multiple: bool = False
-    # Value parser, handed to argparse as `type`.
+    # Value parser, handed to argparse as `type` and applied to environment
+    # values, which arrive as strings however the field is declared.
     type: Callable = str
+    # Optional constraint, raising ValueError with a message that reads as a
+    # continuation of the flag: "must be a valid TCP port (1-65535)". Lives
+    # with the declaration so a renamed field cannot leave its check behind.
+    validate: Optional[Callable] = None
 
-    def resolve(self, value: Optional[str] = None) -> Optional[str]:
-        """The explicit value, else the first environment variable that is
-        set, else None. An empty environment variable counts as unset —
-        `AWS_DEFAULT_REGION=` is not a region."""
-        if value is not None:
+    def resolve(self, value=None):
+        """The explicit value, else the first environment variable set, else
+        None.
+
+        Blank counts as unset from *either* source. `--region ''` and
+        `AWS_DEFAULT_REGION=` are equally "a region the user did not supply",
+        and forwarding either one sends `--region ''` to the provider instead
+        of saying what is missing.
+        """
+        if isinstance(value, str):
+            value = value.strip()
+        if value is not None and value != "":
             return value
         for name in self.env:
-            found = os.environ.get(name)
+            found = (os.environ.get(name) or "").strip()
             if found:
-                return found
+                # Environment values are always strings; a typed field has to
+                # apply its parser here or the driver gets "2222", not 2222.
+                return self.type(found)
         return None
+
+    def resolve_all(self, value=None) -> list:
+        """Every target this field names, which is at most one unless it is
+        `multiple`.
+
+        Splitting lives here rather than in the CLI so a value is split the
+        same way whichever source it came from, and so a field that resolves
+        to nothing but separators — `--host ,` — is correctly empty rather
+        than one target named ",".
+        """
+        resolved = self.resolve(value)
+        if resolved is None:
+            return []
+        if not self.multiple:
+            return [resolved]
+        return [part.strip() for part in str(resolved).split(",") if part.strip()]
 
     def missing_message(self, backend: str) -> str:
         """Why this backend cannot be listed, and what would fix it."""
@@ -170,10 +212,14 @@ class ListingSpec:
             resolved[f.name] = value
         return resolved
 
-    def has_required_scope(self, values: dict) -> bool:
-        """True when the user supplied enough to list this backend.
+    def invited_by(self, values: dict) -> bool:
+        """True when the user's flags amount to asking for this backend.
 
-        Asked of backends outside the default fan-out, to decide whether the
-        user's flags invited one in.
+        Asked of backends outside the default fan-out. One with no required
+        scope can never be invited this way — there is no flag to give — so
+        it answers False rather than True-by-vacuous-`all()`, which would
+        quietly return it to the fan-out it opted out of. Such a backend
+        joins only when named positionally.
         """
-        return all(f.resolve(values.get(f.name)) is not None for f in self.required_fields())
+        required = self.required_fields()
+        return bool(required) and all(f.resolve_all(values.get(f.name)) for f in required)

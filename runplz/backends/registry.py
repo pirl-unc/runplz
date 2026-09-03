@@ -29,6 +29,7 @@ from runplz.backends.listing import (
     ListingSpec,
     ListingUnsupported,
     ScopeField,
+    tcp_port_range,
 )
 
 __all__ = [
@@ -118,6 +119,7 @@ BACKENDS = {
                         name="port",
                         flag="--ssh-port",
                         type=int,
+                        validate=tcp_port_range,
                         help="Port for --host.",
                     ),
                 ),
@@ -200,14 +202,25 @@ def scope_fields() -> list:
     `(ScopeField, backend_names)` pairs in registry order.
     """
     seen = {}
+    owner_of_name = {}
     for name in listable_names():
         for field in BACKENDS[name].listing.scope:
+            # Both halves of a field's identity have to be unique, because the
+            # CLI keys argparse's `dest` — and the scope dict — by `name` while
+            # keying the option itself by `flag`. Guarding only the flag lets
+            # two backends declare the same `name` under different flags, which
+            # argparse accepts and then silently cross-feeds.
+            claimed = owner_of_name.setdefault(field.name, (field, name))
+            if claimed[0] != field:
+                raise ValueError(
+                    f"scope {field.name!r} is declared differently by "
+                    f"{claimed[1]} ({claimed[0].flag}) and {name} ({field.flag}); "
+                    "they must agree"
+                )
             existing = seen.get(field.flag)
             if existing is None:
                 seen[field.flag] = (field, [name])
                 continue
-            # Two backends sharing a flag must mean the same thing by it —
-            # otherwise one of them would silently receive the other's value.
             if existing[0] != field:
                 raise ValueError(
                     f"{field.flag} is declared differently by "
@@ -217,21 +230,34 @@ def scope_fields() -> list:
     return [(field, tuple(backends)) for field, backends in seen.values()]
 
 
-def list_jobs(name: str, **scope) -> list[JobRecord]:
+def list_jobs(backend: str, **scope) -> list[JobRecord]:
     """Enumerate one backend's running jobs as :class:`JobRecord` values.
 
     The single place scope is validated, and it happens before the driver —
     and therefore before any provider CLI — is reached. Provider failures
     from the driver propagate untouched: wrapping them would only relabel
     the error the user needs to read.
+
+    The parameter is `backend`, not `name`, so that a future `ScopeField`
+    called `name` cannot collide with it.
     """
-    spec = get(name)
+    spec = get(backend)
     if spec.listing is None:
         raise ListingUnsupported(
-            f"the {name} backend cannot list jobs, so `runplz ps` has nothing to report "
+            f"the {backend} backend cannot list jobs, so `runplz ps` has nothing to report "
             "for it — this is not the same as having none running."
         )
-    return load(name).list_jobs(**spec.listing.resolve(name, scope))
+    accepted = {f.name for f in spec.listing.scope}
+    unknown = sorted(set(scope) - accepted)
+    if unknown:
+        # Silently dropping these would turn a typo into "aws region is
+        # required", an error that names the right fix while hiding that a
+        # value was passed and thrown away.
+        raise TypeError(
+            f"{backend} listing does not take {', '.join(unknown)}; "
+            f"it accepts {', '.join(sorted(accepted)) or 'no scope'}"
+        )
+    return load(backend).list_jobs(**spec.listing.resolve(backend, scope))
 
 
 def provisioning_names() -> tuple:
