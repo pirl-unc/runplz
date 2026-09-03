@@ -202,31 +202,25 @@ def scope_fields() -> list:
     `(ScopeField, backend_names)` pairs in registry order.
     """
     seen = {}
-    owner_of_name = {}
+    owner = {}
     for name in listable_names():
         for field in BACKENDS[name].listing.scope:
-            # Both halves of a field's identity have to be unique, because the
-            # CLI keys argparse's `dest` — and the scope dict — by `name` while
-            # keying the option itself by `flag`. Guarding only the flag lets
-            # two backends declare the same `name` under different flags, which
-            # argparse accepts and then silently cross-feeds.
-            claimed = owner_of_name.setdefault(field.name, (field, name))
-            if claimed[0] != field:
-                raise ValueError(
-                    f"scope {field.name!r} is declared differently by "
-                    f"{claimed[1]} ({claimed[0].flag}) and {name} ({field.flag}); "
-                    "they must agree"
-                )
-            existing = seen.get(field.flag)
-            if existing is None:
-                seen[field.flag] = (field, [name])
-                continue
-            if existing[0] != field:
-                raise ValueError(
-                    f"{field.flag} is declared differently by "
-                    f"{existing[1][0]} and {name}; they must agree"
-                )
-            existing[1].append(name)
+            # A field is identified by three things the CLI keys off: its
+            # `name`, which becomes argparse's `dest` and the driver keyword,
+            # and every option string it answers to. Two backends may share
+            # one field — that is what makes a single `--region` possible —
+            # but two *different* fields may not share any of those keys.
+            # argparse accepts such a collision and then quietly feeds one
+            # field's value to both.
+            keys = (f"scope {field.name!r}", *(f"option {s}" for s in (field.flag, *field.aliases)))
+            for key in keys:
+                claimed = owner.setdefault(key, (field, name))
+                if claimed[0] != field:
+                    raise ValueError(
+                        f"{key} is claimed by both {claimed[1]} and {name}; "
+                        "one of them would receive the other's value"
+                    )
+            seen.setdefault(field.flag, (field, []))[1].append(name)
     return [(field, tuple(backends)) for field, backends in seen.values()]
 
 

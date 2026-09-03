@@ -94,7 +94,6 @@ def list_jobs(*, region: str) -> list[JobRecord]:
         raise RuntimeError("aws describe-instances returned malformed JSON") from exc
     # Valid JSON that isn't an object — `[]`, `null` — parses fine and then
     # dies on `.get` with an AttributeError that escapes the handler above.
-    # Mirrors the isinstance guard the gcp path already has.
     if not isinstance(payload, dict):
         raise RuntimeError("aws describe-instances returned malformed JSON")
     reservations = payload.get("Reservations", [])

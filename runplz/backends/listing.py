@@ -141,24 +141,27 @@ class ScopeField:
     # with the declaration so a renamed field cannot leave its check behind.
     validate: Optional[Callable] = None
 
-    def resolve(self, value=None):
-        """The explicit value, else the first environment variable set, else
-        None.
+    def _from_source(self, value):
+        """The raw value: the flag if it carries one, the environment if not.
 
         Blank counts as unset from *either* source. `--region ''` and
         `AWS_DEFAULT_REGION=` are equally "a region the user did not supply",
         and forwarding either one sends `--region ''` to the provider instead
         of saying what is missing.
+
+        `type` is applied to both sources, not just the environment: argparse
+        has already coerced a flag, but nothing has coerced a value handed
+        straight to `registry.list_jobs`, and one field must not yield `2222`
+        down one path and `"2222"` down another. It must therefore be
+        idempotent, which `str` and `int` are.
         """
         if isinstance(value, str):
             value = value.strip()
         if value is not None and value != "":
-            return value
+            return self.type(value)
         for name in self.env:
             found = (os.environ.get(name) or "").strip()
             if found:
-                # Environment values are always strings; a typed field has to
-                # apply its parser here or the driver gets "2222", not 2222.
                 return self.type(found)
         return None
 
@@ -171,12 +174,26 @@ class ScopeField:
         to nothing but separators — `--host ,` — is correctly empty rather
         than one target named ",".
         """
-        resolved = self.resolve(value)
-        if resolved is None:
+        raw = self._from_source(value)
+        if raw is None:
             return []
         if not self.multiple:
-            return [resolved]
-        return [part.strip() for part in str(resolved).split(",") if part.strip()]
+            return [raw]
+        return [part.strip() for part in str(raw).split(",") if part.strip()]
+
+    def resolve(self, value=None):
+        """The single value this field carries, or None if it carries none.
+
+        Defined in terms of :meth:`resolve_all` so the two cannot disagree.
+        They did: "is this required field supplied?" asked `resolve` while
+        "how many targets?" asked `resolve_all`, and for `--host ,` the first
+        said "yes, ','" while the second said "none" — so the required-field
+        check passed and a host named "," reached ssh.
+        """
+        targets = self.resolve_all(value)
+        if not targets:
+            return None
+        return ",".join(targets) if self.multiple else targets[0]
 
     def missing_message(self, backend: str) -> str:
         """Why this backend cannot be listed, and what would fix it."""

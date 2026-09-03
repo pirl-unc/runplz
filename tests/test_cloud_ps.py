@@ -266,7 +266,7 @@ def test_scope_fields_refuses_two_backends_that_disagree_about_a_flag(monkeypatc
         ),
     )
     monkeypatch.setitem(registry.BACKENDS, "clashing", clashing)
-    with pytest.raises(ValueError, match=r"--region is declared differently"):
+    with pytest.raises(ValueError, match=r"option --region is claimed by both aws and clashing"):
         registry.scope_fields()
 
 
@@ -304,7 +304,7 @@ def test_scope_fields_refuses_one_keyword_claimed_under_two_flags(monkeypatch):
         ),
     )
     monkeypatch.setitem(registry.BACKENDS, "clashing", clashing)
-    with pytest.raises(ValueError, match=r"scope 'region' is declared differently"):
+    with pytest.raises(ValueError, match=r"scope 'region' is claimed by both aws and clashing"):
         registry.scope_fields()
 
 
@@ -425,3 +425,64 @@ def test_a_valid_value_passes_the_constraint_untouched():
     with mock.patch.object(ssh, "list_jobs", return_value=[]) as list_jobs:
         registry.list_jobs("ssh", host="a.box", port=2200)
     assert list_jobs.call_args.kwargs["port"] == 2200
+
+
+def test_a_separator_only_host_is_no_host_on_the_positional_path_too():
+    """The half of the `--host ,` fix that the fan-out path was hiding.
+
+    `invited_by` asks `resolve_all` ("how many targets?") while the required
+    check asked `resolve` ("is it supplied?"), and for "," those disagreed —
+    so naming ssh explicitly skipped the guard the fan-out had, and a host
+    called "," reached the driver.
+    """
+    from runplz.backends import ssh
+
+    for raw in (",", ",,", " , "):
+        with mock.patch.object(ssh, "list_jobs") as list_jobs:
+            with pytest.raises(MissingScope, match="ssh host is required"):
+                registry.list_jobs("ssh", host=raw)
+        list_jobs.assert_not_called()
+
+
+def test_resolve_and_resolve_all_never_disagree_about_emptiness():
+    """The invariant the bug violated, stated directly."""
+    field = ScopeField(name="host", flag="--host", help="", multiple=True)
+    for raw in ("", "   ", ",", ",,", " , ", None, "a.box", "a.box,b.box"):
+        assert (field.resolve(raw) is None) == (field.resolve_all(raw) == []), raw
+
+
+def test_a_value_is_typed_the_same_way_whichever_path_it_arrived_on(monkeypatch):
+    """argparse coerces a flag, but nothing coerces a value handed straight to
+    `registry.list_jobs` — the entry point the README tells people to prefer."""
+    from runplz.backends import ssh
+
+    with mock.patch.object(ssh, "list_jobs", return_value=[]) as list_jobs:
+        registry.list_jobs("ssh", host="a.box", port="2200")
+    assert list_jobs.call_args.kwargs["port"] == 2200
+
+
+def test_gcp_refuses_valid_json_that_is_not_a_list():
+    """It used to fall through to an empty list, reporting "no jobs" — the one
+    answer a listing must never invent."""
+    for payload in ("{}", "null"):
+        with mock.patch.object(
+            gcp.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=payload, stderr="")
+        ):
+            with pytest.raises(RuntimeError, match="malformed JSON"):
+                gcp.list_jobs(project="p")
+
+
+def test_scope_fields_refuses_two_fields_that_share_an_option_string(monkeypatch):
+    """An alias is the third of a field's identity. Unguarded, a collision
+    surfaced as argparse's `conflicting option string` rather than as a
+    registry error naming the two backends."""
+    clashing = registry.BackendSpec(
+        name="clashing",
+        module="runplz.backends.local",
+        listing=ListingSpec(
+            scope=(ScopeField(name="other", flag="--zhost", aliases=("--ssh",), help="x"),)
+        ),
+    )
+    monkeypatch.setitem(registry.BACKENDS, "clashing", clashing)
+    with pytest.raises(ValueError, match=r"option --ssh is claimed by both ssh and clashing"):
+        registry.scope_fields()

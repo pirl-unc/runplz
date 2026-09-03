@@ -332,6 +332,10 @@ internal that can move in a patch release.
 | `runplz.backends.ssh_common` | The shared layer every ssh-reachable backend runs on: `dispatch_to_target`, `run_on_provisioned_vm`, and the individual pipeline stages. |
 | `runplz.backends.provisioning` | Retry policy, GPU shape tables, instance naming, and teardown shared by the cloud drivers. |
 | `runplz.backends.local`, `runplz.backends.ssh`, `runplz.backends.brev`, `runplz.backends.modal`, `runplz.backends.gcp`, `runplz.backends.aws` | The backend drivers. Each exports `run` and — where the backend declares a `ListingSpec` — `list_jobs`, returning `JobRecord`s. The contract `registry.load()` calls. Normally reached through the CLI or `App.bind()`, not imported directly. |
+| `runplz.backends.docker` | Container labels and `docker ps` parsing, shared by the local and ssh backends. |
+| `runplz.selector` | `pick_machine` / `pick_machines` — cost-tolerance shape selection with an availability tiebreak. |
+| `runplz.excludes` | `DEFAULT_TRANSFER_EXCLUDES`, the secret-shaped patterns kept off every host -> remote transfer. |
+| `runplz.logcapture` | Tees the driver's stdout/stderr to a log file (what `--log-file` drives). |
 
 ### 4.0.0: `list_jobs` takes its scope, it no longer finds it
 
@@ -349,10 +353,6 @@ gcp.list_jobs()                     registry.list_jobs("gcp")
 the same environment variables, validates before spawning a provider CLI,
 and works the same way for every backend. Calling a driver directly still
 works — `aws.list_jobs(region="us-east-1")` — but you supply the region.
-| `runplz.backends.docker` | Container labels and `docker ps` parsing, shared by the local and ssh backends. |
-| `runplz.selector` | `pick_machine` / `pick_machines` — cost-tolerance shape selection with an availability tiebreak. |
-| `runplz.excludes` | `DEFAULT_TRANSFER_EXCLUDES`, the secret-shaped patterns kept off every host -> remote transfer. |
-| `runplz.logcapture` | Tees the driver's stdout/stderr to a log file (what `--log-file` drives). |
 
 Writing a new backend means answering three questions — how do I create a
 box, what ssh target do I hand over, how do I tear it down — and passing

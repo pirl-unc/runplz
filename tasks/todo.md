@@ -105,6 +105,39 @@ Fixed in passing: `runplz.backends.aws` and `.gcp` were missing from
 with the provider env vars set — the billed-CLI call that guard exists to
 stop. Pre-existing, and this PR's tests would have widened it.
 
+### Second review pass
+
+The fix commits were themselves reviewed, and the first fix turned out to be
+half a fix. `--host ,` was still reaching ssh with a hostname of "," on the
+*positional* path: `invited_by` asked `resolve_all` ("how many targets?")
+while the required-field check asked `resolve` ("is it supplied?"), and for
+"," those two disagreed. The fan-out path was guarded, `runplz ps ssh
+--host ,` was not, and neither was `registry.list_jobs("ssh", host=",")`.
+
+`resolve` is now defined in terms of `resolve_all`, so the two cannot
+disagree by construction, and a test asserts that invariant directly across
+every blank/separator input rather than only at the CLI.
+
+Also from that pass:
+
+- The 4.0.0 migration block had been inserted *between* table rows, orphaning
+  four of them — they would have rendered as literal pipe-delimited text on
+  the PyPI project page for this release. Moved below the table.
+- `resolve` applied the field's `type` to environment values but not explicit
+  ones, so `registry.list_jobs("ssh", port="2200")` handed the driver a
+  string while the same field from an env var gave an int. Applied to both.
+- The `validate` hook only ran in the CLI's argparse loop, so it was a check
+  on one spelling of the input rather than on the value. It runs in
+  `ListingSpec.resolve` now, which is the path every caller takes.
+- `gcp.list_jobs` silently returned `[]` for valid-JSON-but-not-a-list (`{}`,
+  `null`) — reporting "no jobs", the one answer a listing must never invent,
+  and the exact failure this issue exists to prevent. It raises now, matching
+  aws. The aws comment claiming parity with gcp was written before that was
+  true; corrected.
+- `scope_fields` guarded `flag` and `name` but not `aliases`. All three keys
+  are one guard now, which also removed a branch the flag/name guards had
+  made unreachable.
+
 ### Version: 4.0.0, not 3.25.0
 
 `aws.list_jobs()` and `gcp.list_jobs()` are in their modules' `__all__`, and

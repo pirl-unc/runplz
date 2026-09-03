@@ -76,8 +76,13 @@ def list_jobs(*, project: str, zone: str | None = None) -> list[JobRecord]:
         instances = json.loads(r.stdout)
     except (TypeError, ValueError) as exc:
         raise RuntimeError("gcloud instances list returned malformed JSON") from exc
+    # `{}` or `null` from a degraded gcloud used to fall through to an empty
+    # list, which reports "no jobs" — the one answer a listing must never
+    # invent. An unreadable response is an error, the same as it is for aws.
+    if not isinstance(instances, list):
+        raise RuntimeError("gcloud instances list returned malformed JSON")
     rows = []
-    for instance in instances if isinstance(instances, list) else []:
+    for instance in instances:
         name = instance.get("name", "")
         app_name, fn_name = split_instance_name(name)
         rows.append(
