@@ -71,11 +71,13 @@ BACKENDS = {
             name="gcp",
             module="runplz.backends.gcp",
             required_config_attr="gcp_config",
+            lists_jobs=True,
         ),
         BackendSpec(
             name="aws",
             module="runplz.backends.aws",
             required_config_attr="aws_config",
+            lists_jobs=True,
         ),
     )
 }

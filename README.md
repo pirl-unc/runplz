@@ -822,8 +822,10 @@ has, or push to S3 at the end of the function.
   package), so it can live anywhere in the repo.
 - One `App` per script. Multiple `App`s in one file is ambiguous for the
   CLI loader and errors.
-- `runplz ps` does not list `gcp` / `aws` jobs yet — that needs a per-cloud
-  query. `runplz tail` / `status` / `kill` work as usual once a run has
+- `runplz ps` lists AWS/GCP instances carrying runplz's tag/label. Pass
+  `--region` (or set `AWS_DEFAULT_REGION`) and `--project`/`--zone` (or set
+  the corresponding gcloud environment variables) when querying those
+  providers. `runplz tail` / `status` / `kill` work as usual once a run has
   written its manifest.
 - Spot capacity (`spot=True`) is a plain passthrough on both clouds: if the
   provider reclaims the box mid-run, the run fails. No retry loop yet.

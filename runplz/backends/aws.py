@@ -14,6 +14,10 @@ inbound TCP 22 from wherever runplz is running, or the run will sit in the
 ssh wait until it times out.
 """
 
+import json
+import os
+import subprocess
+
 from runplz.backends.provisioning import (
     AWS_CPU_SHAPES,
     AWS_GPUS,
@@ -26,6 +30,7 @@ from runplz.backends.provisioning import (
     resolve_gpu_label,
     run_cli,
     select_machine,
+    split_instance_name,
 )
 from runplz.backends.ssh_common import SshOptions, run_on_provisioned_vm
 
@@ -39,6 +44,7 @@ __all__ = [
     "build_run_instances_command",
     "apply_on_finish",
     "DEFAULT_ROOT_DEVICE",
+    "list_jobs",
 ]
 
 # Deep Learning AMI ids are region-specific and roll monthly, so resolve the
@@ -52,6 +58,54 @@ DEFAULT_ROOT_DEVICE = "/dev/sda1"
 _UBUNTU_SSM_PARAM = (
     "/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id"
 )
+
+
+def list_jobs(*, region: str | None = None) -> list[dict]:
+    """List active runplz-tagged EC2 instances through the real AWS CLI."""
+    region = region or os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION")
+    if not region:
+        raise RuntimeError("AWS region is required; pass --region or set AWS_DEFAULT_REGION")
+    r = subprocess.run(
+        [
+            "aws",
+            "ec2",
+            "describe-instances",
+            "--region",
+            region,
+            "--filters",
+            "Name=tag:runplz,Values=1",
+            "Name=instance-state-name,Values=pending,running,stopping,stopped",
+            "--output",
+            "json",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode:
+        raise RuntimeError(
+            f"aws describe-instances failed (rc={r.returncode}): {(r.stderr or '').strip()[:300]}"
+        )
+    try:
+        reservations = json.loads(r.stdout).get("Reservations", [])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("aws describe-instances returned malformed JSON") from exc
+    rows = []
+    for reservation in reservations:
+        for instance in reservation.get("Instances", []):
+            tags = {tag.get("Key"): tag.get("Value") for tag in instance.get("Tags", [])}
+            name = tags.get("Name") or instance.get("InstanceId", "")
+            app_name, fn_name = split_instance_name(name)
+            rows.append(
+                {
+                    "backend": "aws",
+                    "name": name,
+                    "app": app_name,
+                    "function": fn_name,
+                    "started": instance.get("LaunchTime", ""),
+                    "status": instance.get("State", {}).get("Name", ""),
+                }
+            )
+    return rows
 
 
 def run(app, function, args, kwargs, *, outputs_dir: str = "out"):

@@ -376,6 +376,9 @@ def _ps_main(argv):
         ),
     )
     p.add_argument("--ssh-port", type=int, help="[ssh] Port for --ssh-host.")
+    p.add_argument("--region", help="[aws] Region to query (or AWS_DEFAULT_REGION).")
+    p.add_argument("--project", help="[gcp] Project to query (or GOOGLE_CLOUD_PROJECT).")
+    p.add_argument("--zone", help="[gcp] Zone to query (or CLOUDSDK_COMPUTE_ZONE).")
     args = p.parse_args(argv)
     if args.ssh_port is not None and not (0 < args.ssh_port < 65536):
         p.error(f"--ssh-port must be a valid TCP port (1-65535); got {args.ssh_port}.")
@@ -388,7 +391,7 @@ def _ps_main(argv):
     successes = 0
     for backend in backends:
         try:
-            rows.extend(_collect_backend_jobs(backend))
+            rows.extend(_collect_backend_jobs(backend, args))
             successes += 1
         except Exception as exc:  # noqa: BLE001
             errors.append((backend, exc))
@@ -414,8 +417,15 @@ def _ps_main(argv):
     return 1 if errors and not rows and successes == 0 else 0
 
 
-def _collect_backend_jobs(backend: str) -> list[dict]:
-    return registry.load(backend).list_jobs()
+def _collect_backend_jobs(backend: str, args=None) -> list[dict]:
+    options = {}
+    if backend == "aws" and getattr(args, "region", None):
+        options["region"] = args.region
+    if backend == "gcp":
+        for key in ("project", "zone"):
+            if getattr(args, key, None):
+                options[key] = getattr(args, key)
+    return registry.load(backend).list_jobs(**options)
 
 
 def _print_ps_table(rows: list[dict]) -> None:
