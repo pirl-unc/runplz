@@ -152,7 +152,24 @@ class LocalSshd:
         self.stop()
 
     def drop_connection(self) -> None:
-        """Alias used by fault tests to simulate a transport disappearing."""
+        """Drop connections that are already established, not just the listener.
+
+        `stop()` kills the pid in sshd.pid, which is the *listener*; an
+        in-flight session is a forked child and survives it. So a test that
+        called this mid-command watched its command finish normally and then
+        asserted an exception that was really coming from somewhere else.
+        Killing the children first is what actually severs the transport.
+        """
+        pid_file = self.root / "sshd.pid"
+        if pid_file.exists():
+            try:
+                subprocess.run(
+                    ["pkill", "-P", pid_file.read_text().strip()],
+                    capture_output=True,
+                    timeout=10,
+                )
+            except Exception:
+                pass
         self.stop()
 
 
