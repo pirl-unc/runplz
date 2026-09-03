@@ -43,51 +43,53 @@ _AWS_ROUTES = {
 }
 
 # The stub is intentionally small, but it must reject command lines that the
-# real CLIs would reject. Keeping the option vocabulary here means a typo in a
-# production command fails the test instead of being accepted by a permissive
-# fake.
-_KNOWN_OPTIONS = {
-    "--project",
-    "--zone",
-    "--machine-type",
-    "--image-family",
-    "--image-project",
-    "--labels",
-    "--format",
-    "--quiet",
-    "--accelerator",
-    "--maintenance-policy",
-    "--boot-disk-size",
-    "--boot-disk-type",
-    "--network",
-    "--subnet",
-    "--service-account",
-    "--scopes",
-    "--provisioning-model",
-    "--no-restart-on-failure",
-    "--delete-disks",
-    "--region",
-    "--image-id",
-    "--instance-type",
-    "--key-name",
-    "--count",
-    "--client-token",
-    "--tag-specifications",
-    "--output",
-    "--subnet-id",
-    "--security-group-ids",
-    "--iam-instance-profile",
-    "--block-device-mappings",
-    "--instance-market-options",
-    "--query",
-    "--name",
-    "--instance-ids",
-    # Listing. gcloud filters with --filter and narrows with --zones; aws
-    # filters with --filters (plural, and a different syntax) -- close enough
-    # to each other to swap by accident, which is why the stub knows both.
-    "--filter",
-    "--filters",
-    "--zones",
+# real CLIs would reject. The vocabulary is per route, not one flat set shared
+# by both stubs: a single set let `gcloud compute instances create` accept
+# `--instance-type` and `--region`, and `aws ec2 run-instances` accept `--zone`
+# and `--format`, none of which those CLIs have. It also let `--zone` stand in
+# for `--zones` on `instances list` -- the exact confusion this file's own
+# comment warned about while accepting it.
+#
+# Each route lists what it *also* accepts; the required options below are
+# folded in automatically, so a required option never has to be repeated here.
+_OPTIONAL_OPTIONS = {
+    "gcloud": {
+        "compute/instances/create": {
+            "--labels",
+            "--format",
+            "--quiet",
+            "--accelerator",
+            "--maintenance-policy",
+            "--boot-disk-size",
+            "--boot-disk-type",
+            "--network",
+            "--subnet",
+            "--service-account",
+            "--scopes",
+            "--provisioning-model",
+            "--no-restart-on-failure",
+        },
+        "compute/config-ssh": {"--quiet"},
+        "compute/instances/delete": {"--quiet", "--delete-disks"},
+        "compute/instances/stop": {"--quiet"},
+        "compute/instances/list": {"--zones"},
+    },
+    "aws": {
+        "ec2/run-instances": {
+            "--subnet-id",
+            "--security-group-ids",
+            "--iam-instance-profile",
+            "--block-device-mappings",
+            "--instance-market-options",
+            "--query",
+        },
+        "ec2/describe-instances#by-id": set(),
+        "ec2/describe-instances#by-filter": set(),
+        "ec2/wait/instance-running": set(),
+        "ssm/get-parameter": set(),
+        "ec2/terminate-instances": set(),
+        "ec2/stop-instances": set(),
+    },
 }
 
 # One subcommand can be two different calls. `aws ec2 describe-instances` is
@@ -137,6 +139,19 @@ _REQUIRED_OPTIONS = {
     },
 }
 
+
+def _allowed_options(name: str) -> dict:
+    """Every option each route of one CLI accepts, required ones folded in.
+
+    Keeping the two tables separate and merging here means a required option
+    is written once: it cannot be required-but-not-allowed, which would reject
+    the very argv the stub demands.
+    """
+    optional = _OPTIONAL_OPTIONS[name]
+    required = _REQUIRED_OPTIONS[name]
+    return {route: set(optional[route]) | set(required.get(route, set())) for route in optional}
+
+
 _TEMPLATE = '''#!/usr/bin/env python3
 """Stub {name} installed by tests/fake_cloud.py. Talks to nothing."""
 import json, os, sys
@@ -149,7 +164,7 @@ ROUTES = {routes!r}
 FAIL_TIMES = {fail_times!r}
 FAIL_MESSAGE = {fail_message!r}
 MALFORMED = {malformed!r}
-KNOWN_OPTIONS = {_KNOWN_OPTIONS!r}
+ALLOWED_OPTIONS = {_ALLOWED_OPTIONS!r}
 REQUIRED_OPTIONS = {_REQUIRED_OPTIONS!r}
 VARIANTS = {_VARIANTS!r}
 
@@ -199,10 +214,6 @@ if key is None:
     sys.exit(2)
 
 option_names = {{a.split("=", 1)[0] for a in argv if a.startswith("--")}}
-unknown = sorted(option_names - KNOWN_OPTIONS)
-if unknown:
-    sys.stderr.write("stub {name}: unknown option(s): " + " ".join(unknown) + "\\n")
-    sys.exit(2)
 option_counts = {{a.split("=", 1)[0]: 0 for a in argv if a.startswith("--")}}
 for option in (a.split("=", 1)[0] for a in argv if a.startswith("--")):
     option_counts[option] += 1
@@ -237,6 +248,31 @@ if variants:
         )
         sys.exit(2)
     route_name = route_name + "#" + matched[0]
+
+# Per route, not one vocabulary shared by both CLIs -- so gcloud rejects
+# `--instance-type` and aws rejects `--zone`, and `instances list` rejects the
+# singular `--zone` it does not take.
+unknown = sorted(option_names - ALLOWED_OPTIONS.get(route_name, set()))
+if unknown:
+    sys.stderr.write("stub {name}: unknown option(s): " + " ".join(unknown) + "\\n")
+    sys.exit(2)
+
+# Argv is fully validated before anything is mutated. Validating after the
+# fact still let a rejected command line leave state behind: `aws ec2
+# run-instances --region us-east-1` allocated a client token and an
+# instance entry and *then* exited 2 for its missing options, so a test
+# asserting the rejection was silently seeding the next call's state.
+missing = sorted(REQUIRED_OPTIONS.get("{name}", {{}}).get(route_name, set()) - option_names)
+if missing:
+    sys.stderr.write("stub {name}: missing required option(s): " + " ".join(missing) + "\\n")
+    sys.exit(2)
+if key[0:3] == ("compute", "instances", "create") and len(positional) <= 3:
+    sys.stderr.write("stub gcloud: create requires an instance name\\n")
+    sys.exit(2)
+if key[0:3] in (("compute", "instances", "delete"), ("compute", "instances", "stop")):
+    if len(positional) <= 3:
+        sys.stderr.write("stub gcloud: lifecycle command requires an instance name\\n")
+        sys.exit(2)
 
 if key == ("ec2", "run-instances"):
     token = option_value("--client-token")
@@ -281,18 +317,6 @@ with open(TOKENS, "w") as fh:
     json.dump(tokens, fh)
 with open(NAMES, "w") as fh:
     json.dump(names, fh)
-missing = sorted(REQUIRED_OPTIONS.get("{name}", {{}}).get(route_name, set()) - option_names)
-if missing:
-    sys.stderr.write("stub {name}: missing required option(s): " + " ".join(missing) + "\\n")
-    sys.exit(2)
-if key[0:3] == ("compute", "instances", "create") and len(positional) <= 3:
-    sys.stderr.write("stub gcloud: create requires an instance name\\n")
-    sys.exit(2)
-if key[0:3] in (("compute", "instances", "delete"), ("compute", "instances", "stop")):
-    if len(positional) <= 3:
-        sys.stderr.write("stub gcloud: lifecycle command requires an instance name\\n")
-        sys.exit(2)
-
 if "{name}" == "gcloud" and route_name == "compute/config-ssh":
     config = os.environ.get("RUNPLZ_FAKE_SSH_CONFIG")
     if config:
@@ -380,7 +404,7 @@ def install(bin_dir: Path, *, name: str, fail_times=None, fail_message="", malfo
             fail_times=fail_times or {},
             fail_message=fail_message,
             malformed=malformed or {},
-            _KNOWN_OPTIONS=_KNOWN_OPTIONS,
+            _ALLOWED_OPTIONS=_allowed_options(name),
             _REQUIRED_OPTIONS=_REQUIRED_OPTIONS,
             _VARIANTS=_VARIANTS,
         )

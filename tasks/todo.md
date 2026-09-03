@@ -1,3 +1,77 @@
+## 2026-09-03 PR Plan — Close the executable-test fidelity gaps (#96)
+
+Branch: `test/close-fidelity-gaps` (off `main` @ `c47b504`)
+
+- [x] Audit all six claims against HEAD before writing anything
+- [x] Per-route option vocabulary, replacing the flat set shared by both stubs
+- [x] Validate argv before mutating stub state
+- [x] `live_ssh` marker + guard-proof assertions in `test_ssh_faults.py`
+- [x] Make `drop_connection` actually drop an established session
+- [x] Restore the CI fail-on-skip guard
+- [x] Bump `runplz/version.py` to 4.0.4
+- [x] `./format.sh`, `./lint.sh`, `./test.sh`
+- [ ] Review, merge, deploy
+
+### Audit first
+
+#96 was filed against PR #94 and lists six claims. Most were fixed since by
+`e861671`, so the first job was finding out which were still true rather than
+"fixing" what was already fixed:
+
+| # | Claim | Verdict |
+|---|---|---|
+| 1 | fake CLIs accept missing/unknown args | partly live |
+| 2 | lifecycles always install unreachable SSH | fixed |
+| 3 | precondition test passes an empty requirement | fixed |
+| 4 | an AWS describe assertion passes on zero calls | fixed |
+| 5 | SSH harness does not isolate known_hosts | fixed |
+| 6 | container CI must fail on setup/skip | partly live -- regressed |
+
+### What was actually live
+
+**Per-route vocabulary.** `_KNOWN_OPTIONS` was one flat set handed to both
+stubs, so gcloud accepted `--instance-type` and aws accepted `--zone`, and
+`instances list --zone=z` passed -- the exact confusion the file's own comment
+warned about while accepting it. Options are now per route, with required
+folded into allowed at install time so a required option can never also be an
+unknown one.
+
+**Validate before mutating.** Required-option checking ran *after* the stateful
+block, so `aws ec2 run-instances --region us-east-1` allocated a client token
+and an instance entry and *then* exited 2. A test asserting that rejection was
+seeding the next call's state.
+
+**The CI skip guard.** `e861671` deleted the "fail if the tier silently
+skipped" step, so a skip in the container tier reported success again. Restored
+for `e2e-container`, and the main job now pins `RUNPLZ_E2E_REMOTE=local` so a
+runner without sshd fails instead of silently dropping 14 live-ssh tests.
+Checked against a real CI run first: the current job reports `1151 passed, 1
+skipped` and that one skip is a parametrized "this count is sold", not an
+environment skip -- so a blanket skip-fail belongs only on the container job.
+
+### Not in the issue, found while auditing
+
+`test_ssh_faults.py` had no `live_ssh` marker. The marker is a permission, not
+a label: without it the billing guard raises
+`RuntimeError("tried to run ssh for real")`, which satisfied every
+`pytest.raises(Exception)` in the file. Four tests, none of which had ever
+reached the daemon their own docstring named.
+
+Fixing the marker exposed two more:
+
+- `test_mid_command_transport_drop_is_reported` would have *failed* once real,
+  because `drop_connection` stopped the listener and an established session is
+  a forked child that survives it. `sleep 5` ran to completion. The harness now
+  kills the session children, and the drop produces a 255 in ~0.6s.
+- `test_readiness_timeout_is_reported` passed `max_wait_s=0`, so the deadline
+  had already passed on entry and the loop never probed -- it reported
+  `last error: ''` whether or not ssh worked. It now uses a real budget and
+  asserts the recorded last error is non-empty.
+
+Every assertion in that file is now specific enough that the guard cannot stand
+in for it: verified by removing the marker, which fails all four.
+
+
 ## 2026-09-03 PR Plan — Detached launch on a macOS remote (#92)
 
 Branch: `fix/nohup-optional-detach` (off `main` @ `ed0ce7a`)

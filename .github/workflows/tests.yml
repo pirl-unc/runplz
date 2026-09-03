@@ -42,6 +42,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev,modal]"
       - name: Run tests
+        # RUNPLZ_E2E_REMOTE=local turns "no sshd on this runner" from a silent
+        # skip of every live-ssh test into a hard failure. ubuntu-latest ships
+        # one, so the only way this trips is a runner image that stopped doing
+        # so -- which is exactly the change that should be noticed.
+        env:
+          RUNPLZ_E2E_REMOTE: local
         run: pytest tests/ -v --cov=runplz --cov-report=xml
 
   # The default ssh end-to-end run uses a local sshd, which on Linux is
@@ -63,4 +69,16 @@ jobs:
       - name: Run the ssh e2e tier against a Linux container
         env:
           RUNPLZ_E2E_REMOTE: docker
-        run: pytest tests/test_e2e_localhost.py tests/test_e2e_fake_cloud.py -v
+        # A tier that skips reports success, which is how a set of permissive
+        # and vacuous tests survived unnoticed long enough to need issue #96.
+        # This job exists to execute those paths, so a skip here is a failure:
+        # -rs lists them and the grep turns any into a non-zero exit.
+        run: |
+          set -o pipefail
+          pytest tests/test_e2e_localhost.py tests/test_e2e_fake_cloud.py -v -rs \
+            | tee e2e-output.txt
+          if grep -qE '^SKIPPED' e2e-output.txt; then
+            echo "::error::the container e2e tier skipped a test; it must actually run here"
+            grep -E '^SKIPPED' e2e-output.txt
+            exit 1
+          fi
