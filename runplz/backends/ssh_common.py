@@ -1759,11 +1759,25 @@ def build_detached_launcher(remote_run: RemoteRunContext, wrapped_command: str) 
     """Build the portable remote shell used to launch one detached run.
 
     The parent ignores SIGHUP before spawning so SSH teardown cannot win the
-    fork-to-``nohup`` exec race. The child script repeats the ignore as defense
-    in depth. ``nohup`` execs bash in place, so the PID captured by ``$!``
-    remains the bootstrap PID. In contrast, ``setsid`` may fork when invoked by
-    a process group leader, leaving callers monitoring the short-lived wrapper
-    process.
+    fork-to-spawn race. The child script repeats the ignore as defense in
+    depth. Those two traps are the whole SIGHUP guarantee (#74); ``nohup``
+    contributes nothing to it, and neither does it provide the redirections —
+    ``</dev/null`` and the driver log are written here explicitly.
+
+    What ``nohup`` is still for is PID stability: it execs bash in place, so
+    the PID captured by ``$!`` remains the bootstrap PID, which is why it was
+    chosen over ``setsid`` (which may fork when invoked by a process group
+    leader, leaving callers monitoring a short-lived wrapper). A plain
+    backgrounded ``bash`` is equally PID-stable, so ``nohup`` is preferred but
+    never required.
+
+    Hence the probe. macOS ``nohup`` refuses to detach in a non-interactive ssh
+    session — ``can't detach from console: Inappropriate ioctl for device`` —
+    and bash forks the job before nohup execs and fails, so ``$!`` records a
+    pid that is already dead and the run looks like a payload that crashed
+    instantly (#92). Asking ``nohup`` whether it will work costs one process
+    and is right for any platform whose nohup refuses, where sniffing for
+    Darwin would only be right for Darwin.
     """
 
     meta = remote_run.meta_shell
@@ -1784,8 +1798,11 @@ def build_detached_launcher(remote_run: RemoteRunContext, wrapped_command: str) 
         # Claim the run before anything can be spawned, so an ambiguous
         # launch is never mistaken for one that never happened.
         f': > "{claim_file}"\n'
+        # Kept after the claim so the claim-before-spawn ordering still holds.
+        "runplz_nohup=nohup\n"
+        "nohup true >/dev/null 2>&1 || runplz_nohup=\n"
         f"{_run_id_env_assignment(remote_run.run_id)}"
-        f'nohup bash "{run_script}" </dev/null >> "{driver_log}" 2>&1 &\n'
+        f'${{runplz_nohup}} bash "{run_script}" </dev/null >> "{driver_log}" 2>&1 &\n'
         f'echo $! > "{pid_file}"\n'
     )
 

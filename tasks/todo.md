@@ -1,3 +1,107 @@
+## 2026-09-03 PR Plan — Detached launch on a macOS remote (#92)
+
+Branch: `fix/nohup-optional-detach` (off `main` @ `ed0ce7a`)
+
+- [x] Probe `nohup` in `build_detached_launcher` and drop it when it refuses
+- [x] Executable regression test with a failing `nohup` stub on PATH
+- [x] Re-point the five tests that identify the spawn line by the word "nohup"
+- [x] Drop the `remote_is_linux` skips once the detached tests pass on Darwin
+- [x] Bump `runplz/version.py` to 4.0.3
+- [x] `./format.sh`, `./lint.sh`, `./test.sh`
+- [ ] Review, merge, deploy
+
+### The failure
+
+Against a macOS remote every detached run dies immediately. `run_driver.log`
+holds only `nohup: can't detach from console: Inappropriate ioctl for device`,
+and runplz reports `detached bootstrap failed to start (state=dead)`.
+
+Specific to the non-interactive ssh session: `ssh_exec` sends `bash -lc <cmd>`
+with no pty, and macOS `nohup` refuses to detach there. Bare `nohup` in a local
+shell on the same machine is fine. `setsid` is not an alternative -- macOS does
+not have it.
+
+### Why nohup turns out to be droppable
+
+The question was whether `nohup` carries the SIGHUP guarantee #74 established.
+It does not. Measured on this machine (Darwin) before touching the code:
+
+| probe | result |
+|---|---|
+| `trap '' HUP` + background + `</dev/null`, then a real SIGHUP | survived |
+| identical, trap removed (control) | died -- `Hangup: 1` |
+
+The control matters: without it "survived" could just mean no signal was
+delivered. #74's diff (`102cc11`) confirms the shape -- its entire production
+change was two `trap '' HUP` lines, one in the launching parent before the fork
+and one as the first line of the heredoc'd `run.sh`. `nohup` was untouched.
+
+So `nohup`'s only residual role is the one its docstring claims: it `exec`s in
+place, so `$!` stays the bootstrap pid, which is why it was chosen over
+`setsid` (which may fork for a process-group leader). A plain backgrounded
+`bash "$run_script" &` is equally PID-stable.
+
+### Design
+
+Probe once, drop it if it refuses:
+
+    runplz_nohup=nohup
+    nohup true >/dev/null 2>&1 || runplz_nohup=
+    RUNPLZ_RUN_ID=<id> ${runplz_nohup} bash "<run.sh>" </dev/null >> "<log>" 2>&1 &
+
+A runtime probe rather than a `uname` test: production has no remote-OS
+detection anywhere, `build_detached_launcher` receives only a
+`RemoteRunContext` and a command string so it could not learn the OS without
+new plumbing, and a probe is right for any platform whose `nohup` refuses
+rather than for Darwin specifically.
+
+One spawn line rather than an `if/else` around two, so the env assignment and
+the redirections cannot drift. The env assignment has to stay on the exec line:
+`/proc/<pid>/environ` is fixed at exec time.
+
+### Why the bug is invisible
+
+bash forks the job *before* `nohup` execs and fails, so `echo $!` still writes a
+pid -- of a process that is already dead. Indistinguishable from "the payload
+crashed instantly". Only `run_driver.log` carries the real message, and nothing
+parses it.
+
+Docker mode is unaffected: `run_container_detached` backgrounds with
+`sudo docker run -d` and never calls `build_detached_launcher`.
+
+### Testing a platform CI does not have
+
+All three CI jobs are `ubuntu-latest`, so a test needing a Mac would never run.
+Instead the *failure* is made reproducible anywhere: the launcher is plain bash
+and the existing #74 test already executes it with `bash -c`, so running it with
+a stub `nohup` on PATH that exits non-zero reproduces the production symptom
+exactly -- pid file written, payload never runs.
+
+### Review
+
+Verified on the platform, not only on the simulation. This machine is a Mac,
+and `RUNPLZ_E2E_REMOTE=local` forces the harness to a local sshd instead of the
+Docker backend it picks by default on non-Linux -- which makes the "remote" an
+actual macOS box under an actual non-interactive ssh session.
+
+| launcher | `tests/test_e2e_localhost.py` on a macOS remote |
+|---|---|
+| pre-fix | **2 failed**, 6 passed -- the two detached tests |
+| fixed | **8 passed** |
+
+So the two tests that had been skipping since #92 was filed were skipping a
+real, reproducible bug, and they now hold it down. The stubbed-`nohup` unit
+test covers the same thing on Linux CI: it fails on the pre-fix launcher for
+the production reason (no marker -- the payload never ran) and passes after.
+
+Five tests identified "the spawn line" as the first line containing `nohup`,
+which after this change matches the probe rather than the spawn. All five now
+find it by the run script it launches, which is what actually identifies it and
+does not care which tool prefixes the command.
+
+1149 passing, coverage 95.46%.
+
+
 ## 2026-09-03 PR Plan — Typed JobRecord + backend listing capabilities (#133)
 
 Branch: `feat/typed-job-records` (off `main` @ `917d1e6`)
