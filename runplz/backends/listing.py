@@ -34,6 +34,7 @@ __all__ = [
     "ScopeField",
     "ListingSpec",
     "MissingScope",
+    "InvalidScope",
     "ListingUnsupported",
     "tcp_port_range",
 ]
@@ -56,6 +57,14 @@ class MissingScope(RuntimeError):
     Raised before the provider CLI is invoked — the point is that runplz
     never spends a round trip (or an API call) to be told something it could
     have known from the arguments.
+    """
+
+
+class InvalidScope(RuntimeError):
+    """Scope was supplied, but the field's own constraint rejects it.
+
+    Separate from :class:`MissingScope` because the fix is different: one
+    means "you did not say", the other "what you said cannot be right".
     """
 
 
@@ -209,6 +218,15 @@ class ListingSpec:
             value = f.resolve(values.get(f.name))
             if value is None and f.required:
                 raise MissingScope(f.missing_message(backend))
+            if value is not None and f.validate is not None:
+                # Enforced here, not only where a flag is parsed: this is the
+                # entry point every caller goes through, and a value that came
+                # from the environment or from a direct `registry.list_jobs`
+                # call never passes an argparse check at all.
+                try:
+                    f.validate(value)
+                except ValueError as exc:
+                    raise InvalidScope(f"{backend} {f.name} {exc}") from None
             resolved[f.name] = value
         return resolved
 

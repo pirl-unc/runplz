@@ -404,3 +404,24 @@ def test_a_single_valued_field_resolves_to_exactly_one_target():
     field = ScopeField(name="ssh_key_path", flag="--ssh-key", help="")
     assert field.resolve_all("/keys/a,b.pem") == ["/keys/a,b.pem"]
     assert field.resolve_all(None) == []
+
+
+def test_a_field_constraint_is_enforced_on_the_entry_point_not_just_the_flag():
+    """`registry.list_jobs` is the public way in, and a value that arrives
+    from the environment or from a direct call never passes an argparse
+    check. The declared constraint has to hold on every path."""
+    from runplz.backends import ssh
+    from runplz.backends.listing import InvalidScope
+
+    with mock.patch.object(ssh, "list_jobs") as list_jobs:
+        with pytest.raises(InvalidScope, match=r"ssh port must be a valid TCP port"):
+            registry.list_jobs("ssh", host="a.box", port=99999)
+    list_jobs.assert_not_called()
+
+
+def test_a_valid_value_passes_the_constraint_untouched():
+    from runplz.backends import ssh
+
+    with mock.patch.object(ssh, "list_jobs", return_value=[]) as list_jobs:
+        registry.list_jobs("ssh", host="a.box", port=2200)
+    assert list_jobs.call_args.kwargs["port"] == 2200

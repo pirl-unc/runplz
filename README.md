@@ -328,7 +328,7 @@ internal that can move in a patch release.
 | `runplz.runs` | The `tail` / `status` / `kill` verbs, plus the reader for the `run.json` manifest that `rsync_down` leaves in your outputs dir. |
 | `runplz.bootstrap` | The in-container loader and its **environment contract** — `RUNPLZ_SCRIPT`, `RUNPLZ_FUNCTION`, `RUNPLZ_OUT`, `RUNPLZ_ARGS`, `RUNPLZ_KWARGS`. |
 | `runplz.backends.registry` | What backends exist and what each accepts — the single source of truth behind the CLI's choices. |
-| `runplz.backends.listing` | The shape of a listed job and the scope a backend needs to produce one: `JobRecord`, `ScopeField`, `ListingSpec`, `MissingScope`, `ListingUnsupported`. |
+| `runplz.backends.listing` | The shape of a listed job and the scope a backend needs to produce one: `JobRecord`, `ScopeField`, `ListingSpec`, `MissingScope`, `InvalidScope`, `ListingUnsupported`. |
 | `runplz.backends.ssh_common` | The shared layer every ssh-reachable backend runs on: `dispatch_to_target`, `run_on_provisioned_vm`, and the individual pipeline stages. |
 | `runplz.backends.provisioning` | Retry policy, GPU shape tables, instance naming, and teardown shared by the cloud drivers. |
 | `runplz.backends.local`, `runplz.backends.ssh`, `runplz.backends.brev`, `runplz.backends.modal`, `runplz.backends.gcp`, `runplz.backends.aws` | The backend drivers. Each exports `run` and — where the backend declares a `ListingSpec` — `list_jobs`, returning `JobRecord`s. The contract `registry.load()` calls. Normally reached through the CLI or `App.bind()`, not imported directly. |
