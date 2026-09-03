@@ -15,10 +15,10 @@ you, and a VPC with no inbound 22 will simply hang the ssh wait.
 """
 
 import json
-import os
 import subprocess
 from typing import Optional
 
+from runplz.backends.listing import JobRecord
 from runplz.backends.provisioning import (
     ALREADY_EXISTS,
     GCP_CPU_SHAPES,
@@ -48,12 +48,14 @@ __all__ = [
 ]
 
 
-def list_jobs(*, project: str | None = None, zone: str | None = None) -> list[dict]:
-    """List active runplz-labelled GCE instances through the real gcloud CLI."""
-    project = project or os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCLOUD_PROJECT")
-    zone = zone or os.environ.get("CLOUDSDK_COMPUTE_ZONE")
-    if not project:
-        raise RuntimeError("GCP project is required; pass --project or set GOOGLE_CLOUD_PROJECT")
+def list_jobs(*, project: str, zone: str | None = None) -> list[JobRecord]:
+    """List active runplz-labelled GCE instances through the real gcloud CLI.
+
+    `project` is required rather than defaulted: where it and `zone` may come
+    from — flags, `GOOGLE_CLOUD_PROJECT`, `GCLOUD_PROJECT`,
+    `CLOUDSDK_COMPUTE_ZONE` — is declared once in the registry's
+    `ListingSpec` and resolved before this driver is reached.
+    """
     cmd = [
         "gcloud",
         "compute",
@@ -79,14 +81,14 @@ def list_jobs(*, project: str | None = None, zone: str | None = None) -> list[di
         name = instance.get("name", "")
         app_name, fn_name = split_instance_name(name)
         rows.append(
-            {
-                "backend": "gcp",
-                "name": name,
-                "app": app_name,
-                "function": fn_name,
-                "started": instance.get("creationTimestamp", ""),
-                "status": instance.get("status", ""),
-            }
+            JobRecord(
+                backend="gcp",
+                name=name,
+                app=app_name,
+                function=fn_name,
+                started=instance.get("creationTimestamp", ""),
+                status=instance.get("status", ""),
+            )
         )
     return rows
 

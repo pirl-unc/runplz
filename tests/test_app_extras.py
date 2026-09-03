@@ -143,7 +143,13 @@ def test_cli_backend_choices_equal_the_registry():
 
 
 def test_ps_backend_choices_equal_the_registry():
-    """Same two-directional guarantee for `runplz ps`, which lost _PS_BACKENDS."""
+    """Same two-directional guarantee for `runplz ps`, which lost _PS_BACKENDS.
+
+    The choices are `listable_names()`, not `ps_names()`: ssh can be listed,
+    it just cannot be listed *unprompted*, and rejecting `runplz ps ssh` as an
+    invalid choice hid a capability the backend has rather than reporting the
+    host it still needs.
+    """
     import argparse
     from unittest import mock
 
@@ -162,7 +168,7 @@ def test_ps_backend_choices_equal_the_registry():
         with pytest.raises(SystemExit):
             cli.main(["ps", "not-a-backend"])
 
-    assert list(seen["backend"]) == list(registry.ps_names())
+    assert list(seen["backend"]) == list(registry.listable_names())
 
 
 def test_every_registered_backend_is_importable_and_runnable():
@@ -173,15 +179,6 @@ def test_every_registered_backend_is_importable_and_runnable():
             continue  # optional extra; may not be installed
         module = registry.load(name)
         assert callable(module.run), name
-
-
-def test_every_ps_backend_exposes_list_jobs():
-    from runplz.backends import registry
-
-    for name in registry.ps_names():
-        if name == "modal":
-            continue
-        assert callable(registry.load(name).list_jobs), name
 
 
 def test_registry_rejects_an_unknown_backend():

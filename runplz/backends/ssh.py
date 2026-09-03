@@ -19,6 +19,7 @@ import subprocess
 from typing import Optional
 
 from runplz.backends import docker
+from runplz.backends.listing import JobRecord
 from runplz.backends.ssh_common import (
     SshOptions,
     dispatch_to_target,
@@ -66,7 +67,7 @@ def list_jobs(
     user: Optional[str] = None,
     port: Optional[int] = None,
     ssh_key_path: Optional[str] = None,
-) -> list[dict]:
+) -> list[JobRecord]:
     """Return runplz jobs currently running on the SSH target ``host``.
 
     SSH has no registry of hosts, so the caller must supply one. Filters on

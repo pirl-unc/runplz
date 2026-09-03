@@ -37,7 +37,7 @@ def test_list_jobs_falls_back_to_text_and_rejects_cli_failure(monkeypatch):
     ]
     with mock.patch.object(modal_backend.subprocess, "run", side_effect=responses) as run:
         jobs = modal_backend.list_jobs()
-    assert jobs[0]["function"] == "train"
+    assert jobs[0].function == "train"
     assert run.call_count == 2
 
     with mock.patch.object(

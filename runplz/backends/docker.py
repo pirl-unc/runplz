@@ -16,6 +16,8 @@ import json
 import shlex
 from typing import Optional
 
+from runplz.backends.listing import JobRecord
+
 __all__ = [
     # The labels that make a container findable by `runplz ps`.
     "RUNPLZ_LABEL",
@@ -76,8 +78,8 @@ def parse_labels(labels: str) -> dict:
     return out
 
 
-def parse_ps_rows(stdout: str, *, backend: str, name_prefix: str = "") -> list[dict]:
-    """Turn `docker ps --format '{{json .}}'` output into `runplz ps` rows.
+def parse_ps_rows(stdout: str, *, backend: str, name_prefix: str = "") -> list[JobRecord]:
+    """Turn `docker ps --format '{{json .}}'` output into `runplz ps` records.
 
     Malformed lines are skipped rather than raising: `ps` is a read-only
     convenience, and one unparseable line should not cost the user the
@@ -99,14 +101,14 @@ def parse_ps_rows(stdout: str, *, backend: str, name_prefix: str = "") -> list[d
         labels = parse_labels(raw.get("Labels", ""))
         name = raw.get("Names", "") or raw.get("ID", "")
         rows.append(
-            {
-                "backend": backend,
-                "name": f"{name_prefix}{name}",
-                "app": labels.get(APP_LABEL_KEY, ""),
-                "function": labels.get(FUNCTION_LABEL_KEY, ""),
-                "started": raw.get("CreatedAt", "") or raw.get("RunningFor", ""),
-                "status": raw.get("Status", ""),
-            }
+            JobRecord(
+                backend=backend,
+                name=f"{name_prefix}{name}",
+                app=labels.get(APP_LABEL_KEY, ""),
+                function=labels.get(FUNCTION_LABEL_KEY, ""),
+                started=raw.get("CreatedAt", "") or raw.get("RunningFor", ""),
+                status=raw.get("Status", ""),
+            )
         )
     return rows
 

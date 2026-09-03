@@ -5,7 +5,7 @@ Usage:
     runplz brev --instance my-gpu-box <script.py>
     runplz ssh  --host gpu.example.com <script.py>
     runplz modal <script.py>
-    runplz ps [local|brev|modal] [--host <host>]
+    runplz ps [local|brev|modal|ssh|gcp|aws] [--host <host>] [--region <r>]
     runplz tail [--outputs-dir <path>] [--host <host>] [--run-id <id>] [-n N] [-f]
     runplz status [--outputs-dir <path>] [--host <host>] [--run-id <id>]
 
@@ -39,6 +39,7 @@ from pathlib import Path
 
 from runplz.app import repo_root_for
 from runplz.backends import registry
+from runplz.backends.listing import JobRecord
 
 
 def main(argv=None):
@@ -345,10 +346,13 @@ def _load_app(script_path: Path):
 
 
 def _ps_main(argv):
-    """Dispatch ``runplz ps`` — list runplz jobs across backends."""
-    # Read the registry once: the choices and the fan-out list must be the
-    # same set, which the deleted _PS_BACKENDS constant used to guarantee.
-    ps_backends = registry.ps_names()
+    """Dispatch ``runplz ps`` — list runplz jobs across backends.
+
+    Every provider-specific detail here comes from the registry: the flags,
+    which backends each flag reaches, and what scope a backend needs before
+    it can be asked. What is left is the part that is genuinely the CLI's —
+    who to ask, and what to do when one of them fails.
+    """
     p = argparse.ArgumentParser(
         prog="runplz ps",
         description="List runplz jobs currently running across backends.",
@@ -356,55 +360,41 @@ def _ps_main(argv):
     p.add_argument(
         "backend",
         nargs="?",
-        choices=ps_backends,
-        help="Limit listing to one backend. Default: fan out to all of local, brev, modal.",
-    )
-    p.add_argument(
-        "--host",
-        "--ssh",  # legacy alias: pre-3.15.1 used --ssh here. Kept indefinitely.
-        dest="ssh_host",
+        choices=registry.listable_names(),
         help=(
-            "[ssh] Also probe this SSH host. SSH has no job registry, so the "
-            "host must be supplied. May be given multiple times (comma-separated)."
+            f"Limit listing to one backend. Default: fan out to {', '.join(registry.ps_names())}."
         ),
     )
-    p.add_argument(
-        "--ssh-key",
-        help=(
-            "[ssh] Private key for --ssh-host. Needed for a box that is not in "
-            "your ssh config — an EC2 instance, say."
-        ),
-    )
-    p.add_argument("--ssh-port", type=int, help="[ssh] Port for --ssh-host.")
-    p.add_argument("--region", help="[aws] Region to query (or AWS_DEFAULT_REGION).")
-    p.add_argument("--project", help="[gcp] Project to query (or GOOGLE_CLOUD_PROJECT).")
-    p.add_argument("--zone", help="[gcp] Zone to query (or CLOUDSDK_COMPUTE_ZONE).")
+    fields = registry.scope_fields()
+    for field, owners in fields:
+        help_text = f"[{'|'.join(owners)}] {field.help}"
+        if field.env:
+            help_text += f" Or set {' / '.join(field.env)}."
+        p.add_argument(
+            field.flag,
+            *field.aliases,
+            dest=field.name,
+            type=field.type,
+            # Name the placeholder after the flag, not the driver keyword it
+            # feeds: `--ssh-key SSH_KEY` is what the user typed and what the
+            # help has always shown.
+            metavar=field.flag.lstrip("-").replace("-", "_").upper(),
+            help=help_text,
+        )
     args = p.parse_args(argv)
-    if args.ssh_port is not None and not (0 < args.ssh_port < 65536):
-        p.error(f"--ssh-port must be a valid TCP port (1-65535); got {args.ssh_port}.")
+    scope = {field.name: getattr(args, field.name) for field, _ in fields}
+    _require_valid_port(scope.get("port"), p.error)
 
-    backends = [args.backend] if args.backend else list(ps_backends)
-    ssh_hosts = [h.strip() for h in (args.ssh_host or "").split(",") if h.strip()]
-
+    backends = _ps_selection(args.backend, scope)
     rows = []
     errors = []
     successes = 0
-    for backend in backends:
+    for backend, target_scope, label in _ps_targets(backends, scope):
         try:
-            rows.extend(_collect_backend_jobs(backend, args))
+            rows.extend(registry.list_jobs(backend, **target_scope))
             successes += 1
         except Exception as exc:  # noqa: BLE001
-            errors.append((backend, exc))
-    for host in ssh_hosts:
-        try:
-            from runplz.backends import ssh as ssh_backend
-
-            rows.extend(
-                ssh_backend.list_jobs(host=host, port=args.ssh_port, ssh_key_path=args.ssh_key)
-            )
-            successes += 1
-        except Exception as exc:  # noqa: BLE001
-            errors.append((f"ssh:{host}", exc))
+            errors.append((label, exc))
 
     # Print the table whenever at least one backend was reachable. Suppress
     # the "(no runplz jobs running)" line ONLY when every backend errored —
@@ -412,36 +402,90 @@ def _ps_main(argv):
     # information the user asked for.
     if rows or successes > 0:
         _print_ps_table(rows)
+    if not rows and args.backend is None:
+        _note_backends_not_listed(backends)
     for name, exc in errors:
         print(f"warning: {name} listing failed: {type(exc).__name__}: {exc}", file=sys.stderr)
     return 1 if errors and not rows and successes == 0 else 0
 
 
-def _collect_backend_jobs(backend: str, args=None) -> list[dict]:
-    options = {}
-    if backend == "aws" and getattr(args, "region", None):
-        options["region"] = args.region
-    if backend == "gcp":
-        for key in ("project", "zone"):
-            if getattr(args, key, None):
-                options[key] = getattr(args, key)
-    return registry.load(backend).list_jobs(**options)
+def _ps_selection(chosen: str, scope: dict) -> list:
+    """Which backends this `runplz ps` invocation should ask.
+
+    A backend outside the default fan-out joins as soon as the user supplies
+    the scope it needs, and it does so *whether or not* a positional narrowed
+    the rest: `runplz ps local --host box` has always listed local jobs and
+    the box's, and dropping that would quietly lose half the answer.
+
+    The converse is deliberately not true. Supplying `--region` does not pull
+    AWS into `runplz ps local` — AWS is already in the fan-out, so the flag
+    scopes a backend that was going to be asked anyway rather than adding one.
+    """
+    fan_out = registry.ps_names()
+    selected = [chosen] if chosen else list(fan_out)
+    for name in registry.listable_names():
+        if name in selected or name in fan_out:
+            continue
+        if registry.get(name).listing.has_required_scope(scope):
+            selected.append(name)
+    return selected
 
 
-def _print_ps_table(rows: list[dict]) -> None:
+def _ps_targets(backends: list, scope: dict):
+    """Expand a backend selection into `(backend, scope, error_label)` calls.
+
+    Most backends are one call. A field marked `multiple` — ssh hosts, the
+    only case — is comma-split into one call per value, so an unreachable box
+    costs the user that box's row rather than every box's, and the warning
+    names which one failed.
+    """
+    for backend in backends:
+        spec = registry.get(backend).listing
+        base = {f.name: scope.get(f.name) for f in spec.scope}
+        fan = next((f for f in spec.scope if f.multiple), None)
+        values = (
+            [v.strip() for v in (base.get(fan.name) or "").split(",") if v.strip()] if fan else []
+        )
+        if not values:
+            # No fan-out field, or nothing supplied for it. Ask once and let
+            # scope resolution report a required field the user left out.
+            yield backend, base, backend
+            continue
+        for value in values:
+            yield backend, {**base, fan.name: value}, f"{backend}:{value}"
+
+
+def _note_backends_not_listed(selected: list) -> None:
+    """Say which backends went unasked when the table came back empty.
+
+    An empty table is the one moment "nothing is running" and "nobody asked"
+    look identical, and jobs on an ssh box are invisible to a bare
+    `runplz ps`. Only said when there is nothing to show — once rows exist,
+    the user can see what was covered.
+    """
+    for name in registry.listable_names():
+        if name in selected:
+            continue
+        flags = " ".join(f.flag for f in registry.get(name).listing.required_fields())
+        print(f"note: {name} was not listed; pass {flags} to include it", file=sys.stderr)
+
+
+def _print_ps_table(rows: list[JobRecord]) -> None:
     if not rows:
         print("(no runplz jobs running)")
         return
-    headers = ["BACKEND", "NAME", "APP", "FUNCTION", "STARTED", "STATUS"]
-    keys = ["backend", "name", "app", "function", "started", "status"]
-    widths = [len(h) for h in headers]
-    for row in rows:
-        for i, key in enumerate(keys):
-            widths[i] = max(widths[i], len(str(row.get(key, ""))))
+    # Columns come from the record itself, so renaming or reordering a field
+    # moves its column rather than silently printing a blank one.
+    keys = JobRecord.field_names()
+    cells = [[str(getattr(row, key) or "") for key in keys] for row in rows]
+    widths = [len(key) for key in keys]
+    for row in cells:
+        for i, value in enumerate(row):
+            widths[i] = max(widths[i], len(value))
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
-    print(fmt.format(*headers))
-    for row in rows:
-        print(fmt.format(*(str(row.get(k, "")) for k in keys)))
+    print(fmt.format(*(key.upper() for key in keys)))
+    for row in cells:
+        print(fmt.format(*row))
 
 
 def _tail_main(argv):
@@ -564,6 +608,17 @@ def _kill_main(argv, *, prog="kill"):
         return 2
 
 
+def _require_valid_port(port, fail) -> None:
+    """Reject an out-of-range `--ssh-port` before it reaches ssh.
+
+    One check for both spellings of the flag — `runplz ps --ssh-port` and the
+    `tail`/`status`/`kill` override — which drifted apart as two copies of the
+    same three lines.
+    """
+    if port is not None and not (0 < port < 65536):
+        fail(f"--ssh-port must be a valid TCP port (1-65535); got {port}.")
+
+
 def _ssh_overrides_from_args(args, fail):
     """The ssh fields the user pinned on the command line, if any.
 
@@ -573,8 +628,7 @@ def _ssh_overrides_from_args(args, fail):
     """
     key = getattr(args, "ssh_key", None)
     port = getattr(args, "ssh_port", None)
-    if port is not None and not (0 < port < 65536):
-        fail(f"--ssh-port must be a valid TCP port (1-65535); got {port}.")
+    _require_valid_port(port, fail)
     overrides = {}
     if key:
         overrides["identity_file"] = key

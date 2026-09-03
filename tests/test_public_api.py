@@ -33,6 +33,7 @@ PUBLIC_MODULES = (
         "runplz.selector",
         "runplz.logcapture",
     )
+    + ("runplz.backends.listing",)
     + tuple(f"runplz.backends.{name}" for name in ("local", "ssh", "brev", "modal", "gcp", "aws"))
 )
 

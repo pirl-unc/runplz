@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from runplz.backends.listing import JobRecord
 from runplz.backends.provisioning import (
     CloudCliError,
     RetryPolicy,
@@ -287,7 +288,7 @@ def _skip_onboarding():
         pass
 
 
-def list_jobs() -> list[dict]:
+def list_jobs() -> list[JobRecord]:
     """Return Brev instances runplz created for ephemeral runs.
 
     Matches the full shape :func:`_make_ephemeral_name` generates —
@@ -309,7 +310,7 @@ def list_jobs() -> list[dict]:
 _EPHEMERAL_NAME_RE = re.compile(r"^runplz-.+-[0-9a-f]{8}$")
 
 
-def _jobs_from_brev_rows(rows: list[dict]) -> list[dict]:
+def _jobs_from_brev_rows(rows: list[dict]) -> list[JobRecord]:
     jobs = []
     for row in rows:
         name = row.get("name") or ""
@@ -317,14 +318,14 @@ def _jobs_from_brev_rows(rows: list[dict]) -> list[dict]:
             continue
         app_name, fn_name = _split_ephemeral_name(name)
         jobs.append(
-            {
-                "backend": "brev",
-                "name": name,
-                "app": app_name,
-                "function": fn_name,
-                "started": row.get("createdAt") or row.get("created_at") or "",
-                "status": _snapshot_status(row) or "",
-            }
+            JobRecord(
+                backend="brev",
+                name=name,
+                app=app_name,
+                function=fn_name,
+                started=row.get("createdAt") or row.get("created_at") or "",
+                status=_snapshot_status(row) or "",
+            )
         )
     return jobs
 

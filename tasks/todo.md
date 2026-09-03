@@ -1,3 +1,122 @@
+## 2026-09-03 PR Plan — Typed JobRecord + backend listing capabilities (#133)
+
+Branch: `feat/typed-job-records` (off `main` @ `917d1e6`)
+
+- [x] New public `runplz/backends/listing.py`: `JobRecord`, `ScopeField`,
+      `ListingSpec`, `MissingScope`, `ListingUnsupported`
+- [x] `registry.BackendSpec.lists_jobs` -> `listing: ListingSpec | None`;
+      add `listable_names()`, `scope_fields()`, `list_jobs()` dispatch
+- [x] Every driver returns `JobRecord`; aws/gcp stop resolving their own scope
+- [x] `cli._ps_main` generates flags + selection from the registry
+- [x] Guard `runplz.backends.aws` / `.gcp` in `tests/conftest.py`
+- [x] Bump `runplz/version.py` to 3.25.0
+- [x] `./format.sh`, `./lint.sh`, `./test.sh`
+- [ ] Review, merge, deploy
+
+### The problem
+
+`runplz ps` grew per-provider by accretion:
+
+- Six independent dict literals (`local`, `brev` x1, `modal` x2, `aws`, `gcp`,
+  `docker.parse_ps_rows`) all had to agree with `_print_ps_table`'s
+  `row.get(key, "")`. Nothing checked that they did.
+- `_collect_backend_jobs` mapped CLI args to driver kwargs through an
+  `if backend == ...` chain, and the flags themselves were hardcoded.
+- `aws.list_jobs` / `gcp.list_jobs` each resolved their own env fallbacks and
+  raised after dispatch, so "what scope does this backend need" was written
+  twice, in two shapes, in the wrong layer.
+- `ssh` was excluded from `lists_jobs`, so `_ps_main` carried a second loop
+  just for it and `runplz ps ssh` was an "invalid choice".
+
+### Design
+
+`listing.py` holds pure data with no provider knowledge and no argparse
+import, so the dependency graph stays a DAG:
+`listing` <- `docker` / `registry` / every driver.
+
+- `JobRecord` — the one row shape. `_print_ps_table` derives its headers from
+  `dataclasses.fields()`, so a renamed field can't drift from the table.
+- `ScopeField` — `name` (the driver kwarg) / `flag` + `aliases` (CLI spelling)
+  / `help` / `env` / `required` / `multiple` / `type`. `name` and `flag`
+  decouple on purpose: `--ssh-key` feeds `ssh_key_path`.
+- `ListingSpec` — `scope` plus an explicit `default_fan_out`. Explicit, not
+  inferred from "every required field has an env fallback": those two
+  correlate today by coincidence, and inferring would have put `ssh` in the
+  bare fan-out and added a third warning line to the most common invocation.
+- `resolve()` applies env fallbacks and raises `MissingScope` **before** any
+  provider CLI is spawned — the acceptance criterion that scope is validated
+  ahead of dispatch, not inside the driver.
+- `BackendSpec.listing = None` is the explicit "cannot enumerate jobs";
+  `registry.list_jobs` raises `ListingUnsupported` rather than returning `[]`.
+
+### Compatibility notes
+
+Four behaviours that a naive unification would have broken, all now pinned by
+tests:
+
+- The ssh probe runs **independently of the positional**: `runplz ps local
+  --host box` lists local jobs *and* the box's. Selection is therefore
+  "positional (or the fan-out set), plus any non-fan-out backend whose
+  required scope the user supplied" — not "scope implies backend", which
+  would make `runplz ps local --region r` start querying AWS.
+- Missing scope stays a per-backend warning with rc 1, not a parser error
+  (which would return 2 with different stderr).
+- `registry.list_jobs` does not wrap provider errors, so the
+  `warning: <backend> listing failed: <ExcName>: ...` line is unchanged for
+  every real provider failure.
+- Unset optional scope is passed explicitly as `None`, matching the ssh call
+  shape the existing tests assert.
+
+Deliberately not done: rejecting a scope flag that no selected backend accepts
+(today it is silently ignored; erroring is a new failure mode the issue does
+not ask for).
+
+### Sequencing
+
+`listing.py` first (nothing depends on it), then `registry`, then the six
+drivers, then `cli`, then tests and docs. Tests stay green at each step
+except for the intentional record-access churn.
+
+### Review
+
+Landed as designed. 1104 passing, coverage 95.39% (floor 95.0), with
+`listing.py`, `registry.py` and `docker.py` each at 100%.
+
+What the change actually removed: `_collect_backend_jobs`'s if-chain, the
+second dispatch loop in `_ps_main`, six hardcoded flag declarations, two
+copies of the env-fallback logic, and one of the two duplicated
+`--ssh-port` range checks. `runplz ps --help` renders the same text as
+before, generated — including the `[aws]` tags and the `Or set
+AWS_DEFAULT_REGION / AWS_REGION` hints, both derived from the registry.
+
+Behaviour added, both small:
+
+- `runplz ps ssh` is now a valid target. It used to be `invalid choice:
+  'ssh'`, which said the backend could not be listed when it only needed a
+  host; it now reports the host.
+- An empty table names the backends that went unasked. That is the moment
+  "nothing is running" and "nobody asked" are indistinguishable, and ssh
+  jobs are invisible to a bare `runplz ps`. Suppressed once rows exist or
+  once a positional narrowed the selection.
+
+Fixed in passing: `runplz.backends.aws` and `.gcp` were missing from
+`tests/conftest.py`'s `_MODULES_TO_GUARD`, so `list_jobs` reached the real
+`aws` / `gcloud` binaries whenever a test drove `runplz ps` on a machine
+with the provider env vars set — the billed-CLI call that guard exists to
+stop. Pre-existing, and this PR's tests would have widened it.
+
+Two near-misses worth keeping, both caught in design review rather than by
+a test, because no test pinned either:
+
+- The ssh probe has always run *independently of the positional*, so
+  `runplz ps local --host box` lists both. The obvious "positional means
+  only that backend" selection rule silently drops half the answer. Now
+  pinned by `test_ps_probes_an_ssh_host_even_when_a_positional_narrows_the_rest`.
+- Deriving "is in the default fan-out" from "every required field has an
+  env fallback" gives the right answer for all six backends today purely by
+  coincidence, and would have added a third warning line to the most common
+  invocation. `default_fan_out` is stated instead.
+
 ## 2026-08-27 PR Plan — Retry idempotent SSH preparation (#84)
 
 Branch: `fix/retry-ssh-preparation` (off `main` @ `1182715`)

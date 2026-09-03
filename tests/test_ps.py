@@ -7,6 +7,7 @@ import pytest
 
 from runplz import cli
 from runplz.backends import brev, local, modal, ssh
+from runplz.backends.listing import JobRecord
 
 # ---------------------------------------------------------------------------
 # local
@@ -43,11 +44,11 @@ def test_local_list_jobs_parses_docker_ps_json_lines():
     assert cmd[:2] == ["docker", "ps"]
     assert "label=runplz=1" in cmd
     assert len(rows) == 2
-    assert rows[0]["backend"] == "local"
-    assert rows[0]["app"] == "demo"
-    assert rows[0]["function"] == "train"
-    assert rows[0]["name"] == "runplz-demo-train"
-    assert rows[1]["function"] == "eval"
+    assert rows[0].backend == "local"
+    assert rows[0].app == "demo"
+    assert rows[0].function == "train"
+    assert rows[0].name == "runplz-demo-train"
+    assert rows[1].function == "eval"
 
 
 def test_local_list_jobs_silent_when_docker_daemon_down():
@@ -154,13 +155,13 @@ def test_brev_list_jobs_filters_on_runplz_prefix():
     fake = mock.Mock(returncode=0, stdout=rows_json, stderr="")
     with mock.patch("runplz.backends.brev._brev_capture", return_value=fake):
         jobs = brev.list_jobs()
-    assert [j["name"] for j in jobs] == [
+    assert [j.name for j in jobs] == [
         "runplz-demo-train-abcd1234",
         "runplz-demo-eval-deadbeef",
     ]
-    assert jobs[0]["app"] == "demo"
-    assert jobs[0]["function"] == "train"
-    assert jobs[0]["status"] == "RUNNING"
+    assert jobs[0].app == "demo"
+    assert jobs[0].function == "train"
+    assert jobs[0].status == "RUNNING"
 
 
 def test_brev_split_ephemeral_name_handles_multi_segment_app():
@@ -194,10 +195,10 @@ def test_modal_list_jobs_parses_json():
     fake = mock.Mock(returncode=0, stdout=payload, stderr="")
     with mock.patch("runplz.backends.modal.subprocess.run", return_value=fake):
         jobs = modal.list_jobs()
-    assert [j["name"] for j in jobs] == ["runplz-demo-train"]
-    assert jobs[0]["app"] == "demo"
-    assert jobs[0]["function"] == "train"
-    assert jobs[0]["backend"] == "modal"
+    assert [j.name for j in jobs] == ["runplz-demo-train"]
+    assert jobs[0].app == "demo"
+    assert jobs[0].function == "train"
+    assert jobs[0].backend == "modal"
 
 
 def test_modal_list_jobs_falls_back_to_text_parse():
@@ -216,7 +217,7 @@ def test_modal_list_jobs_falls_back_to_text_parse():
     ]
     with mock.patch("runplz.backends.modal.subprocess.run", side_effect=returns):
         jobs = modal.list_jobs()
-    names = [j["name"] for j in jobs]
+    names = [j.name for j in jobs]
     assert "runplz-demo-train" in names
 
 
@@ -246,11 +247,11 @@ def test_ssh_list_jobs_requires_host_and_parses_remote_docker_ps():
     assert cmd[0] == "ssh"
     assert "my.box" in cmd
     assert len(jobs) == 1
-    assert jobs[0]["backend"] == "ssh"
-    assert jobs[0]["app"] == "demo"
-    assert jobs[0]["function"] == "train"
+    assert jobs[0].backend == "ssh"
+    assert jobs[0].app == "demo"
+    assert jobs[0].function == "train"
     # host prefix is stamped onto the name so ps output is unambiguous across hosts.
-    assert jobs[0]["name"].startswith("my.box:")
+    assert jobs[0].name.startswith("my.box:")
 
 
 # ---------------------------------------------------------------------------
@@ -259,14 +260,14 @@ def test_ssh_list_jobs_requires_host_and_parses_remote_docker_ps():
 
 def test_ps_cli_fans_out_and_prints_rows(capsys):
     rows_local = [
-        {
-            "backend": "local",
-            "name": "runplz-demo-train",
-            "app": "demo",
-            "function": "train",
-            "started": "t",
-            "status": "Up 5m",
-        }
+        JobRecord(
+            backend="local",
+            name="runplz-demo-train",
+            app="demo",
+            function="train",
+            started="t",
+            status="Up 5m",
+        )
     ]
     with mock.patch.object(local, "list_jobs", return_value=rows_local):
         with mock.patch.object(brev, "list_jobs", return_value=[]):
@@ -405,10 +406,10 @@ def test_ps_row_parsing_is_shared_by_local_and_ssh():
     )
     local_rows = docker.parse_ps_rows(line, backend="local")
     ssh_rows = docker.parse_ps_rows(line, backend="ssh", name_prefix="gpu.box:")
-    assert local_rows[0]["app"] == ssh_rows[0]["app"] == "myapp"
-    assert local_rows[0]["function"] == ssh_rows[0]["function"] == "train"
-    assert local_rows[0]["name"] == "runplz-app-train"
-    assert ssh_rows[0]["name"] == "gpu.box:runplz-app-train"
+    assert local_rows[0].app == ssh_rows[0].app == "myapp"
+    assert local_rows[0].function == ssh_rows[0].function == "train"
+    assert local_rows[0].name == "runplz-app-train"
+    assert ssh_rows[0].name == "gpu.box:runplz-app-train"
 
 
 def test_ps_row_parsing_skips_garbage_rather_than_failing():
@@ -416,3 +417,142 @@ def test_ps_row_parsing_skips_garbage_rather_than_failing():
 
     rows = docker.parse_ps_rows("not json\n\n{}\n", backend="local")
     assert len(rows) == 1  # the empty object still yields a (blank) row
+
+
+# ---------------------------------------------------------------------------
+# selection: who gets asked, and who says they weren't
+
+
+@pytest.fixture
+def quiet_fan_out(monkeypatch):
+    """Silence every fan-out backend so a test can assert on one of them.
+
+    gcp/aws are in the default fan-out, so a test that patches only
+    local/brev/modal is really asserting against whatever cloud credentials
+    the developer's shell happens to export.
+    """
+    from runplz.backends import aws, gcp
+
+    for module in (local, brev, modal, gcp, aws):
+        monkeypatch.setattr(module, "list_jobs", lambda **kw: [], raising=False)
+
+
+def test_ps_probes_an_ssh_host_even_when_a_positional_narrows_the_rest(quiet_fan_out):
+    """`--host` has always been additive, independent of the positional.
+
+    A "positional means only that backend" rule reads cleanly and loses half
+    the answer: `runplz ps local --host box` is a request for both, and the
+    box is the half the user cannot get any other way.
+    """
+    from runplz.backends import ssh as ssh_backend
+
+    with mock.patch.object(local, "list_jobs", return_value=[]) as local_mock:
+        with mock.patch.object(ssh_backend, "list_jobs", return_value=[]) as ssh_mock:
+            rc = cli.main(["ps", "local", "--host", "my.box"])
+    assert rc == 0
+    local_mock.assert_called_once()
+    ssh_mock.assert_called_once_with(host="my.box", ssh_key_path=None, port=None)
+
+
+def test_ps_queries_each_comma_separated_host_separately(quiet_fan_out):
+    """One call per host, so one unreachable box costs that box's rows rather
+    than every box's, and the warning can name which one failed."""
+    from runplz.backends import ssh as ssh_backend
+
+    def fake(*, host, **kw):
+        if host == "bad.box":
+            raise RuntimeError("connection refused")
+        return [JobRecord(backend="ssh", name=f"{host}:job")]
+
+    with mock.patch.object(ssh_backend, "list_jobs", side_effect=fake):
+        rc = cli.main(["ps", "--host", "good.box, bad.box"])
+    assert rc == 0
+
+
+def test_ps_names_the_failing_host_not_just_the_backend(capsys, quiet_fan_out):
+    from runplz.backends import ssh as ssh_backend
+
+    with mock.patch.object(ssh_backend, "list_jobs", side_effect=RuntimeError("refused")):
+        cli.main(["ps", "--host", "bad.box"])
+    assert "ssh:bad.box listing failed" in capsys.readouterr().err
+
+
+def test_scope_for_a_fan_out_backend_does_not_recruit_it(quiet_fan_out):
+    """`--region` scopes AWS, which was already going to be asked. It must not
+    also be read as "and please add AWS", which would make
+    `runplz ps local --region r` start querying a cloud the user narrowed away
+    from."""
+    from runplz.backends import aws
+
+    with mock.patch.object(aws, "list_jobs", return_value=[]) as aws_mock:
+        cli.main(["ps", "local", "--region", "us-east-1"])
+    aws_mock.assert_not_called()
+
+
+def test_ps_ssh_without_a_host_reports_the_missing_scope(capsys):
+    """Previously `argparse: invalid choice: 'ssh'`, which said the backend
+    could not be listed at all rather than naming the one thing it needed."""
+    rc = cli.main(["ps", "ssh"])
+    err = capsys.readouterr().err
+    assert "ssh listing failed: MissingScope" in err
+    assert "--host" in err
+    assert rc == 1
+
+
+def test_an_empty_table_admits_which_backends_went_unasked(capsys, quiet_fan_out):
+    """An empty table is the one moment "nothing is running" and "nobody
+    asked" look the same, and ssh jobs are invisible to a bare `runplz ps`."""
+    rc = cli.main(["ps"])
+    out = capsys.readouterr()
+    assert "(no runplz jobs running)" in out.out
+    assert "note: ssh was not listed; pass --host to include it" in out.err
+    assert rc == 0
+
+
+def test_the_unasked_note_is_silent_once_there_are_rows_to_show(capsys, quiet_fan_out):
+    with mock.patch.object(
+        local, "list_jobs", return_value=[JobRecord(backend="local", name="runplz-a-b")]
+    ):
+        cli.main(["ps"])
+    assert "was not listed" not in capsys.readouterr().err
+
+
+def test_the_unasked_note_is_silent_when_the_user_narrowed_deliberately(capsys, quiet_fan_out):
+    """`runplz ps local` already says which backend the user wants; listing
+    everything it isn't would be noise."""
+    cli.main(["ps", "local"])
+    assert "was not listed" not in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# table rendering
+
+
+def test_ps_table_columns_come_from_the_record(capsys):
+    """Headers are derived from JobRecord's fields, so this pins the rendered
+    contract that derivation has to keep producing."""
+    cli._print_ps_table(
+        [
+            JobRecord(
+                backend="local",
+                name="runplz-demo-train",
+                app="demo",
+                function="train",
+                started="t",
+                status="Up 5m",
+            )
+        ]
+    )
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].split() == ["BACKEND", "NAME", "APP", "FUNCTION", "STARTED", "STATUS"]
+    assert lines[1].split() == ["local", "runplz-demo-train", "demo", "train", "t", "Up", "5m"]
+
+
+def test_ps_table_prints_a_null_field_as_blank_not_the_word_none(capsys):
+    """Providers hand back nulls: `docker ps` omits keys and a half-created
+    instance has no launch time. A column reading "None" is worse than an
+    empty one — it looks like a value."""
+    cli._print_ps_table([JobRecord(backend="aws", name="i-1", started=None, status=None)])
+    body = capsys.readouterr().out.splitlines()[1]
+    assert "None" not in body
+    assert body.split() == ["aws", "i-1"]

@@ -23,6 +23,7 @@ import subprocess
 from pathlib import Path
 
 from runplz.backends import docker
+from runplz.backends.listing import JobRecord
 
 IMAGE_TAG_DEFAULT = "runplz-local"
 
@@ -126,7 +127,7 @@ def _print_cmd(cmd):
     print("+ " + " ".join(cmd), flush=True)
 
 
-def list_jobs() -> list[dict]:
+def list_jobs() -> list[JobRecord]:
     """Return runplz jobs currently running under the local docker daemon.
 
     Filters on the ``runplz=1`` label so this never returns unrelated

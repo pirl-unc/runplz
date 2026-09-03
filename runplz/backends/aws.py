@@ -15,9 +15,9 @@ ssh wait until it times out.
 """
 
 import json
-import os
 import subprocess
 
+from runplz.backends.listing import JobRecord
 from runplz.backends.provisioning import (
     AWS_CPU_SHAPES,
     AWS_GPUS,
@@ -60,11 +60,14 @@ _UBUNTU_SSM_PARAM = (
 )
 
 
-def list_jobs(*, region: str | None = None) -> list[dict]:
-    """List active runplz-tagged EC2 instances through the real AWS CLI."""
-    region = region or os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION")
-    if not region:
-        raise RuntimeError("AWS region is required; pass --region or set AWS_DEFAULT_REGION")
+def list_jobs(*, region: str) -> list[JobRecord]:
+    """List active runplz-tagged EC2 instances through the real AWS CLI.
+
+    `region` is required rather than defaulted: where it may come from — a
+    flag, `AWS_DEFAULT_REGION`, `AWS_REGION` — is declared once in the
+    registry's `ListingSpec` and resolved before this driver is reached, so
+    the fallback chain exists in one place instead of two.
+    """
     r = subprocess.run(
         [
             "aws",
@@ -96,14 +99,14 @@ def list_jobs(*, region: str | None = None) -> list[dict]:
             name = tags.get("Name") or instance.get("InstanceId", "")
             app_name, fn_name = split_instance_name(name)
             rows.append(
-                {
-                    "backend": "aws",
-                    "name": name,
-                    "app": app_name,
-                    "function": fn_name,
-                    "started": instance.get("LaunchTime", ""),
-                    "status": instance.get("State", {}).get("Name", ""),
-                }
+                JobRecord(
+                    backend="aws",
+                    name=name,
+                    app=app_name,
+                    function=fn_name,
+                    started=instance.get("LaunchTime", ""),
+                    status=instance.get("State", {}).get("Name", ""),
+                )
             )
     return rows
 
