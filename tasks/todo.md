@@ -9,7 +9,7 @@ Branch: `feat/typed-job-records` (off `main` @ `917d1e6`)
 - [x] Every driver returns `JobRecord`; aws/gcp stop resolving their own scope
 - [x] `cli._ps_main` generates flags + selection from the registry
 - [x] Guard `runplz.backends.aws` / `.gcp` in `tests/conftest.py`
-- [x] Bump `runplz/version.py` to 3.25.0
+- [x] Bump `runplz/version.py` to 4.0.0 (breaking: see below)
 - [x] `./format.sh`, `./lint.sh`, `./test.sh`
 - [ ] Review, merge, deploy
 
@@ -104,6 +104,17 @@ Fixed in passing: `runplz.backends.aws` and `.gcp` were missing from
 `aws` / `gcloud` binaries whenever a test drove `runplz ps` on a machine
 with the provider env vars set — the billed-CLI call that guard exists to
 stop. Pre-existing, and this PR's tests would have widened it.
+
+### Version: 4.0.0, not 3.25.0
+
+`aws.list_jobs()` and `gcp.list_jobs()` are in their modules' `__all__`, and
+the README's Public API table — which it says is semver-covered — lists both
+modules. Moving their env fallbacks up into the registry made `region` and
+`project` required keyword arguments, so a downstream `aws.list_jobs()` with
+`AWS_DEFAULT_REGION` set now raises TypeError. That is a major break by the
+repo's own stated rule, whatever the usual patch-bump habit, so it ships as
+one, with a migration note in the README pointing at
+`registry.list_jobs(name, **scope)`.
 
 ### Code review follow-up
 
