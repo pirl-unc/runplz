@@ -40,3 +40,15 @@
   reason. `runplz ps` CLI tests patched three of five fan-out backends and relied on the
   other two erroring on a dev machine with no cloud credentials. Patch the whole surface a
   test claims to control.
+- A platform CI cannot reach is still testable: stub the tool that fails there. macOS
+  `nohup` refuses to detach under a non-interactive ssh session, and all CI runners are
+  Linux -- but the launcher is plain bash, so a `nohup` on PATH that exits the way macOS
+  exits reproduces the production symptom on any runner. Reserve the real platform for
+  confirming the fix, not for carrying the regression test.
+- Before removing a belt-and-braces layer, find out what it is actually holding. `nohup`
+  looked load-bearing for SIGHUP safety; the traps installed by #74 were, and nohup's real
+  job was PID stability, which plain backgrounding also gives. Measure with a control --
+  "survived the signal" means nothing unless the same test without the guard dies.
+- A test that identifies a line of generated script by a keyword pins the wrong thing.
+  Five tests found the spawn by grepping for `nohup`; when nohup became conditional they
+  matched the probe instead. Identify it by what it does -- the script it launches.

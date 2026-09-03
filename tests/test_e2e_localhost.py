@@ -43,21 +43,11 @@ def opts(sshd_server):
     return sshd_server.ssh_options()
 
 
-@pytest.fixture
-def remote_is_linux(target, opts):
-    """Whether the box under test detaches the way production boxes do.
-
-    macOS `nohup` refuses to detach in a non-interactive ssh session
-    ("can't detach from console: Inappropriate ioctl for device"), and
-    macOS has no `setsid`, so detached launch does not work there at all --
-    issue #92. Every documented remote is Linux, so the detached tests run
-    where it matters and skip rather than reporting a runplz bug that only
-    exists on the harness's platform.
-
-    Start Docker and this stops skipping anywhere: the container backend
-    makes the remote Linux regardless of the host.
-    """
-    return "Linux" in sc.ssh_capture(target, "uname -s", ssh_opts=opts)
+# Until 4.0.3 the two detached tests below skipped on a non-Linux remote,
+# because macOS `nohup` refuses to detach in a non-interactive ssh session and
+# detached launch did not work there at all (#92). The launcher no longer
+# depends on nohup succeeding, so they run everywhere -- and on a Mac they run
+# against the platform the bug was actually on.
 
 
 @pytest.fixture
@@ -138,14 +128,8 @@ def test_rsync_up_transfers_the_repo_and_honors_secret_excludes(tmp_path, target
     assert "payload" in nested
 
 
-def test_a_detached_run_reports_its_real_exit_code(
-    tmp_path, target, opts, remote_run, remote_is_linux
-):
+def test_a_detached_run_reports_its_real_exit_code(tmp_path, target, opts, remote_run):
     """The detachment contract: the job outlives the ssh that started it."""
-    if not remote_is_linux:
-        pytest.skip(
-            "ENVIRONMENT_UNAVAILABLE: detached launch is broken on a macOS remote — issue #92"
-        )
     sc.prepare_remote_run(target, remote_run, manifest={}, ssh_opts=opts)
 
     code = sc.launch_detached_and_wait(
@@ -157,7 +141,7 @@ def test_a_detached_run_reports_its_real_exit_code(
     assert code == 7, "the remote exit code must come back verbatim"
 
 
-def test_kill_actually_stops_a_running_remote_process(target, opts, remote_run, remote_is_linux):
+def test_kill_actually_stops_a_running_remote_process(target, opts, remote_run):
     """`runplz kill` is pure generated shell and has broken twice.
 
     The pgid approach shipped broken because bash disables job control in
@@ -165,10 +149,6 @@ def test_kill_actually_stops_a_running_remote_process(target, opts, remote_run, 
     a later revision carried a literal NUL byte. Neither is visible without
     running the script against a real process.
     """
-    if not remote_is_linux:
-        pytest.skip(
-            "ENVIRONMENT_UNAVAILABLE: detached launch is broken on a macOS remote — issue #92"
-        )
     sc.prepare_remote_run(target, remote_run, manifest={}, ssh_opts=opts)
     files = _run_files(remote_run)
     # Launch, but do not wait: this test is about killing a live process.

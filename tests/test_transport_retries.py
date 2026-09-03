@@ -472,7 +472,7 @@ def test_the_launch_claim_is_written_before_the_spawn(remote_run):
     which an already-running job looks like one that never started."""
     lines = sc.build_detached_launcher(remote_run, "train").splitlines()
     claim = next(i for i, ln in enumerate(lines) if sc.LAUNCH_CLAIM_FILENAME in ln)
-    spawn = next(i for i, ln in enumerate(lines) if "nohup" in ln)
+    spawn = next(i for i, ln in enumerate(lines) if '/run.sh"' in ln and ln.endswith("&"))
     pid = next(i for i, ln in enumerate(lines) if sc.BOOTSTRAP_PID_FILENAME in ln)
     assert claim < spawn < pid
 

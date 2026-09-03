@@ -2314,10 +2314,10 @@ def test_launch_detached_and_wait_double_quotes_home_paths_for_expansion():
     )
     launcher = build_detached_launcher(remote_run, "echo hi")
     # ``cat >`` target must be double-quoted (so $HOME expands), not
-    # single-quoted. Same for chmod / nohup / echo-pid targets.
+    # single-quoted. Same for chmod / spawn / echo-pid targets.
     assert f'cat > "{remote_run.meta_shell}/run.sh"' in launcher
     assert f'chmod +x "{remote_run.meta_shell}/run.sh"' in launcher
-    assert f'nohup bash "{remote_run.meta_shell}/run.sh"' in launcher
+    assert f'bash "{remote_run.meta_shell}/run.sh"' in launcher
     assert f'echo $! > "{remote_run.meta_shell}/bootstrap.pid"' in launcher
     # And explicitly NOT the shlex.quote form that broke the previous
     # release.
@@ -2326,8 +2326,14 @@ def test_launch_detached_and_wait_double_quotes_home_paths_for_expansion():
     )
 
 
-def test_build_detached_launcher_uses_pid_stable_nohup():
-    """The public launcher uses nohup without setsid's possible fork."""
+def test_build_detached_launcher_stays_pid_stable_and_avoids_setsid():
+    """`setsid` may fork when invoked by a process group leader, which would
+    leave `$!` pointing at a short-lived wrapper rather than the bootstrap.
+
+    `nohup` is preferred for the same PID-stability reason but is no longer
+    required: it is probed and dropped where it refuses (#92), and a plain
+    backgrounded bash is equally PID-stable.
+    """
     from runplz.backends.ssh_common import build_detached_launcher
 
     remote_run = ssh_common.make_remote_run_context(

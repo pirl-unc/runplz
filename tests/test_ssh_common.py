@@ -356,10 +356,10 @@ def test_detached_launcher_ignores_hup_before_spawn_and_in_child(tmp_path):
         f"sleep 1; printf survived > {shlex.quote(str(marker))}",
     )
 
-    nohup_offset = launcher.index("nohup bash")
+    spawn_offset = launcher.index('bash "' + remote_run.meta_shell + '/run.sh"')
     assert launcher.count("trap '' HUP") == 2
-    assert launcher.index("trap '' HUP") < nohup_offset
-    assert launcher.rindex("trap '' HUP") < nohup_offset
+    assert launcher.index("trap '' HUP") < spawn_offset
+    assert launcher.rindex("trap '' HUP") < spawn_offset
 
     env = dict(os.environ, HOME=str(tmp_path))
     subprocess.run(["bash", "-c", launcher], check=True, env=env)
@@ -438,3 +438,84 @@ def test_build_detached_log_command_stops_tail_for_zombie():
     assert "ps -o stat=" not in command
     assert "missing|dead|zombie" in command
     assert "runplz_stop_tail" in command
+
+
+def _spawn_line(launcher):
+    """The line that actually backgrounds the bootstrap.
+
+    Identified by the run script it launches, not by whichever tool happens to
+    prefix the command -- `nohup` is now conditional, and a test that greps for
+    it matches the probe instead of the spawn.
+    """
+    return next(line for line in launcher.splitlines() if '/run.sh"' in line and line.endswith("&"))
+
+
+def test_a_refusing_nohup_does_not_stop_the_bootstrap(tmp_path):
+    """Issue #92. macOS `nohup` refuses to detach in a non-interactive ssh
+    session, and because bash forks the job before nohup execs and fails, the
+    pid file is still written -- of a process that never ran. The run then
+    looks exactly like a payload that crashed instantly.
+
+    CI has no macOS runner, so the refusal is reproduced instead of the
+    platform: a `nohup` on PATH that fails the way macOS fails. This test fails
+    on the pre-4.0.3 launcher for the real reason -- no marker, because the
+    payload never ran.
+    """
+    stub_dir = tmp_path / "stub-bin"
+    stub_dir.mkdir()
+    nohup = stub_dir / "nohup"
+    nohup.write_text(
+        "#!/bin/sh\n"
+        'echo "nohup: can\'t detach from console: Inappropriate ioctl for device" >&2\n'
+        "exit 1\n"
+    )
+    nohup.chmod(0o755)
+
+    remote_run = ssh_common.make_remote_run_context(
+        backend="ssh", target="box", function_name="train"
+    )
+    marker = tmp_path / "ran-anyway"
+    launcher = ssh_common.build_detached_launcher(
+        remote_run, f"printf ran > {shlex.quote(str(marker))}"
+    )
+
+    env = dict(os.environ, HOME=str(tmp_path), PATH=f"{stub_dir}{os.pathsep}{os.environ['PATH']}")
+    subprocess.run(["bash", "-c", launcher], check=True, env=env)
+
+    deadline = time.monotonic() + 5
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert marker.read_text() == "ran", "the bootstrap never ran when nohup refused"
+
+
+def test_the_bootstrap_still_runs_under_a_working_nohup(tmp_path):
+    """The control. Without it the test above would also pass if the probe had
+    simply disabled the spawn entirely."""
+    remote_run = ssh_common.make_remote_run_context(
+        backend="ssh", target="box", function_name="train"
+    )
+    marker = tmp_path / "ran"
+    launcher = ssh_common.build_detached_launcher(
+        remote_run, f"printf ran > {shlex.quote(str(marker))}"
+    )
+
+    subprocess.run(["bash", "-c", launcher], check=True, env=dict(os.environ, HOME=str(tmp_path)))
+
+    deadline = time.monotonic() + 5
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert marker.read_text() == "ran"
+
+
+def test_the_run_id_is_on_the_spawn_line_whichever_way_nohup_resolves():
+    """`/proc/<pid>/environ` is fixed at exec time, so the assignment has to be
+    on the command that execs -- and there is now only one such line, rather
+    than one per branch that could drift from the other."""
+    remote_run = ssh_common.make_remote_run_context(
+        backend="ssh", target="box", function_name="train"
+    )
+    launcher = ssh_common.build_detached_launcher(remote_run, "echo hi")
+    spawn = _spawn_line(launcher)
+    assert spawn.startswith(f"{ssh_common.RUN_ID_ENV_VAR}={remote_run.run_id} ")
+    assert "${runplz_nohup}" in spawn
+    assert launcher.count('/run.sh" </dev/null') == 1, "the spawn must not be duplicated"

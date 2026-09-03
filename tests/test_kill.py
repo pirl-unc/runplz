@@ -364,10 +364,14 @@ def test_launcher_tags_the_bootstrap_environment_with_the_run_id():
         backend="ssh", target="box", function_name="train"
     )
     launcher = ssh_common.build_detached_launcher(remote_run, "echo hi")
-    nohup_line = next(line for line in launcher.splitlines() if "nohup" in line)
+    # Identified by the script it launches, not by the word "nohup": nohup is
+    # now probed and conditional (#92), so grepping for it finds the probe.
+    spawn_line = next(
+        line for line in launcher.splitlines() if '/run.sh"' in line and line.endswith("&")
+    )
     # Must be on the exec line: /proc/<pid>/environ is fixed at exec time, so a
     # later `export` inside the script would never appear there.
-    assert nohup_line.startswith(f"{ssh_common.RUN_ID_ENV_VAR}={remote_run.run_id} ")
+    assert spawn_line.startswith(f"{ssh_common.RUN_ID_ENV_VAR}={remote_run.run_id} ")
     assert "setsid" not in launcher
     assert f'echo $! > "{remote_run.meta_shell}/bootstrap.pid"' in launcher
     assert "pgid" not in launcher
