@@ -82,6 +82,22 @@ _KNOWN_OPTIONS = {
     "--query",
     "--name",
     "--instance-ids",
+    # Listing. gcloud filters with --filter and narrows with --zones; aws
+    # filters with --filters (plural, and a different syntax) -- close enough
+    # to each other to swap by accident, which is why the stub knows both.
+    "--filter",
+    "--filters",
+    "--zones",
+}
+
+# One subcommand can be two different calls. `aws ec2 describe-instances` is
+# both "what is this instance's IP" (--instance-ids, --output text, a bare
+# address) and "what runplz instances exist" (--filters, --output json, a
+# Reservations document). They take different options and return different
+# shapes, so the stub resolves a variant and lets validation and response
+# follow the call shape rather than the subcommand name.
+_VARIANTS = {
+    "ec2/describe-instances": {"--instance-ids": "by-id", "--filters": "by-filter"},
 }
 
 _REQUIRED_OPTIONS = {
@@ -96,6 +112,10 @@ _REQUIRED_OPTIONS = {
         "compute/config-ssh": {"--project"},
         "compute/instances/delete": {"--project", "--zone"},
         "compute/instances/stop": {"--project", "--zone"},
+        # --filter is required, not incidental: a listing that dropped its
+        # label filter would report every instance in the project as a runplz
+        # job, and the stub should refuse that argv rather than answer it.
+        "compute/instances/list": {"--project", "--filter", "--format"},
     },
     "aws": {
         "ec2/run-instances": {
@@ -108,7 +128,8 @@ _REQUIRED_OPTIONS = {
             "--tag-specifications",
             "--output",
         },
-        "ec2/describe-instances": {"--region", "--instance-ids", "--query", "--output"},
+        "ec2/describe-instances#by-id": {"--region", "--instance-ids", "--query", "--output"},
+        "ec2/describe-instances#by-filter": {"--region", "--filters", "--output"},
         "ec2/wait/instance-running": {"--region", "--instance-ids"},
         "ssm/get-parameter": {"--region", "--name", "--query", "--output"},
         "ec2/terminate-instances": {"--region", "--instance-ids", "--output"},
@@ -123,12 +144,14 @@ import json, os, sys
 LOG = {log!r}
 STATE = LOG + ".state"
 TOKENS = LOG + ".tokens"
+NAMES = LOG + ".names"
 ROUTES = {routes!r}
 FAIL_TIMES = {fail_times!r}
 FAIL_MESSAGE = {fail_message!r}
 MALFORMED = {malformed!r}
 KNOWN_OPTIONS = {_KNOWN_OPTIONS!r}
 REQUIRED_OPTIONS = {_REQUIRED_OPTIONS!r}
+VARIANTS = {_VARIANTS!r}
 
 argv = sys.argv[1:]
 positional = [a for a in argv if not a.startswith("-")]
@@ -143,6 +166,11 @@ try:
         tokens = json.load(fh)
 except FileNotFoundError:
     tokens = {{}}
+try:
+    with open(NAMES) as fh:
+        names = json.load(fh)
+except FileNotFoundError:
+    names = {{}}
 
 with open(LOG, "a") as fh:
     fh.write(json.dumps({{"argv": argv}}) + "\\n")
@@ -193,6 +221,23 @@ def option_value(name):
     except (ValueError, IndexError):
         return None
 
+# Resolve the call shape before anything reads it. A route with variants is
+# ambiguous until we know which discriminating option was passed, and both the
+# stateful block below and the required-option check need the answer -- so an
+# argv that names none of them (or several) is rejected here rather than
+# falling through to whichever branch happens to be written first.
+route_name = "/".join(key)
+variants = VARIANTS.get(route_name)
+if variants:
+    matched = sorted({{name for option, name in variants.items() if option in option_names}})
+    if len(matched) != 1:
+        sys.stderr.write(
+            "stub {name}: " + route_name + " needs exactly one of "
+            + " ".join(sorted(variants)) + "\\n"
+        )
+        sys.exit(2)
+    route_name = route_name + "#" + matched[0]
+
 if key == ("ec2", "run-instances"):
     token = option_value("--client-token")
     instance_id = tokens.get(token)
@@ -200,8 +245,16 @@ if key == ("ec2", "run-instances"):
         instance_id = "i-fake" + str(len(tokens) + 1).zfill(10)
         tokens[token] = instance_id
     state[instance_id] = "running"
-elif key in (("ec2", "describe-instances"), ("ec2", "wait", "instance-running"),
-             ("ec2", "terminate-instances"), ("ec2", "stop-instances")):
+    spec = option_value("--tag-specifications") or ""
+    for chunk in "[]{{}}":
+        spec = spec.replace(chunk, ",")
+    parts = [piece for piece in spec.split(",") if piece]
+    for index, piece in enumerate(parts[:-1]):
+        if piece == "Key=Name" and parts[index + 1].startswith("Value="):
+            names[instance_id] = parts[index + 1][len("Value="):]
+            break
+elif route_name in ("ec2/describe-instances#by-id", "ec2/wait/instance-running",
+                    "ec2/terminate-instances", "ec2/stop-instances"):
     instance_id = option_value("--instance-ids")
     if instance_id not in state or state[instance_id] in {{"terminated", "DELETED"}}:
         sys.stderr.write("InvalidInstanceID.NotFound: instance does not exist\\n")
@@ -226,7 +279,8 @@ with open(STATE, "w") as fh:
     json.dump(state, fh)
 with open(TOKENS, "w") as fh:
     json.dump(tokens, fh)
-route_name = "/".join(key)
+with open(NAMES, "w") as fh:
+    json.dump(names, fh)
 missing = sorted(REQUIRED_OPTIONS.get("{name}", {{}}).get(route_name, set()) - option_names)
 if missing:
     sys.stderr.write("stub {name}: missing required option(s): " + " ".join(missing) + "\\n")
@@ -256,12 +310,15 @@ if "{name}" == "gcloud" and route_name == "compute/config-ssh":
                 "  UserKnownHostsFile /dev/null\\n"
             )
 
-if "/".join(key) in MALFORMED:
-    sys.stdout.write(MALFORMED["/".join(key)])
+# A variant key wins, so one call shape of a subcommand can be made malformed
+# without the other; the bare route name still works and still covers both.
+malformed_body = MALFORMED.get(route_name, MALFORMED.get("/".join(key)))
+if malformed_body is not None:
+    sys.stdout.write(malformed_body)
 else:
     if key == ("ec2", "run-instances"):
         sys.stdout.write(json.dumps({{"Instances": [{{"InstanceId": instance_id}}]}}))
-    elif key == ("ec2", "describe-instances"):
+    elif route_name == "ec2/describe-instances#by-id":
         # Keep the fake response tied to the requested resource.  A
         # production bug that asks about the wrong instance must not still
         # receive a universal localhost address.
@@ -269,6 +326,41 @@ else:
         digits = "".join(ch for ch in requested if ch.isdigit())
         octet = (int(digits[-3:]) if digits else 1) % 254 or 1
         sys.stdout.write("127.0.0." + str(octet))
+    elif route_name == "ec2/describe-instances#by-filter":
+        # Report what this stub actually created rather than a fixture, so a
+        # create-then-list test proves the round trip. Terminated instances
+        # are dropped because production asks for
+        # `Name=instance-state-name,Values=pending,running,stopping,stopped`;
+        # the tag filter needs no work because the stub only ever creates
+        # runplz-tagged instances.
+        reservations = []
+        for iid in sorted(state):
+            if not iid.startswith("i-") or state[iid] == "terminated":
+                continue
+            reservations.append({{"Instances": [{{
+                "InstanceId": iid,
+                "LaunchTime": "2026-01-01T00:00:00+00:00",
+                "State": {{"Name": state[iid]}},
+                "Tags": [
+                    {{"Key": "Name", "Value": names.get(iid, iid)}},
+                    {{"Key": "runplz", "Value": "1"}},
+                ],
+            }}]}})
+        sys.stdout.write(json.dumps({{"Reservations": reservations}}))
+    elif route_name == "compute/instances/list":
+        # Same, for gcloud -- which already keys its state by instance name,
+        # so nothing extra had to be recorded. DELETED and TERMINATED drop out
+        # for the same reason terminated does on the aws side.
+        sys.stdout.write(json.dumps([
+            {{
+                "name": iname,
+                "creationTimestamp": "2026-01-01T00:00:00.000-08:00",
+                "status": state[iname],
+                "labels": {{"runplz": "1"}},
+            }}
+            for iname in sorted(state)
+            if state[iname] not in ("DELETED", "TERMINATED")
+        ]))
     else:
         sys.stdout.write(ROUTES[key])
 sys.exit(0)
@@ -290,6 +382,7 @@ def install(bin_dir: Path, *, name: str, fail_times=None, fail_message="", malfo
             malformed=malformed or {},
             _KNOWN_OPTIONS=_KNOWN_OPTIONS,
             _REQUIRED_OPTIONS=_REQUIRED_OPTIONS,
+            _VARIANTS=_VARIANTS,
         )
     )
     script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
