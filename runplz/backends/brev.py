@@ -256,6 +256,8 @@ def run(
         outputs_dir=outputs_dir,
         mode=dispatch_mode(cfg),
         max_runtime_seconds=cfg.max_runtime_seconds,
+        max_inactivity_seconds=cfg.max_inactivity_seconds,
+        inactivity_action=cfg.inactivity_action,
         ssh_ready_wait_seconds=cfg.ssh_ready_wait_seconds,
         refresh_callback=_poll_refresh_and_check,
     )

@@ -57,6 +57,8 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
         outputs_dir=outputs_dir,
         mode="docker" if cfg.use_docker else "native",
         max_runtime_seconds=cfg.max_runtime_seconds,
+        max_inactivity_seconds=cfg.max_inactivity_seconds,
+        inactivity_action=cfg.inactivity_action,
         ssh_opts=ssh_opts,
     )
 

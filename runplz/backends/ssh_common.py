@@ -111,6 +111,9 @@ __all__ = [
     "inspect_detached_run",
     "wait_for_detached_start",
     "detached_launch_diagnostics",
+    "INACTIVITY_POLL_INTERVAL_S",
+    "build_inactivity_probe",
+    "seconds_since_activity",
     "launch_detached_and_wait",
     "tail_and_wait_for_detached",
     "remote_pid_alive",
@@ -1464,6 +1467,8 @@ def run_container_mode(
     kwargs,
     remote_run: Optional[RemoteRunContext] = None,
     max_runtime_seconds=None,
+    max_inactivity_seconds=None,
+    inactivity_action="diagnose",
     ssh_opts=None,
 ):
     """Container-mode dispatch: the box IS the user's image. Apply Image
@@ -1516,6 +1521,8 @@ def run_container_mode(
         wrapped_command=wrapped,
         remote_run=remote_run,
         max_runtime_seconds=max_runtime_seconds,
+        max_inactivity_seconds=max_inactivity_seconds,
+        inactivity_action=inactivity_action,
         ssh_opts=ssh_opts,
     )
 
@@ -1530,6 +1537,8 @@ def run_native(
     has_nvidia,
     remote_run: Optional[RemoteRunContext] = None,
     max_runtime_seconds=None,
+    max_inactivity_seconds=None,
+    inactivity_action="diagnose",
     ssh_opts=None,
 ):
     """Native dispatch: install python+torch+user code in a venv on the
@@ -1583,6 +1592,8 @@ def run_native(
         wrapped_command=wrapped,
         remote_run=remote_run,
         max_runtime_seconds=max_runtime_seconds,
+        max_inactivity_seconds=max_inactivity_seconds,
+        inactivity_action=inactivity_action,
         ssh_opts=ssh_opts,
     )
 
@@ -2197,13 +2208,123 @@ def wait_for_detached_start(
         time.sleep(poll_interval_s)
 
 
+# How often the watchdog wakes to check for silence. Bounded well under any
+# useful inactivity budget so expiry is noticed promptly, and floored so a
+# small budget cannot turn the monitor into a polling loop.
+INACTIVITY_POLL_INTERVAL_S = 60
+
+
+def build_inactivity_probe(remote_run: RemoteRunContext) -> str:
+    """Shell that reports how long the *application* has been silent.
+
+    Deliberately not the heartbeat. `runplz_heartbeat_loop` runs on a timer as
+    a background job of the wrapper shell, independent of the user's command,
+    so its mtime stays fresh while the job is wedged — proving liveness, which
+    is the exact signal issue #122 says failed to distinguish a deadlock.
+
+    What does move only when the application moves: the driver log, and the
+    outputs directory. The directory is checked non-recursively — a new
+    checkpoint file updates its mtime — so this stays one cheap `stat` rather
+    than a walk of a multi-gigabyte tree every minute.
+
+    Both timestamps and `now` come from the remote, so idle time is computed
+    entirely in the box's own clock; skew against the laptop cannot invent a
+    stall or hide one.
+    """
+    driver_log = f"{remote_run.meta_shell}/run_driver.log"
+    outputs_shell = remote_run.out_shell
+    # `stat -c` is GNU, `stat -f` is BSD. Try both, then fall back to 0, which
+    # reads as "never written" rather than as fresh activity.
+    # `printf '%s\\n' '---NAME---'` rather than `printf '---NAME---\\n'`:
+    # a leading `--` is parsed as options by printf, which the section
+    # markers are made entirely of.
+    return (
+        "runplz_mtime() { "
+        'stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || printf 0; '
+        "}; "
+        "printf '%s\\n' '---NOW---'; date +%s; "
+        "printf '%s\\n' '---LOG---'; "
+        f"runplz_mtime \"{driver_log}\"; printf '%s\\n' ''; "
+        "printf '%s\\n' '---OUT---'; "
+        f"runplz_mtime \"{outputs_shell}\"; printf '%s\\n' ''; "
+        "printf '%s\\n' '---END---'"
+    )
+
+
+def seconds_since_activity(probe_output: str) -> Optional[float]:
+    """Idle seconds from :func:`build_inactivity_probe` output, or None.
+
+    None means "cannot tell" — a truncated or unparseable probe. The caller
+    must treat that as *not* a stall: an unreadable probe is a fact about the
+    ssh round trip, and killing a healthy job over one would be worse than the
+    deadlock the watchdog exists to catch.
+    """
+    sections = parse_probe_sections(probe_output)
+
+    def _stamp(name: str) -> Optional[int]:
+        raw = (sections.get(name) or "").strip().splitlines()
+        try:
+            return int(raw[0]) if raw else None
+        except ValueError:
+            return None
+
+    now = _stamp("NOW")
+    if now is None:
+        return None
+    latest = max((t for t in (_stamp("LOG"), _stamp("OUT")) if t is not None), default=None)
+    if latest is None:
+        return None
+    return max(0.0, float(now - latest))
+
+
+def _stall_context_shell(remote_run: RemoteRunContext, proc_root: str = "/proc") -> str:
+    """Every process of this run, with its state, plus accelerator use.
+
+    Not `ps`: `tasks/lessons.md` records that remote process tracking has to
+    work in minimal container images and must not assume procps. This uses the
+    same `/proc/<pid>/environ` run-id marker `build_kill_command` uses, which
+    is exact — it finds workers orphaned to init and cannot match another run.
+
+    Unlike the kill scan, zombies are *kept*. That scan skips them because
+    counting a zombie as alive would pin its wait loop; here they are the
+    finding — the stall in #122 was one child wedged in `_finalize_join` with
+    four zombie siblings.
+    """
+    return (
+        "printf '%s\\n' 'run processes (pid state):'; "
+        f'for runplz_entry in "{proc_root}"/[0-9]*; do '
+        '  [ -r "$runplz_entry/environ" ] || continue; '
+        "  runplz_cand=${runplz_entry##*/}; "
+        f"  if tr '\\0' '\\n' < \"$runplz_entry/environ\" 2>/dev/null "
+        f'    | grep -qxF "{RUN_ID_ENV_VAR}={remote_run.run_id}"; then '
+        '    runplz_st="?"; '
+        '    if [ -r "$runplz_entry/stat" ]; then '
+        '      IFS= read -r runplz_line < "$runplz_entry/stat" || true; '
+        "      runplz_rest=${runplz_line##*) }; runplz_st=${runplz_rest%% *}; "
+        "    fi; "
+        '    printf \'%s %s\\n\' "$runplz_cand" "$runplz_st"; '
+        "  fi; "
+        "done; "
+        "printf '%s\\n' 'accelerators:'; "
+        "nvidia-smi --query-gpu=index,utilization.gpu,memory.used "
+        "--format=csv,noheader 2>/dev/null || printf '%s\\n' '(no nvidia-smi)'"
+    )
+
+
 def detached_launch_diagnostics(
     target: str,
     remote_run: RemoteRunContext,
     *,
     ssh_opts: Optional[SshOptions] = None,
+    include_stall_context: bool = False,
 ) -> str:
-    """Fetch compact process and lifecycle context for a failed startup."""
+    """Fetch compact process and lifecycle context for a failed startup.
+
+    ``include_stall_context`` adds this run's process table and accelerator
+    use, which a stall needs and a failed launch does not — at launch failure
+    there are no processes to table and no GPU work to report. Opt-in so the
+    launch path's output is unchanged.
+    """
 
     meta = remote_run.meta_shell
     pid_file = f"{meta}/{BOOTSTRAP_PID_FILENAME}"
@@ -2222,6 +2343,8 @@ def detached_launch_diagnostics(
         "printf '%s\\n' 'driver log:'; "
         f'tail -n {FAILURE_TAIL_LINES} "{driver_log}" 2>/dev/null || true'
     )
+    if include_stall_context:
+        command += "; " + _stall_context_shell(remote_run)
     return ssh_capture(target, command, ssh_opts=ssh_opts).rstrip()
 
 
@@ -2257,6 +2380,8 @@ def launch_detached_and_wait(
     wrapped_command: str,
     remote_run: Optional["RemoteRunContext"] = None,
     max_runtime_seconds: Optional[int] = None,
+    max_inactivity_seconds: Optional[int] = None,
+    inactivity_action: str = "diagnose",
     ssh_opts: Optional[SshOptions] = None,
     max_reconnects: int = 20,
 ) -> int:
@@ -2369,12 +2494,103 @@ def launch_detached_and_wait(
         log_file=log_file,
         events_file=events_file,
         max_runtime_seconds=max_runtime_seconds,
+        max_inactivity_seconds=max_inactivity_seconds,
+        inactivity_action=inactivity_action,
         max_reconnects=max_reconnects,
         ssh_opts=ssh_opts,
         # So a runtime-cap timeout stops this run precisely instead of
         # pkill-ing every runplz bootstrap on the box.
         remote_run=remote_run,
     )
+
+
+def _check_inactivity(
+    target: str,
+    remote_run: Optional[RemoteRunContext],
+    max_inactivity_seconds: Optional[int],
+    inactivity_action: str,
+    *,
+    already_reported: bool,
+    ssh_opts: Optional[SshOptions] = None,
+) -> tuple:
+    """One watchdog tick. Returns ``(stalled_now, reported)``.
+
+    An unreadable probe is not a stall. It is a fact about the ssh round
+    trip, and terminating a healthy job over one would be a worse failure
+    than the deadlock this exists to catch — so anything short of a
+    confidently-measured silence leaves the run alone.
+    """
+    if remote_run is None or max_inactivity_seconds is None:
+        return False, already_reported
+    try:
+        idle = seconds_since_activity(
+            ssh_capture(target, build_inactivity_probe(remote_run), ssh_opts=ssh_opts)
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"+ warning: inactivity probe failed: {type(exc).__name__}: {exc}", flush=True)
+        return False, already_reported
+    if idle is None or idle < max_inactivity_seconds:
+        # Work resumed (or was never absent): re-arm, so a later stall is
+        # reported as its own episode rather than suppressed by this one.
+        return False, False
+    if already_reported:
+        return True, True
+
+    _record_remote_event(
+        target,
+        remote_run,
+        "remote_command_stalled",
+        ssh_opts=ssh_opts,
+        idle_seconds=int(idle),
+        threshold_seconds=int(max_inactivity_seconds),
+        action=inactivity_action,
+    )
+    print(
+        f"+ WARNING: no application output on {target} for {int(idle)}s "
+        f"(max_inactivity_seconds={int(max_inactivity_seconds)}). The process is "
+        f"alive — the runplz heartbeat proves only that — so this is silence, "
+        f"not necessarily a hang.",
+        flush=True,
+    )
+    try:
+        print(
+            detached_launch_diagnostics(
+                target, remote_run, ssh_opts=ssh_opts, include_stall_context=True
+            ),
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"+ warning: stall diagnostics failed: {type(exc).__name__}: {exc}", flush=True)
+
+    if inactivity_action == "terminate":
+        print(f"+ inactivity_action=terminate: stopping run {remote_run.run_id}", flush=True)
+        _terminate_stalled_run(target, remote_run, ssh_opts=ssh_opts)
+    else:
+        print("+ inactivity_action=diagnose: leaving the run alone", flush=True)
+    return True, True
+
+
+def _terminate_stalled_run(
+    target: str,
+    remote_run: RemoteRunContext,
+    *,
+    ssh_opts: Optional[SshOptions] = None,
+) -> None:
+    """Stop exactly this run, and report what it actually stopped.
+
+    `build_kill_command` already emits a bounded SUMMARY / HEARTBEAT / LOGTAIL
+    block — including gpu_mem_used — which `raise_for_runtime_cap` captures and
+    then throws away. Printing it costs nothing and is precisely the evidence
+    an operator needs about a stall.
+    """
+    cleanup = build_kill_command(remote_run.meta_shell, run_id=remote_run.run_id, timeout_s=5)
+    try:
+        summary = ssh_capture(target, cleanup, ssh_opts=ssh_opts)
+    except Exception as exc:  # noqa: BLE001
+        print(f"+ warning: failed to stop stalled run: {type(exc).__name__}: {exc}", flush=True)
+        return
+    if summary.strip():
+        print(summary.rstrip(), flush=True)
 
 
 def tail_and_wait_for_detached(
@@ -2384,6 +2600,8 @@ def tail_and_wait_for_detached(
     log_file: str,
     events_file: str,
     max_runtime_seconds: Optional[int] = None,
+    max_inactivity_seconds: Optional[int] = None,
+    inactivity_action: str = "diagnose",
     max_reconnects: int = 20,
     ssh_opts: Optional[SshOptions] = None,
     remote_run: Optional[RemoteRunContext] = None,
@@ -2397,18 +2615,37 @@ def tail_and_wait_for_detached(
     If ssh drops mid-stream but the remote PID is still alive, reconnect
     and keep tailing. If the PID is gone, read the exit code from the
     events file and return it.
+
+    ``max_inactivity_seconds`` adds an opt-in watchdog on *application*
+    silence, independent of the total-runtime cap (#122). Off by default,
+    because build, download and compile phases are legitimately quiet and
+    silence alone must not change what an existing job does.
     """
     print(
         "+ streaming detached remote log (resilient to ssh reconnects)",
         flush=True,
     )
     started = time.monotonic()
+    watching = max_inactivity_seconds is not None and remote_run is not None
+    # Fires once per stall, re-armed when work resumes, so a job that is quiet
+    # for ten hours warns once rather than every poll interval.
+    stall_reported = False
 
     def _remaining_s() -> Optional[float]:
-        if max_runtime_seconds is None:
-            return None
-        left = max_runtime_seconds - (time.monotonic() - started)
-        return max(1.0, left)
+        bounds = []
+        if max_runtime_seconds is not None:
+            bounds.append(max(1.0, max_runtime_seconds - (time.monotonic() - started)))
+        if watching:
+            # The tail blocks until the job ends, so without a bound there is
+            # no moment at which silence could be noticed. This is what wakes
+            # the loop; it is not a timeout on anything.
+            bounds.append(float(min(INACTIVITY_POLL_INTERVAL_S, max_inactivity_seconds)))
+        return min(bounds) if bounds else None
+
+    def _runtime_cap_reached() -> bool:
+        return (
+            max_runtime_seconds is not None and (time.monotonic() - started) >= max_runtime_seconds
+        )
 
     reconnects = 0
     while True:
@@ -2419,13 +2656,37 @@ def tail_and_wait_for_detached(
                 timeout=_remaining_s(),
             )
         except subprocess.TimeoutExpired:
-            raise_for_runtime_cap(
+            # Two things end the tail early, and they are not the same event.
+            # Only an exhausted runtime budget is the cap; otherwise this is
+            # the watchdog's own wake-up.
+            if _runtime_cap_reached() or not watching:
+                raise_for_runtime_cap(
+                    target,
+                    max_runtime_seconds,
+                    container_name=None,
+                    ssh_opts=ssh_opts,
+                    remote_run=remote_run,
+                )
+            if not remote_pid_alive(target, pid_file, ssh_opts=ssh_opts):
+                break
+            stalled, stall_reported = _check_inactivity(
                 target,
-                max_runtime_seconds,
-                container_name=None,
+                remote_run,
+                max_inactivity_seconds,
+                inactivity_action,
+                already_reported=stall_reported,
                 ssh_opts=ssh_opts,
-                remote_run=remote_run,
             )
+            if stalled and inactivity_action == "terminate":
+                # Deliberately not raise_for_runtime_cap's shape: that raises
+                # out of dispatch_to_target before rsync_down, losing whatever
+                # the job produced. #122 requires outputs preserved, so stop
+                # the run and let the normal completion path collect them.
+                break
+            # A watchdog tick is not a dropped connection. Falling through
+            # would spend one of `max_reconnects` per poll and silently kill
+            # the live log stream on any legitimately quiet job.
+            continue
         if not remote_pid_alive(target, pid_file, ssh_opts=ssh_opts):
             break
         if max_runtime_seconds is not None and (time.monotonic() - started) >= max_runtime_seconds:
@@ -2833,6 +3094,8 @@ def dispatch_to_target(
     outputs_dir: str = "out",
     mode: str = "docker",
     max_runtime_seconds: Optional[int] = None,
+    max_inactivity_seconds: Optional[int] = None,
+    inactivity_action: str = "diagnose",
     ssh_opts: Optional[SshOptions] = None,
 ) -> DispatchResult:
     """Run one function on an already-reachable box, start to finish.
@@ -2907,6 +3170,8 @@ def dispatch_to_target(
                 kwargs=kwargs,
                 remote_run=remote_run,
                 max_runtime_seconds=max_runtime_seconds,
+                max_inactivity_seconds=max_inactivity_seconds,
+                inactivity_action=inactivity_action,
                 ssh_opts=ssh_opts,
             )
         elif mode == "docker":
@@ -2942,6 +3207,8 @@ def dispatch_to_target(
                 has_nvidia=remote_has_nvidia(target, ssh_opts=ssh_opts),
                 remote_run=remote_run,
                 max_runtime_seconds=max_runtime_seconds,
+                max_inactivity_seconds=max_inactivity_seconds,
+                inactivity_action=inactivity_action,
                 ssh_opts=ssh_opts,
             )
         rsync_down(target, host_out, remote_run=remote_run, ssh_opts=ssh_opts)
@@ -3003,6 +3270,8 @@ def run_on_provisioned_vm(
     outputs_dir: str = "out",
     mode: str = "docker",
     max_runtime_seconds: Optional[int] = None,
+    max_inactivity_seconds: Optional[int] = None,
+    inactivity_action: str = "diagnose",
     ssh_ready_wait_seconds: int = 1800,
     refresh_callback: Optional[Callable[[], None]] = None,
     ssh_opts: Optional[SshOptions] = None,
@@ -3051,6 +3320,8 @@ def run_on_provisioned_vm(
                 outputs_dir=outputs_dir,
                 mode=mode,
                 max_runtime_seconds=max_runtime_seconds,
+                max_inactivity_seconds=max_inactivity_seconds,
+                inactivity_action=inactivity_action,
                 ssh_opts=ssh_opts,
             )
         finally:
