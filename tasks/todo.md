@@ -2419,7 +2419,7 @@ skipped, and total coverage is 95.07%.
       and interrupted transfers.
 - [x] Add regression coverage for persistent and ephemeral dispatch, all four SSH-derived
       backends, current/legacy kill records, cap cleanup outcomes, and sync history.
-- [ ] Re-run `./format.sh`, `./lint.sh`, and `./test.sh`; update PR #164 and confirm CI.
+- [x] Re-run `./format.sh`, `./lint.sh`, and `./test.sh`; update PR #164 and confirm CI.
 
 ### Review follow-up results
 
@@ -2430,5 +2430,6 @@ kills override later exits only with explicit no-survivor evidence. A failed `--
 is named `kill_attempted_by_user`, and old fieldless kill/stall records yield to a later exit.
 Start-only sync records now say `started (completion unknown)`.
 
-Local verification: `./format.sh`, `./lint.sh`, and `./test.sh` pass; 1290 tests passed, 1 platform
-test skipped, and total coverage is 95.14%. PR/CI update pending.
+Verification: `./format.sh`, `./lint.sh`, and `./test.sh` pass; 1290 tests passed, 1 platform test
+skipped, and total coverage is 95.14%. PR #164 is updated and its lint, Python 3.10–3.12, and
+container end-to-end checks all pass.
