@@ -167,12 +167,16 @@ def test_status_does_not_claim_a_start_only_sync_is_active():
 
 
 def test_status_parser_tolerates_blank_malformed_and_non_object_records():
-    sections = runs._status_event_sections('\nnot-json\n["valid JSON, wrong shape"]\n')
+    bad_array = json.dumps({"event": []})
+    bad_object = json.dumps({"event": {"not": "a string"}})
+    sections = runs._status_event_sections(
+        f'\nnot-json\n["valid JSON, wrong shape"]\n{bad_array}\n{bad_object}\n'
+    )
 
     assert sections == {
-        "LAST_EVENT": '["valid JSON, wrong shape"]',
+        "LAST_EVENT": bad_object,
         "LAST_SYNC_EVENT": "",
-        "EVENT_COUNT": "2",
+        "EVENT_COUNT": "4",
     }
 
     rendered = runs._format_status(
@@ -204,6 +208,8 @@ def test_rsync_down_records_started_and_completed(tmp_path):
         "rsync_down_start",
         "rsync_down_done",
     ]
+    local_events = (tmp_path / ".runplz" / "events.ndjson").read_text().splitlines()
+    assert [json.loads(line)["event"] for line in local_events] == ["rsync_down_done"]
 
 
 def test_rsync_down_records_failure_without_replacing_it(tmp_path):
@@ -222,6 +228,46 @@ def test_rsync_down_records_failure_without_replacing_it(tmp_path):
         "rsync_down_failed",
     ]
     assert record.call_args.kwargs["exit_code"] == 23
+    local_event = json.loads((tmp_path / ".runplz" / "events.ndjson").read_text())
+    assert local_event["event"] == "rsync_down_failed"
+    assert local_event["error_type"] == "CalledProcessError"
+    assert local_event["exit_code"] == 23
+
+
+def test_local_sync_event_failure_does_not_replace_the_transfer_error(tmp_path, capsys):
+    remote_run = _remote_run()
+    transfer_failure = subprocess.CalledProcessError(23, "rsync")
+    local_out = tmp_path / "not-a-directory"
+    local_out.write_text("blocks metadata directory creation")
+
+    with (
+        mock.patch.object(sc, "run_local", side_effect=transfer_failure),
+        mock.patch.object(sc, "_record_remote_event"),
+        pytest.raises(subprocess.CalledProcessError) as raised,
+    ):
+        sc.rsync_down("box", local_out, remote_run=remote_run)
+
+    assert raised.value is transfer_failure
+    assert "failed to record local lifecycle event 'rsync_down_failed'" in capsys.readouterr().out
+
+
+def test_signal_sentinel_bypasses_best_effort_exception_handlers(tmp_path):
+    interruption = sc.OrchestratorKilled("terminated", signal_name="SIGTERM")
+
+    assert not isinstance(interruption, Exception)
+    with (
+        mock.patch.object(sc.subprocess, "run", side_effect=interruption),
+        pytest.raises(sc.OrchestratorKilled) as inspect_raised,
+    ):
+        sc.inspect_local_repo(tmp_path)
+    assert inspect_raised.value is interruption
+
+    with (
+        mock.patch.object(sc, "ssh_capture", side_effect=interruption),
+        pytest.raises(sc.OrchestratorKilled) as tail_raised,
+    ):
+        sc.fetch_failure_tail(target="box", container_name="container")
+    assert tail_raised.value is interruption
 
 
 def test_build_failure_closes_the_started_phase():

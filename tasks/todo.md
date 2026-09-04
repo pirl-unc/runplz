@@ -2433,3 +2433,30 @@ Start-only sync records now say `started (completion unknown)`.
 Verification: `./format.sh`, `./lint.sh`, and `./test.sh` pass; 1290 tests passed, 1 platform test
 skipped, and total coverage is 95.14%. PR #164 is updated and its lint, Python 3.10–3.12, and
 container end-to-end checks all pass.
+
+### Second review follow-up — cancellation and locally durable sync outcomes
+
+#### Specification
+
+- [x] Make `OrchestratorKilled` bypass every ordinary `except Exception` boundary by construction,
+      while retaining the explicit dispatch catch that records the signal and the outer lifecycle
+      `finally` that tears provisioned hosts down.
+- [x] Record `rsync_down_done` and `rsync_down_failed` directly in the local downloaded metadata as
+      well as remotely; local reporting is best-effort and must never replace a transfer error.
+- [x] Treat non-string `event` fields as malformed/non-authoritative without performing a set
+      lookup, so arrays, objects, and other externally edited values cannot crash status.
+- [x] Add regressions through the existing broad catches, successful and failed transfer paths,
+      ephemeral-survival semantics, and malformed event objects.
+- [x] Run `./format.sh`, `./lint.sh`, and `./test.sh`; push PR #164 and confirm every CI job.
+
+#### Review
+
+`OrchestratorKilled` now inherits directly from `BaseException`, so routine best-effort
+`except Exception` blocks cannot turn operator cancellation into continued staging or launch.
+Successful and failed output transfers append their terminal outcome to the local surviving event
+stream as well as the remote live stream; a local reporting error remains a warning and cannot
+replace the transfer exception. Status validates event-name types before selection and rendering,
+so externally edited arrays/objects remain reportable rather than crashing set lookup.
+
+Local verification: `./format.sh`, `./lint.sh`, and `./test.sh` pass; 1293 tests passed, 1 platform
+test skipped, and total coverage is 95.14%.

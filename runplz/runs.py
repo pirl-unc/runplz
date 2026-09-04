@@ -243,6 +243,8 @@ def _is_authoritative_status_event(event: dict) -> bool:
     ``remote_command_exit`` become current.
     """
     name = event.get("event")
+    if not isinstance(name, str):
+        return False
     if name in {"killed_by_runtime_cap", "runtime_cap_reached", "orchestrator_signalled"}:
         return True
     confirmed_stop = _confirmed_true(event.get("signalled")) and _confirmed_false(
@@ -274,7 +276,8 @@ def _status_event_sections(raw_events: str) -> dict[str, str]:
         if not isinstance(event, dict):
             latest_run = line
             continue
-        if event.get("event") in _OUTPUT_SYNC_EVENTS:
+        name = event.get("event")
+        if isinstance(name, str) and name in _OUTPUT_SYNC_EVENTS:
             latest_sync = line
             continue
         latest_run = line
@@ -467,6 +470,8 @@ def _format_status(*, target: str, manifest: dict, sections: dict[str, str]) -> 
             evt = json.loads(last_event_raw)
             ts = evt.get("ts", "")
             evt_name = evt.get("event", "?")
+            if not isinstance(evt_name, str):
+                raise TypeError("event name must be a string")
             age = _age_str(ts)
             extra = "".join(
                 f" {key}={evt[key]}"
@@ -474,7 +479,7 @@ def _format_status(*, target: str, manifest: dict, sections: dict[str, str]) -> 
                 if key in evt
             )
             lines.append(f"last event: {evt_name}{extra} at {ts}{age}")
-        except (json.JSONDecodeError, AttributeError):
+        except (json.JSONDecodeError, AttributeError, TypeError):
             lines.append(f"last event (unparsed): {last_event_raw[:200]}")
     else:
         lines.append("last event: (none recorded)")
@@ -483,6 +488,8 @@ def _format_status(*, target: str, manifest: dict, sections: dict[str, str]) -> 
         try:
             sync = json.loads(last_sync_raw)
             sync_name = sync.get("event", "?")
+            if not isinstance(sync_name, str):
+                raise TypeError("event name must be a string")
             sync_state = {
                 "rsync_down_start": "started (completion unknown)",
                 "rsync_down_done": "completed",
@@ -492,7 +499,7 @@ def _format_status(*, target: str, manifest: dict, sections: dict[str, str]) -> 
             age = _age_str(ts)
             detail = f" error_type={sync['error_type']}" if "error_type" in sync else ""
             lines.append(f"output sync: {sync_state}{detail} at {ts}{age}")
-        except (json.JSONDecodeError, AttributeError):
+        except (json.JSONDecodeError, AttributeError, TypeError):
             lines.append(f"output sync (unparsed): {last_sync_raw[:200]}")
     else:
         lines.append("output sync: (not started)")

@@ -737,6 +737,30 @@ def _record_remote_event(
         )
 
 
+def _record_local_event(
+    local_out: Path,
+    remote_run: Optional[RemoteRunContext],
+    event: str,
+    **fields: Any,
+) -> None:
+    """Append an event to the downloaded stream without masking its cause."""
+    if remote_run is None:
+        return
+    payload = {"ts": _utc_now_iso(), "run_id": remote_run.run_id, "event": event}
+    payload.update({k: v for k, v in fields.items() if v is not None})
+    path = Path(local_out) / REMOTE_META_DIRNAME / "events.ndjson"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, sort_keys=True) + "\n")
+    except OSError as exc:
+        print(
+            f"+ warning: failed to record local lifecycle event "
+            f"{event!r} for {remote_run.run_id}: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+
 def _remote_logging_shell(remote_run: RemoteRunContext) -> str:
     return (
         f'RUNPLZ_EVENTS="{remote_run.events_shell}"\n'
@@ -1224,15 +1248,25 @@ def rsync_down(
     except OrchestratorKilled:
         raise
     except Exception as exc:
+        fields = {
+            "error_type": type(exc).__name__,
+            "exit_code": getattr(exc, "returncode", None),
+        }
+        # The failed transfer cannot carry an event written afterwards back
+        # to this machine. Persist the surviving local audit record directly.
+        _record_local_event(local_out, remote_run, "rsync_down_failed", **fields)
         _record_remote_event(
             target,
             remote_run,
             "rsync_down_failed",
             ssh_opts=ssh_opts,
-            error_type=type(exc).__name__,
-            exit_code=getattr(exc, "returncode", None),
+            **fields,
         )
         raise
+    # The successful transfer copied rsync_down_start, but this terminal event
+    # necessarily happens afterwards. Write it locally before the remote copy
+    # can disappear during ephemeral teardown.
+    _record_local_event(local_out, remote_run, "rsync_down_done")
     _record_remote_event(target, remote_run, "rsync_down_done", ssh_opts=ssh_opts)
 
 
@@ -3375,8 +3409,8 @@ def make_container_name(fn_name: str) -> str:
 CLEANUP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 
 
-class OrchestratorKilled(RuntimeError):
-    """Raised in place of a termination signal so cleanup still runs."""
+class OrchestratorKilled(BaseException):
+    """Signal sentinel that bypasses ordinary best-effort exception handlers."""
 
     def __init__(self, message: str, *, signal_name: Optional[str] = None):
         super().__init__(message)
