@@ -4,6 +4,7 @@ actually shelling out to `modal` or hitting Modal's servers.
 """
 
 import io
+import json
 import sys
 import tarfile
 import types
@@ -463,3 +464,62 @@ def test_run_cleans_up_entrypoint_and_blob_files(tmp_path):
     # Both temp files should be cleaned up after a successful run.
     assert not Path(captured_paths["entry"]).exists()
     assert not Path(captured_paths["blob"]).exists()
+
+
+def test_list_jobs_reads_the_display_name_out_of_description(monkeypatch):
+    """Modal client 1.1.4 reports the app display name under `Description`.
+
+    The parser only knew `name` / `App Name` / `Name`, so the name came back
+    empty, every app failed the `runplz-` prefix filter, and `runplz ps`
+    reported no Modal jobs at all — silently, because an app that parses to no
+    name is indistinguishable from someone else's app (#142). Fixture is the
+    real 1.1.4 response shape.
+    """
+    payload = json.dumps(
+        [
+            {
+                "App ID": "ap-example",
+                "Description": "runplz-example-train",
+                "State": "ephemeral (detached)",
+                "Tasks": "1",
+            },
+            {"App ID": "ap-other", "Description": "someone-elses-app", "State": "deployed"},
+        ]
+    )
+    monkeypatch.setitem(sys.modules, "modal", types.ModuleType("modal"))
+    with mock.patch.object(
+        modal_backend.subprocess,
+        "run",
+        return_value=mock.Mock(returncode=0, stdout=payload, stderr=""),
+    ):
+        jobs = modal_backend.list_jobs()
+
+    assert [j.name for j in jobs] == ["runplz-example-train"]
+    assert (jobs[0].app, jobs[0].function) == ("example", "train")
+    assert jobs[0].status == "ephemeral (detached)"
+
+
+def test_a_runplz_name_wins_over_an_unrelated_field_that_comes_first():
+    """Field order is not the contract. If a future shape puts an app id in
+    `Name` and the display name in `Description`, taking the first non-empty
+    field would fail the prefix filter and lose the job the same way #142 did.
+    """
+    row = {"Name": "ap-0123456789", "Description": "runplz-demo-train"}
+    assert modal_backend._display_name(row) == "runplz-demo-train"
+
+
+def test_a_row_with_no_runplz_name_still_reports_something_identifiable():
+    """Falling back to the first non-empty field keeps unrelated apps
+    debuggable rather than blank — they are filtered out either way."""
+    assert modal_backend._display_name({"Name": "someone-else"}) == "someone-else"
+    assert modal_backend._display_name({}) == ""
+
+
+def test_the_prefix_that_is_stamped_is_the_prefix_that_is_filtered():
+    """One constant, so a rename cannot make runplz stop recognising its own
+    apps — the shape of the bug this fixes."""
+    assert modal_backend.APP_PREFIX == "runplz-"
+    assert modal_backend._split_modal_app_name(f"{modal_backend.APP_PREFIX}demo-train") == (
+        "demo",
+        "train",
+    )
