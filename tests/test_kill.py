@@ -264,7 +264,7 @@ class _FakeBox:
             ["bash", str(script)], capture_output=True, text=True, timeout=180, env=env
         )
         assert r.returncode == 0, r.stderr
-        sections = runs._parse_status_sections(r.stdout)
+        sections = ssh_common.parse_probe_sections(r.stdout)
         return ssh_common.parse_kv_block(sections.get("SUMMARY", ""))
 
     def cleanup(self):

@@ -203,10 +203,18 @@ def _option_values() -> dict:
             },
         },
         "aws": {
-            "*": {"--output": {"choices": ["json", "text", "table", "yaml", "yaml-stream"]}},
+            "*": {
+                "--output": {"choices": ["json", "text", "table", "yaml", "yaml-stream"]},
+                # EC2 resource ids are `<type>-<hex>`. Not pinned to the real
+                # width, because the stubs mint short ids of their own and the
+                # bug worth catching is a value that is not an id at all -- an
+                # ARN, a name, an empty string from a failed lookup.
+                "--instance-ids": {"prefix": "i-"},
+            },
             "ec2/run-instances": {
                 "--instance-type": {"choices": _machine_names(AWS_CPU_SHAPES, AWS_GPUS)},
                 "--count": {"int": True},
+                "--image-id": {"prefix": "ami-"},
             },
         },
     }
@@ -368,6 +376,10 @@ def bad_value(spec, value):
             return "unknown accelerator " + fields["type"]
         if not fields["count"].isdigit():
             return "count must be an integer"
+        return None
+    if "prefix" in spec:
+        if not value.startswith(spec["prefix"]) or value == spec["prefix"]:
+            return "expected a value starting with " + spec["prefix"]
         return None
     if spec.get("int"):
         digits = value

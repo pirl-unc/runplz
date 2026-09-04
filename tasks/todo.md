@@ -11,6 +11,35 @@ Branch: `fix/graceful-container-stop-on-cap` (off `main` @ 4.3.2)
 - [x] `./format.sh`, `./lint.sh`, `./test.sh`
 - [ ] Review, merge, deploy
 
+### Also in this PR: every deferral this session left open
+
+Asked to stop deferring, so the three loose ends recorded above are closed
+here rather than carried:
+
+1. **`--image-id` / `--instance-ids` value validation** (#154's "Not done").
+   `ami-` and `i-` prefixes, not the real id widths -- the stubs mint short
+   ids of their own, and the bug worth catching is a value that is not an id
+   at all: an ARN, a name, or the empty string from a failed `ssm
+   get-parameter`, which would otherwise launch with no image.
+
+2. **`runs._parse_status_sections`** (#155's "Not deduped") was a
+   byte-for-byte copy of `ssh_common.parse_probe_sections`. #155 moved the
+   kv-block parser to `ssh_common` and left its sibling behind, which was the
+   worse of the two states: one parser shared, one duplicated, side by side.
+
+3. **A `runplz ps` scope flag that reaches no listed backend** was silently
+   ignored -- deferred back in the listing-registry PR as "a new failure mode
+   the issue does not ask for". It is the same failure class as #153, #143 and
+   #20, and this PR is already about not letting a stop path lie, so leaving
+   it would have been inconsistent.
+
+   Two things that check had to get right, both pinned by tests: it reads only
+   what the user *typed*, because `resolve_all` falls back to the environment
+   and an exported `AWS_DEFAULT_REGION` would otherwise break `runplz ps
+   local` for most AWS users; and `--host ,` still counts as unsupplied, since
+   "scope that resolves to nothing is scope the user did not supply" holds
+   everywhere else.
+
 ### The bug
 
 `raise_for_runtime_cap` branches on shape, and the docker branch comes first:
@@ -168,9 +197,10 @@ event write and asserts the RuntimeError is unchanged.
 `_parse_kv_block` moved from `runs.py` to `ssh_common.parse_kv_block`. Both
 the `kill` CLI and the cap path read the same SUMMARY block, and the command
 that emits it is built in `ssh_common`, so that is where its parser belongs --
-`runs.py` already imports from there. Not deduped: `runs._parse_status_sections`
-is still a copy of `ssh_common.parse_probe_sections`; filed rather than folded
-in, since nothing here needed a second section parser.
+`runs.py` already imports from there. Not deduped in that PR:
+`runs._parse_status_sections` was still a copy of
+`ssh_common.parse_probe_sections`. Folded in later, in the #158 batch --
+and the note above was wrong to say it had been filed, because it had not.
 
 ### Deliberately not in this PR
 

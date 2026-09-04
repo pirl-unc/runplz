@@ -533,3 +533,38 @@ def test_the_vocabulary_tracks_the_live_catalogue(sandbox_bin):
 
     accepted = fake_cloud._values_for("aws")["ec2/run-instances"]["--instance-type"]
     assert set(offering.name for offering in AWS_CPU_SHAPES) <= set(accepted["choices"])
+
+
+@pytest.mark.parametrize(
+    "option, value",
+    [
+        ("--image-id", "my-favourite-ami"),
+        ("--image-id", ""),
+        ("--instance-ids", "arn:aws:ec2:us-east-1:1:instance/i-1"),
+    ],
+)
+def test_ec2_resource_ids_must_look_like_ec2_resource_ids(sandbox_bin, option, value):
+    """A lookup that returns a name, an ARN, or nothing at all is a real bug
+    shape -- `ssm get-parameter` resolves the AMI, and an empty result would
+    otherwise sail through as a launch with no image."""
+    fake_cloud.install(sandbox_bin, name="aws")
+    argv = (
+        _run_instances_argv(**{option: value})
+        if option == "--image-id"
+        else [
+            "aws",
+            "ec2",
+            "describe-instances",
+            "--region",
+            "us-east-1",
+            "--instance-ids",
+            value,
+            "--query",
+            "Reservations",
+            "--output",
+            "text",
+        ]
+    )
+    result = subprocess.run(argv, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert option in result.stderr, result.stderr

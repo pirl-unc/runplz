@@ -392,6 +392,8 @@ def _ps_main(argv):
             p.error(f"{field.flag} {exc}")
 
     backends = _ps_selection(args.backend, scope)
+    _reject_unreachable_scope(p, fields, scope, backends)
+
     rows = []
     errors = []
     successes = 0
@@ -413,6 +415,44 @@ def _ps_main(argv):
     for name, exc in errors:
         print(f"warning: {name} listing failed: {type(exc).__name__}: {exc}", file=sys.stderr)
     return 1 if errors and not rows and successes == 0 else 0
+
+
+def _reject_unreachable_scope(parser, fields, scope: dict, backends: list) -> None:
+    """Refuse a scope flag that no backend being listed can use.
+
+    `runplz ps local --region us-east-1` used to run and quietly ignore the
+    region, because AWS is in the default fan-out and so is never *invited* by
+    a flag -- and a positional had already excluded it. The user narrowed the
+    listing and scoped a backend that was not in it, which is two mistakes
+    that cancel into silence.
+
+    A flag that is accepted, validated and then dropped is the failure class
+    this repo has spent several releases removing (#20, #143, #153): the
+    operator believes the listing was scoped and it was not. Erroring names
+    both halves -- the flag, and who would have had to be listed for it to
+    mean anything.
+    """
+    listed = set(backends)
+    for field, owners in fields:
+        raw = scope[field.name]
+        # Only what the user typed. `resolve_all` falls back to the
+        # environment, and an `AWS_DEFAULT_REGION` that happens to be exported
+        # is not a claim about this command — erroring on it would break
+        # `runplz ps local` for anyone with the variable set.
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            continue
+        # Supplied but naming nothing — `--host ,` — is already "scope the
+        # user did not supply" everywhere else, and must stay that here.
+        # `raw` is non-blank, so this never reaches the environment either.
+        if not field.resolve_all(raw):
+            continue
+        if listed & set(owners):
+            continue
+        parser.error(
+            f"{field.flag} only applies to {'/'.join(owners)}, which "
+            f"{'is' if len(owners) == 1 else 'are'} not being listed. "
+            f"Listing: {', '.join(backends)}."
+        )
 
 
 def _ps_selection(chosen: str, scope: dict) -> list:

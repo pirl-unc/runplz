@@ -272,6 +272,11 @@ host registry, so a bare `runplz ps` skips it and says so; pass
 `--host` to include it, alongside the other backends or on its own as
 `runplz ps ssh --host <h>`.
 
+A scope flag that no listed backend can use is an error, not a no-op:
+`runplz ps local --region us-east-1` narrows the listing to `local` and then
+scopes AWS, which is not in it. That used to run and quietly ignore the
+region, leaving you to believe the listing was scoped when it was not.
+
 #### What `kill` actually stops
 
 A remote run is a tree, not a process: a bash supervisor, the bootstrap,
@@ -856,7 +861,8 @@ has, or push to S3 at the end of the function.
   `--region` (or set `AWS_DEFAULT_REGION`) and `--project`/`--zone` (or set
   the corresponding gcloud environment variables) when querying those
   providers; each backend declares what it needs, and missing scope is
-  reported before the provider CLI is called rather than after.
+  reported before the provider CLI is called rather than after. Scope that
+  reaches no listed backend is refused rather than dropped.
   `runplz tail` / `status` / `kill` work as usual once a run has written its
   manifest.
 - Spot capacity (`spot=True`) is a plain passthrough on both clouds: if the
