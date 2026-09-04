@@ -24,6 +24,32 @@ from pathlib import Path
 
 import pytest
 
+_E2E_REMOTE_ENV = "RUNPLZ_E2E_REMOTE"
+
+
+def pytest_addoption(parser):
+    """Declare `--e2e-remote`, which used to be the `RUNPLZ_E2E_REMOTE` env var.
+
+    An env var is invisible: it does not appear in `pytest --help`, it is easy
+    to leave exported in a shell and then wonder why a later run behaves
+    differently, and it was being read and validated independently here and in
+    `sshd_harness`, so the two could disagree about what was asked for.
+    """
+    from sshd_harness import MODES
+
+    parser.addoption(
+        "--e2e-remote",
+        choices=MODES,
+        default="auto",
+        help=(
+            "Which ssh endpoint the e2e tier runs against: a real sshd on this "
+            "machine (local), a Debian container matching production (docker), "
+            "or auto -- Docker only where a local sshd would be the wrong "
+            "platform. Default: auto."
+        ),
+    )
+
+
 # CLI names that cost money or touch user-owned infrastructure.
 _BILLED_COMMANDS = {
     "brev": "live_brev",
@@ -35,6 +61,15 @@ _BILLED_COMMANDS = {
 
 
 def pytest_configure(config):
+    # Refuse to run with the retired env var still exported. Ignoring it
+    # silently is the worse failure: a stale `RUNPLZ_E2E_REMOTE=docker` in a
+    # shell profile would quietly downgrade to `auto`, and the run would test a
+    # different backend than the operator asked for without saying so.
+    if os.environ.get(_E2E_REMOTE_ENV):
+        raise pytest.UsageError(
+            f"{_E2E_REMOTE_ENV} is no longer read; pass "
+            f"--e2e-remote={os.environ[_E2E_REMOTE_ENV].lower()} instead."
+        )
     for marker in set(_BILLED_COMMANDS.values()):
         config.addinivalue_line(
             "markers",
@@ -195,7 +230,7 @@ def fast_clock(monkeypatch):
 
 
 @pytest.fixture(scope="session")
-def sshd_server(tmp_path_factory):
+def sshd_server(request, tmp_path_factory):
     """Shared, isolated SSH endpoint for local and cloud-handoff e2e tests.
 
     Auto mode may skip when this machine genuinely has no usable endpoint.
@@ -205,10 +240,10 @@ def sshd_server(tmp_path_factory):
     """
     from sshd_harness import select_backend
 
-    mode = os.environ.get("RUNPLZ_E2E_REMOTE", "auto").lower()
+    mode = request.config.getoption("--e2e-remote")
     root = tmp_path_factory.mktemp("sshd")
     try:
-        server, unavailable = select_backend(root)
+        server, unavailable = select_backend(root, mode)
     except Exception as exc:
         message = f"could not initialize SSH test backend: {exc}"
         if mode == "auto":

@@ -10,7 +10,6 @@ known_hosts, config, pid, log. Nothing touches ~/.ssh, and the daemon binds to
 127.0.0.1 on an ephemeral port so it is not reachable off the machine.
 """
 
-import os
 import platform
 import shutil
 import socket
@@ -181,7 +180,7 @@ class LocalSshd:
 # detached launch is broken outright (issue #92). A Linux container makes
 # the remote match production on any host, so the detached tests run on a
 # Mac instead of skipping. It costs a Docker daemon, so it is not the
-# default: `RUNPLZ_E2E_REMOTE` selects, and `auto` only reaches for Docker
+# default: `--e2e-remote` selects, and `auto` only reaches for Docker
 # where the local sshd would be the wrong platform.
 
 DOCKERFILE = """\
@@ -272,24 +271,30 @@ class DockerSshd:
                 pass
 
 
-def select_backend(root: Path):
-    """Pick an ssh backend, honouring RUNPLZ_E2E_REMOTE.
+MODES = ("auto", "local", "docker")
+
+
+def select_backend(root: Path, mode: str = "auto"):
+    """Pick an ssh backend for the requested mode.
 
     `local` (a real sshd on this machine, no daemon needed), `docker` (a
     Linux container, matching production), or `auto` -- which uses Docker
     only where the local sshd would give the wrong platform, so Linux CI
     keeps the faster path and a Mac gets Linux fidelity when Docker is up.
 
+    The mode is passed in rather than read from the environment here: it is
+    one `--e2e-remote` option, parsed once by conftest, so this module and the
+    fixture cannot disagree about what was asked for.
+
     Returns (backend, reason_if_unavailable).
     """
-    mode = os.environ.get("RUNPLZ_E2E_REMOTE", "auto").lower()
-    if mode not in {"auto", "local", "docker"}:
-        raise ValueError(f"RUNPLZ_E2E_REMOTE must be auto, local, or docker; got {mode!r}")
+    if mode not in MODES:
+        raise ValueError(f"--e2e-remote must be one of {MODES}; got {mode!r}")
     if mode == "local":
         return (LocalSshd(root), None) if find_sshd() else (None, "no sshd binary")
     if mode == "docker":
         if not docker_available():
-            return None, "RUNPLZ_E2E_REMOTE=docker but no Docker daemon is reachable"
+            return None, "--e2e-remote=docker but no Docker daemon is reachable"
         return DockerSshd(root), None
     if platform.system() != "Linux" and docker_available():
         return DockerSshd(root), None

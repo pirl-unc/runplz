@@ -891,11 +891,11 @@ service, no configuration. Real staging, rsync, detached launch, kill and
 fetch-back. This is the tier that catches generated shell that parses but
 does not work.
 
-Set `RUNPLZ_E2E_REMOTE=docker` (or just have Docker running on a non-Linux
-host) and the same tests run against a Debian container instead, so the
-remote matches production. That matters on a Mac: macOS cannot run the
-detached launch at all (issue #92), so those tests skip against a local
-sshd there and run against a container.
+Pass `pytest --e2e-remote=docker` (or just have Docker running on a
+non-Linux host) and the same tests run against a Debian container instead,
+so the remote matches production. `--e2e-remote=local` forces the real
+sshd, and `auto` — the default — reaches for Docker only where a local
+sshd would be the wrong platform. `pytest --help` lists it.
 
 **Shape catalogue** (`test_cloud_catalogue.py`). `botocore` bundles the EC2
 instance-type list as a static enum, so every shape runplz can emit is
