@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 
 from runplz import cli, runs
+from runplz.backends import ssh_common
 
 
 @pytest.mark.parametrize(
@@ -215,7 +216,7 @@ def test_status_formats_exit_code_and_trailing_section(capsys):
     )
     assert "finished exit_code=17" in rendered
     assert "last heartbeat: (none yet)" in rendered
-    assert runs._parse_status_sections("---TRAILING---\nvalue\n")["TRAILING"] == "value"
+    assert ssh_common.parse_probe_sections("---TRAILING---\nvalue\n")["TRAILING"] == "value"
 
 
 def test_status_returns_ssh_failure_code(tmp_path, capsys):

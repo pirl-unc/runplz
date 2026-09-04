@@ -492,16 +492,54 @@ def test_ps_names_the_failing_host_not_just_the_backend(capsys, quiet_fan_out):
     assert "ssh:bad.box listing failed" in capsys.readouterr().err
 
 
-def test_scope_for_a_fan_out_backend_does_not_recruit_it(quiet_fan_out):
+def test_scope_for_a_fan_out_backend_does_not_recruit_it(quiet_fan_out, capsys):
     """`--region` scopes AWS, which was already going to be asked. It must not
     also be read as "and please add AWS", which would make
     `runplz ps local --region r` start querying a cloud the user narrowed away
-    from."""
+    from.
+
+    Nor is it silently dropped. The user narrowed the listing *and* scoped a
+    backend that is not in it — two mistakes that used to cancel into silence,
+    which is the failure class #20 / #143 / #153 were each about."""
     from runplz.backends import aws
 
     with mock.patch.object(aws, "list_jobs", return_value=[]) as aws_mock:
-        cli.main(["ps", "local", "--region", "us-east-1"])
+        with pytest.raises(SystemExit) as ei:
+            cli.main(["ps", "local", "--region", "us-east-1"])
     aws_mock.assert_not_called()
+    assert ei.value.code == 2
+    err = capsys.readouterr().err
+    assert "--region only applies to aws" in err
+    assert "Listing: local" in err
+
+
+def test_a_scope_flag_for_a_backend_being_listed_is_fine(quiet_fan_out):
+    """The whole fan-out is listed, so `--region` reaches the AWS in it."""
+    from runplz.backends import aws
+
+    with mock.patch.object(aws, "list_jobs", return_value=[]) as aws_mock:
+        cli.main(["ps", "--region", "us-east-1"])
+    aws_mock.assert_called_once()
+
+
+def test_a_scope_flag_that_invites_its_own_backend_is_fine(quiet_fan_out):
+    """`--host` recruits ssh, so it always reaches something — including
+    alongside a positional, which has always listed both."""
+    from runplz.backends import ssh as ssh_backend
+
+    with mock.patch.object(ssh_backend, "list_jobs", return_value=[]) as ssh_mock:
+        cli.main(["ps", "local", "--host", "box"])
+    ssh_mock.assert_called_once()
+
+
+def test_an_ssh_option_without_a_host_is_refused_rather_than_dropped(quiet_fan_out, capsys):
+    """`--ssh-port` without `--host` never recruits ssh, so nothing would have
+    read it. Silently accepting an ssh option on a listing with no ssh in it
+    tells the operator their port was applied."""
+    with pytest.raises(SystemExit) as ei:
+        cli.main(["ps", "local", "--ssh-port", "2222"])
+    assert ei.value.code == 2
+    assert "--ssh-port only applies to ssh" in capsys.readouterr().err
 
 
 def test_ps_ssh_without_a_host_reports_the_missing_scope(capsys):
@@ -636,3 +674,19 @@ def test_ps_rejects_an_out_of_range_ssh_port(capsys):
         assert f"--ssh-port must be a valid TCP port (1-65535); got {bad}." in (
             capsys.readouterr().err
         )
+
+
+def test_an_exported_region_does_not_break_a_narrowed_listing(quiet_fan_out, monkeypatch):
+    """`AWS_DEFAULT_REGION` in the shell is not a claim about this command.
+    Reading the environment here would make `runplz ps local` fail for anyone
+    who has the variable exported, which is most AWS users."""
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    assert cli.main(["ps", "local"]) == 0
+
+
+@pytest.mark.parametrize("raw", ["", "   ", ",", " , "])
+def test_a_host_flag_naming_no_host_is_not_an_unreachable_scope(raw, quiet_fan_out):
+    """`--host ,` names zero hosts, and "scope that resolves to nothing is
+    scope the user did not supply" has to hold for this check too — otherwise
+    it would reject a command the rest of the CLI treats as unscoped."""
+    assert cli.main(["ps", "local", "--host", raw]) == 0

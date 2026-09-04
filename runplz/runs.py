@@ -43,6 +43,7 @@ from runplz.backends.ssh_common import (
     build_kill_command,
     is_safe_run_id,
     parse_kv_block,
+    parse_probe_sections,
     read_local_ssh_options,
     remote_shell_path,
     ssh_cmd_opts,
@@ -200,7 +201,7 @@ def status(
         if r.stderr:
             print(r.stderr.strip())
         return r.returncode
-    sections = _parse_status_sections(r.stdout)
+    sections = parse_probe_sections(r.stdout)
     print(_format_status(target=target, manifest=manifest, sections=sections))
     return 0
 
@@ -257,7 +258,7 @@ def kill(
         if r.stderr:
             print(r.stderr.strip(), file=sys.stderr)
         return r.returncode
-    sections = _parse_status_sections(r.stdout)
+    sections = parse_probe_sections(r.stdout)
     if "SUMMARY" not in sections or "alive_after" not in sections["SUMMARY"]:
         # ssh succeeded but the script did not run to completion -- a login
         # shell that cannot parse it, or a banner/sudo prompt on stdout. Never
@@ -351,24 +352,6 @@ def _render_timestamped(line: str) -> str:
     if not ts:
         return f"(unparsed) {line[:200]}"
     return f"{ts}{_age_str(ts)}"
-
-
-def _parse_status_sections(stdout: str) -> dict[str, str]:
-    sections: dict[str, str] = {}
-    current = None
-    buf: list[str] = []
-    for line in stdout.splitlines():
-        line = line.rstrip()
-        if line.startswith("---") and line.endswith("---"):
-            if current:
-                sections[current] = "\n".join(buf).strip()
-                buf = []
-            current = line.strip("-").strip()
-        else:
-            buf.append(line)
-    if current and current != "END":
-        sections[current] = "\n".join(buf).strip()
-    return sections
 
 
 _ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")

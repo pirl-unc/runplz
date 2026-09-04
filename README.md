@@ -272,6 +272,11 @@ host registry, so a bare `runplz ps` skips it and says so; pass
 `--host` to include it, alongside the other backends or on its own as
 `runplz ps ssh --host <h>`.
 
+A scope flag that no listed backend can use is an error, not a no-op:
+`runplz ps local --region us-east-1` narrows the listing to `local` and then
+scopes AWS, which is not in it. That used to run and quietly ignore the
+region, leaving you to believe the listing was scoped when it was not.
+
 #### What `kill` actually stops
 
 A remote run is a tree, not a process: a bash supervisor, the bootstrap,
@@ -393,7 +398,7 @@ All fields are validated at construction time — an invalid config raises
 | `mode`                   | `"container"` | `"container"` (default) = the Brev box IS the base image; runplz applies Image DSL ops inline over ssh. Lighter, no DinD, sidesteps a known GPU+docker SSH-wedging bug. Requires `Image.from_registry(...)`. `"vm"` = full Brev VM + docker-in-VM; use when you need a user Dockerfile or the legacy native path. |
 | `use_docker`             | `True`  | VM-mode only. `False` skips docker and installs a native venv on the box. Legacy escape hatch for providers where container mode isn't available. |
 | `on_finish`              | `"stop"` | What runplz does to the Brev box when the App exits (success **or** failure). `"stop"` → `brev stop` (disk cached, small ongoing charge). `"delete"` → `brev delete` (zero ongoing cost, cold rebuild). `"leave"` → never touch the box (opt-in for interactive dev workflows). |
-| `max_runtime_seconds`    | `None`  | Wall-clock kill-switch. When set, runplz kills the remote container/process and raises `RuntimeError` after this many seconds so a wedged job can't keep billing forever. `None` = unlimited.                                                                       |
+| `max_runtime_seconds`    | `None`  | Wall-clock kill-switch. When set, runplz stops the remote run and raises `RuntimeError` after this many seconds so a wedged job can't keep billing forever. Still a hard stop, but not an instant one: the run is sent `SIGTERM` first and `SIGKILL` ~5s later if it has not gone, so a job that traps `SIGTERM` gets to flush a partial checkpoint — which, since outputs are collected from a capped run, is often the only evidence of what went wrong. Records a `killed_by_runtime_cap` event. `None` = unlimited.                                                                       |
 | `max_inactivity_seconds` | `None`  | Opt-in watchdog on *application silence*, independent of `max_runtime_seconds`. When set, runplz checks how long it has been since the job last produced output — its driver log, its container's log in docker mode, or its outputs dir; past this many seconds it records a `remote_command_stalled` event and captures bounded diagnostics (this run's processes and their states, including zombies, plus `nvidia-smi`). Deliberately not the heartbeat — that ticks on a timer and proves only that the process exists. `None` = no watchdog. |
 | `inactivity_action`      | `"diagnose"` | What to do on expiry. `"diagnose"` warns once per stall and keeps monitoring; `"terminate"` stops exactly this run. Outputs are synced back either way. |
 | `ssh_ready_wait_seconds` | `1800` (30 min) | How long to wait for the freshly-provisioned Brev box to become SSH-reachable. Default covers 8×A100/H100 cold boots on Denvr / OCI (15-18 min in practice). Bump for slower provider / shape combos. |
@@ -856,7 +861,8 @@ has, or push to S3 at the end of the function.
   `--region` (or set `AWS_DEFAULT_REGION`) and `--project`/`--zone` (or set
   the corresponding gcloud environment variables) when querying those
   providers; each backend declares what it needs, and missing scope is
-  reported before the provider CLI is called rather than after.
+  reported before the provider CLI is called rather than after. Scope that
+  reaches no listed backend is refused rather than dropped.
   `runplz tail` / `status` / `kill` work as usual once a run has written its
   manifest.
 - Spot capacity (`spot=True`) is a plain passthrough on both clouds: if the

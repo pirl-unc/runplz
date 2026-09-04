@@ -545,3 +545,33 @@ def test_every_remote_config_declares_the_watchdog(config_cls):
     fields = {f.name for f in dataclasses.fields(getattr(runplz, config_cls))}
     assert "max_inactivity_seconds" in fields
     assert "inactivity_action" in fields
+
+
+# ---------------------------------------------------------------------------
+# terminate stops the run without claiming a person did (#158)
+
+
+def test_terminate_does_not_record_that_a_user_killed_the_run(fast_clock):
+    """`build_kill_command` appended `killed_by_user` whenever it signalled,
+    and the watchdog is not a user. The stall is already recorded as
+    `remote_command_stalled` with `action="terminate"`; a second event saying
+    somebody ran `runplz kill` would contradict it."""
+    remote = _Remote(idle=3600, alive_calls=6)
+    _, record = _drive(remote, max_inactivity_seconds=1800, action="terminate")
+
+    kills = [c for c in remote.commands if "runplz_run_pids" in c]
+    assert kills, remote.commands
+    assert "killed_by_user" not in kills[0]
+    assert [c.args[2] for c in record.call_args_list] == ["remote_command_stalled"]
+
+
+def test_terminate_in_docker_mode_names_the_container_it_stops(fast_clock):
+    """The container is the run's only handle there: its processes are in the
+    container's PID namespace, so the marker scan finds none of them."""
+    remote = _DockerRemote(idle=3600, running_calls=6, exit_code=137)
+    _drive_docker(remote, max_inactivity_seconds=1800, action="terminate")
+
+    kills = [c for c in remote.commands if "runplz_run_pids" in c]
+    assert kills, remote.commands
+    assert 'runplz_container="runplz-train-abc123"' in kills[0]
+    assert "killed_by_user" not in kills[0]
