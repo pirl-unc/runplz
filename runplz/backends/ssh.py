@@ -23,6 +23,7 @@ from runplz.backends.listing import JobRecord
 from runplz.backends.ssh_common import (
     SshOptions,
     dispatch_to_target,
+    orchestrator_signal_cleanup,
     parse_probe_sections,
     ssh_capture,
     ssh_cmd_opts,
@@ -47,20 +48,21 @@ def run(app, function, args, kwargs, *, host: str, outputs_dir: str = "out"):
 
     # No teardown: the user owns this box's lifecycle, which is the whole
     # point of the ssh backend. Everything else is the shared dispatch.
-    dispatch_to_target(
-        app=app,
-        function=function,
-        args=args,
-        kwargs=kwargs,
-        target=target,
-        backend="ssh",
-        outputs_dir=outputs_dir,
-        mode="docker" if cfg.use_docker else "native",
-        max_runtime_seconds=cfg.max_runtime_seconds,
-        max_inactivity_seconds=cfg.max_inactivity_seconds,
-        inactivity_action=cfg.inactivity_action,
-        ssh_opts=ssh_opts,
-    )
+    with orchestrator_signal_cleanup(target):
+        dispatch_to_target(
+            app=app,
+            function=function,
+            args=args,
+            kwargs=kwargs,
+            target=target,
+            backend="ssh",
+            outputs_dir=outputs_dir,
+            mode="docker" if cfg.use_docker else "native",
+            max_runtime_seconds=cfg.max_runtime_seconds,
+            max_inactivity_seconds=cfg.max_inactivity_seconds,
+            inactivity_action=cfg.inactivity_action,
+            ssh_opts=ssh_opts,
+        )
 
 
 def list_jobs(

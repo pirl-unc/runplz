@@ -197,6 +197,8 @@ def status(
             print(r.stderr.strip())
         return r.returncode
     sections = parse_probe_sections(r.stdout)
+    if "EVENTS" in sections:
+        sections.update(_status_event_sections(sections["EVENTS"]))
     print(_format_status(target=target, manifest=manifest, sections=sections))
     return 0
 
@@ -204,43 +206,85 @@ def status(
 def _status_probe_command(meta: str) -> str:
     """Build the single-round-trip probe used by :func:`status`.
 
-    Control events override a later ``remote_command_exit`` because they name
-    why the command exited. This matters when an orchestrator signal or a
-    watchdog stop races the remote docker monitor, which can append the
-    resulting SIGKILL status afterwards. A diagnose-only stall is not an
-    override: if that run later exits, its exit is the current state.
-
-    The event stream is deliberately parsed with POSIX ``awk`` rather than
-    ``jq``; minimal remote images are part of the supported surface.
+    The event stream is small (heartbeats live in a separate file), so fetch it
+    once and apply lifecycle semantics in Python. This avoids depending on
+    ``jq`` in minimal images and, unlike shell regexes, lets us distinguish a
+    confirmed stop from a legacy or failed attempt by its typed JSON fields.
     """
     ev_q = f'"{remote_shell_path(f"{meta}/events.ndjson")}"'
     hb_q = f'"{remote_shell_path(f"{meta}/heartbeat.ndjson")}"'
-    last_run_event = (
-        "awk '"
-        '/"event"[[:space:]]*:[[:space:]]*"rsync_down_(start|done|failed)"/ { next } '
-        "{ latest = $0; "
-        '  if ($0 ~ /"event"[[:space:]]*:[[:space:]]*"(killed_by_runtime_cap|killed_by_user|'
-        'orchestrator_signalled)"/ || '
-        '      ($0 ~ /"event"[[:space:]]*:[[:space:]]*"remote_command_stalled"/ && '
-        '$0 ~ /"action"[[:space:]]*:[[:space:]]*"terminate"/)) authoritative = $0 } '
-        'END { if (authoritative != "") print authoritative; '
-        'else if (latest != "") print latest }\' '
-        f"{ev_q} 2>/dev/null || true"
-    )
-    last_sync_event = (
-        "awk '"
-        '/"event"[[:space:]]*:[[:space:]]*"rsync_down_(start|done|failed)"/ '
-        "{ latest = $0 } "
-        'END { if (latest != "") print latest }\' '
-        f"{ev_q} 2>/dev/null || true"
-    )
     return (
-        f"echo '---LAST_EVENT---'; {last_run_event}; "
-        f"echo '---LAST_SYNC_EVENT---'; {last_sync_event}; "
+        f"echo '---EVENTS---'; cat {ev_q} 2>/dev/null || true; printf '\\n'; "
         f"echo '---LAST_HEARTBEAT---'; tail -n 1 {hb_q} 2>/dev/null || true; "
-        f"echo '---EVENT_COUNT---'; wc -l < {ev_q} 2>/dev/null || echo 0; "
         f"echo '---END---'"
     )
+
+
+_OUTPUT_SYNC_EVENTS = {"rsync_down_start", "rsync_down_done", "rsync_down_failed"}
+
+
+def _confirmed_false(value) -> bool:
+    """True only for an explicit JSON/shell false, never for a missing field."""
+    return value is False or (isinstance(value, (int, str)) and value in (0, "0"))
+
+
+def _confirmed_true(value) -> bool:
+    """True only for an explicit JSON/shell true, never for a missing field."""
+    return value is True or (isinstance(value, (int, str)) and value in (1, "1"))
+
+
+def _is_authoritative_status_event(event: dict) -> bool:
+    """Whether ``event`` causally supersedes a later low-level exit.
+
+    Runtime caps and orchestrator signals end orchestration even when cleanup
+    cannot confirm a stop. User/watchdog kill attempts are different: they win
+    only when measured state confirms that a signal was sent and no process
+    survived. Legacy events lack those fields and therefore let a later natural
+    ``remote_command_exit`` become current.
+    """
+    name = event.get("event")
+    if name in {"killed_by_runtime_cap", "runtime_cap_reached", "orchestrator_signalled"}:
+        return True
+    confirmed_stop = _confirmed_true(event.get("signalled")) and _confirmed_false(
+        event.get("alive_after")
+    )
+    if name == "killed_by_user":
+        return confirmed_stop
+    return (
+        name == "remote_command_stalled" and event.get("action") == "terminate" and confirmed_stop
+    )
+
+
+def _status_event_sections(raw_events: str) -> dict[str, str]:
+    """Select run outcome, sync state, and count from an NDJSON event stream."""
+    latest_run = ""
+    authoritative = ""
+    latest_sync = ""
+    count = 0
+    for line in (raw_events or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        count += 1
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            latest_run = line
+            continue
+        if not isinstance(event, dict):
+            latest_run = line
+            continue
+        if event.get("event") in _OUTPUT_SYNC_EVENTS:
+            latest_sync = line
+            continue
+        latest_run = line
+        if _is_authoritative_status_event(event):
+            authoritative = line
+    return {
+        "LAST_EVENT": authoritative or latest_run,
+        "LAST_SYNC_EVENT": latest_sync,
+        "EVENT_COUNT": str(count),
+    }
 
 
 def kill(
@@ -430,7 +474,7 @@ def _format_status(*, target: str, manifest: dict, sections: dict[str, str]) -> 
                 if key in evt
             )
             lines.append(f"last event: {evt_name}{extra} at {ts}{age}")
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, AttributeError):
             lines.append(f"last event (unparsed): {last_event_raw[:200]}")
     else:
         lines.append("last event: (none recorded)")
@@ -440,7 +484,7 @@ def _format_status(*, target: str, manifest: dict, sections: dict[str, str]) -> 
             sync = json.loads(last_sync_raw)
             sync_name = sync.get("event", "?")
             sync_state = {
-                "rsync_down_start": "in progress",
+                "rsync_down_start": "started (completion unknown)",
                 "rsync_down_done": "completed",
                 "rsync_down_failed": "failed",
             }.get(sync_name, sync_name)
@@ -448,7 +492,7 @@ def _format_status(*, target: str, manifest: dict, sections: dict[str, str]) -> 
             age = _age_str(ts)
             detail = f" error_type={sync['error_type']}" if "error_type" in sync else ""
             lines.append(f"output sync: {sync_state}{detail} at {ts}{age}")
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, AttributeError):
             lines.append(f"output sync (unparsed): {last_sync_raw[:200]}")
     else:
         lines.append("output sync: (not started)")

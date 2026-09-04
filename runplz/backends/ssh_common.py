@@ -1954,19 +1954,28 @@ def remote_shell_path(path: str) -> str:
 
 
 def _kill_event_shell(event: Optional[str], *, meta: str, run_id: str, events_file: str) -> str:
-    """The event append, or nothing when the caller records its own.
+    """Append the measured kill outcome, or nothing when the caller owns it.
 
     Empty rather than a no-op branch: a caller that passes ``event=None`` has
     its own terminal event, and a second one saying something else happened
     would be worse than silence.
+
+    The CLI's successful outcome is ``killed_by_user``. If processes survive
+    (notably ``runplz kill --no-escalate``), record an attempt instead so a
+    later natural exit can become the run's final state.
     """
     if event is None:
         return ""
+    attempted_event = "kill_attempted_by_user" if event == "killed_by_user" else event
     return (
         'if [ "$runplz_signalled" = "1" ]; then\n'
+        f'  runplz_event="{event}"\n'
+        f'  if [ "$runplz_alive_after" = "1" ]; then runplz_event="{attempted_event}"; fi\n'
         f'  mkdir -p "{meta}" 2>/dev/null || true\n'
-        f'  printf \'{{"ts":"%s","run_id":"%s","event":"{event}","escalated":%s}}\\n\' \\\n'
-        f'    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "{run_id}" "$runplz_escalated" \\\n'
+        '  printf \'{"ts":"%s","run_id":"%s","event":"%s",'
+        '"escalated":%s,"signalled":true,"alive_after":%s}\\n\' \\\n'
+        f'    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "{run_id}" "$runplz_event" \\\n'
+        '    "$runplz_escalated" "$runplz_alive_after" \\\n'
         f'    >> "{events_file}" 2>/dev/null || true\n'
         "fi"
     )
@@ -2005,11 +2014,12 @@ def build_kill_command(
     knows the name say so rather than depend on the file; `runplz kill` learns
     it no other way and keeps reading it.
 
-    ``event`` is the lifecycle event recorded when this script actually
-    signals something. It defaults to ``killed_by_user`` for the CLI, but the
-    runtime cap and the inactivity watchdog also stop runs, and recording that
-    a user did it would be false (#158). They pass ``None`` and record their
-    own, with fields the shell does not have.
+    ``event`` is the successful lifecycle outcome recorded when this script
+    actually signals something. It defaults to ``killed_by_user`` for the CLI;
+    a survivor is recorded as ``kill_attempted_by_user`` instead. The runtime
+    cap and inactivity watchdog also stop runs, and recording that a user did
+    it would be false (#158). They pass ``None`` and record their own, with
+    fields the shell does not have.
 
     Every value interpolated here is validated first -- the meta path in
     particular arrives from a manifest rsynced off the remote box.
@@ -3301,11 +3311,16 @@ def raise_for_runtime_cap(
     # process that vanished. The container's own state is the true one there.
     process_state = summary.get("final") if summary.get("pid") else None
     container_state = summary.get("container_state")
+    stop_signalled = {"0": False, "1": True}.get(summary.get("signalled"))
+    stop_alive_after = {"0": False, "1": True}.get(summary.get("alive_after"))
     event_fields = {
         "threshold_seconds": int(cap_s) if isinstance(cap_s, (int, float)) else None,
         "process_state": process_state or None,
         "container": container_name,
         "container_state": (container_state if container_state not in (None, "", "none") else None),
+        "signal": summary.get("signal") or None,
+        "signalled": stop_signalled,
+        "alive_after": stop_alive_after,
     }
     if summary.get("signalled") == "1" and summary.get("alive_after") == "0":
         _record_remote_event(
@@ -3322,6 +3337,8 @@ def raise_for_runtime_cap(
         # signal landed.
         if summary.get("signalled") == "0" and summary.get("alive_after") == "0":
             action = "nothing_to_stop"
+        elif summary.get("alive_after") == "1":
+            action = "terminate_failed"
         elif summary.get("signalled") == "1":
             action = "terminate_unconfirmed"
         else:
@@ -3493,7 +3510,6 @@ def dispatch_to_target(
     exit_code: Optional[int] = None
     failure_tail = ""
     synced = False
-    interruption: Optional[OrchestratorKilled] = None
     try:
         # Probe declared preconditions (issue #56) before bootstrap, so a
         # misprovisioned box fails fast instead of burning paid GPU minutes.
@@ -3574,11 +3590,18 @@ def dispatch_to_target(
         rsync_down(target, host_out, remote_run=remote_run, ssh_opts=ssh_opts)
         synced = True
     except OrchestratorKilled as exc:
-        # Defer this record until after container cleanup. The detached docker
-        # monitor can append remote_command_exit when `docker rm -f` signals
-        # the container; recording first would let that secondary status
-        # misreport the operator's signal as a job crash.
-        interruption = exc
+        # This must precede salvage: provisioned backends delete the host in
+        # their outer finally, so an event appended after rsync_down exists
+        # only on a box that is about to disappear. Status applies causal
+        # precedence in Python, so a cleanup-induced remote_command_exit may
+        # safely be appended later without hiding the operator signal.
+        _record_remote_event(
+            target,
+            remote_run,
+            "orchestrator_signalled",
+            ssh_opts=ssh_opts,
+            signal=exc.signal_name,
+        )
         raise
     finally:
         # Grab the log tail before the container goes away — `docker rm`
@@ -3627,15 +3650,6 @@ def dispatch_to_target(
                     f"+ warning: failed to remove container {container_name}: {exc}",
                     flush=True,
                 )
-        if interruption is not None:
-            _record_remote_event(
-                target,
-                remote_run,
-                "orchestrator_signalled",
-                ssh_opts=ssh_opts,
-                signal=interruption.signal_name,
-            )
-
     result = DispatchResult(
         exit_code=exit_code,
         container_name=container_name,

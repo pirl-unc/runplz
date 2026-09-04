@@ -273,6 +273,27 @@ def test_ssh_run_end_to_end_passes_port_through_to_helpers(tmp_path):
     assert all(v == 2222 for v in seen_ports.values()), seen_ports
 
 
+def test_ssh_run_translates_signals_without_taking_ownership_of_the_host(tmp_path):
+    app = _app(tmp_path)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"))
+    cleanup = mock.MagicMock()
+
+    with (
+        mock.patch.object(ssh, "wait_until_ssh_reachable"),
+        mock.patch.object(ssh, "_warn_on_spec_mismatch"),
+        mock.patch.object(ssh, "dispatch_to_target") as dispatch,
+        mock.patch.object(
+            ssh, "orchestrator_signal_cleanup", return_value=cleanup
+        ) as signal_cleanup,
+    ):
+        ssh.run(app, fn, [], {}, host="gpu.example.com")
+
+    signal_cleanup.assert_called_once_with("gpu.example.com")
+    cleanup.__enter__.assert_called_once_with()
+    cleanup.__exit__.assert_called_once()
+    dispatch.assert_called_once()
+
+
 # --- App.bind wiring -----------------------------------------------------
 
 

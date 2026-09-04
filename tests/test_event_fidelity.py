@@ -29,7 +29,12 @@ def _event(name, **fields):
         ),
         (
             [
-                _event("remote_command_stalled", action="terminate"),
+                _event(
+                    "remote_command_stalled",
+                    action="terminate",
+                    signalled=True,
+                    alive_after=False,
+                ),
                 _event("remote_command_exit", exit_code=137),
                 _event("rsync_down_start"),
             ],
@@ -59,7 +64,47 @@ def _event(name, **fields):
                 ),
                 _event("rsync_down_done"),
             ],
+            "remote_command_exit",
+        ),
+        (
+            [
+                _event("killed_by_user", signalled=True, alive_after=False),
+                _event("remote_command_exit", exit_code=137),
+                _event("rsync_down_done"),
+            ],
             "killed_by_user",
+        ),
+        (
+            [
+                _event("killed_by_user", signalled=True, alive_after=True),
+                _event("remote_command_exit", exit_code=0),
+                _event("rsync_down_done"),
+            ],
+            "remote_command_exit",
+        ),
+        (
+            [
+                _event("runtime_cap_reached", action="terminate_failed", alive_after=True),
+                _event("remote_command_exit", exit_code=137),
+                _event("rsync_down_done"),
+            ],
+            "runtime_cap_reached",
+        ),
+        (
+            [
+                _event("runtime_cap_reached", action="cleanup_unconfirmed"),
+                _event("remote_command_exit", exit_code=137),
+                _event("rsync_down_done"),
+            ],
+            "runtime_cap_reached",
+        ),
+        (
+            [
+                _event("remote_command_stalled", action="terminate"),
+                _event("remote_command_exit", exit_code=0),
+                _event("rsync_down_done"),
+            ],
+            "remote_command_exit",
         ),
         (
             [
@@ -82,6 +127,7 @@ def test_status_probe_selects_the_causal_run_event(tmp_path, events, expected):
         text=True,
     )
     sections = sc.parse_probe_sections(completed.stdout)
+    sections.update(runs._status_event_sections(sections["EVENTS"]))
 
     assert json.loads(sections["LAST_EVENT"])["event"] == expected
     assert json.loads(sections["LAST_SYNC_EVENT"])["event"].startswith("rsync_down_")
@@ -102,6 +148,44 @@ def test_status_renders_output_sync_separately_from_the_run_outcome():
 
     assert "last event: killed_by_runtime_cap threshold_seconds=60" in rendered
     assert "output sync: completed" in rendered
+
+
+def test_status_does_not_claim_a_start_only_sync_is_active():
+    rendered = runs._format_status(
+        target="box",
+        manifest={},
+        sections={
+            "LAST_EVENT": _event("remote_command_exit", exit_code=0),
+            "LAST_SYNC_EVENT": _event("rsync_down_start"),
+            "LAST_HEARTBEAT": "",
+            "EVENT_COUNT": "2",
+        },
+    )
+
+    assert "output sync: started (completion unknown)" in rendered
+    assert "in progress" not in rendered
+
+
+def test_status_parser_tolerates_blank_malformed_and_non_object_records():
+    sections = runs._status_event_sections('\nnot-json\n["valid JSON, wrong shape"]\n')
+
+    assert sections == {
+        "LAST_EVENT": '["valid JSON, wrong shape"]',
+        "LAST_SYNC_EVENT": "",
+        "EVENT_COUNT": "2",
+    }
+
+    rendered = runs._format_status(
+        target="box",
+        manifest={},
+        sections={
+            "LAST_EVENT": sections["LAST_EVENT"],
+            "LAST_SYNC_EVENT": "[]",
+            "EVENT_COUNT": sections["EVENT_COUNT"],
+        },
+    )
+    assert "last event (unparsed)" in rendered
+    assert "output sync (unparsed)" in rendered
 
 
 def _remote_run():
@@ -233,16 +317,21 @@ def test_precondition_failure_is_recorded_and_salvaged(tmp_path):
     assert patched["_record_remote_event"].call_args.args[2] == "precondition_failed"
 
 
-def test_orchestrator_signal_is_recorded_after_docker_cleanup(tmp_path):
+@pytest.mark.parametrize("backend", ["ssh", "brev", "gcp", "aws"])
+def test_orchestrator_signal_is_salvaged_before_backend_teardown(tmp_path, backend):
     app, function = _app(tmp_path)
     interruption = sc.OrchestratorKilled("terminated", signal_name="SIGTERM")
     observed = []
+    remote_events = []
+    local_events = []
 
     def record(*args, **kwargs):
         observed.append(("event", args[2], kwargs))
+        remote_events.append((args[2], kwargs))
 
     def sync(*args, **kwargs):
         observed.append(("sync",))
+        local_events[:] = remote_events
 
     def capture(*args, **kwargs):
         observed.append(("container_cleanup",))
@@ -272,11 +361,17 @@ def test_orchestrator_signal_is_recorded_after_docker_cleanup(tmp_path):
                 args=[],
                 kwargs={},
                 target="box",
-                backend="ssh",
+                backend=backend,
                 mode="docker",
             )
 
     assert raised.value is interruption
-    assert [item[0] for item in observed] == ["sync", "container_cleanup", "event"]
-    assert observed[-1][1] == "orchestrator_signalled"
-    assert observed[-1][2]["signal"] == "SIGTERM"
+    assert [item[0] for item in observed] == ["event", "sync", "container_cleanup"]
+    assert observed[0][1] == "orchestrator_signalled"
+    assert observed[0][2]["signal"] == "SIGTERM"
+
+    # Provisioned backends now tear the remote host down. The salvaged local
+    # stream must already contain the signal even after its remote copy is gone.
+    if backend != "ssh":
+        remote_events.clear()
+    assert local_events == [("orchestrator_signalled", {"ssh_opts": None, "signal": "SIGTERM"})]

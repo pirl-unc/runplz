@@ -69,3 +69,11 @@
   whose entire purpose is salvaging a wedged run -- discarded the outputs. Put collection in
   the `finally`, best-effort so it cannot replace the original exception, and keep the success
   path strict so a genuine sync failure is still an error.
+- A remote lifecycle event is not durable evidence when teardown deletes the remote. Record every
+  causal outcome before the final salvage transfer, then let semantic status selection handle any
+  lower-level exit event appended afterward. Ordering for display and ordering for persistence are
+  separate concerns.
+- An attempted action is not an outcome. Only prioritize `killed`/`terminated` events when measured
+  cleanup state confirms no survivors; failed and legacy-unconfirmed attempts must yield to a later
+  natural exit. Likewise, a start event without a matching finish proves only "completion unknown,"
+  never that the operation is still active.

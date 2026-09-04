@@ -173,15 +173,7 @@ def test_status_summarizes_last_event_and_heartbeat(tmp_path, capsys):
         }
     )
     last_hb = json.dumps({"ts": "2026-04-27T01:05:30Z", "run_id": "x"})
-    fake_stdout = (
-        "---LAST_EVENT---\n"
-        f"{last_event}\n"
-        "---LAST_HEARTBEAT---\n"
-        f"{last_hb}\n"
-        "---EVENT_COUNT---\n"
-        "12\n"
-        "---END---\n"
-    )
+    fake_stdout = f"---EVENTS---\n{last_event}\n---LAST_HEARTBEAT---\n{last_hb}\n---END---\n"
     fake = mock.Mock(returncode=0, stdout=fake_stdout, stderr="")
     with mock.patch("runplz.runs.subprocess.run", return_value=fake):
         rc = runs.status(outputs_dir=tmp_path, host_override=None, run_id_override=None)
@@ -190,12 +182,12 @@ def test_status_summarizes_last_event_and_heartbeat(tmp_path, capsys):
     assert "target: my-gpu-box" in out
     assert "function: train" in out
     assert "container_started" in out
-    assert "events recorded: 12" in out
+    assert "events recorded: 1" in out
 
 
 def test_status_handles_empty_event_log(tmp_path, capsys):
     _write_manifest(tmp_path, _manifest())
-    fake_stdout = "---LAST_EVENT---\n---LAST_HEARTBEAT---\n---EVENT_COUNT---\n0\n---END---\n"
+    fake_stdout = "---EVENTS---\n---LAST_HEARTBEAT---\n---END---\n"
     fake = mock.Mock(returncode=0, stdout=fake_stdout, stderr="")
     with mock.patch("runplz.runs.subprocess.run", return_value=fake):
         runs.status(outputs_dir=tmp_path, host_override=None, run_id_override=None)

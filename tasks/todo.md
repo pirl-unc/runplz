@@ -2395,12 +2395,40 @@ backend-agnostic SSH dispatch/event machinery and CLI status rendering.
 
 ### Review
 
-Implemented causal status selection without adding a remote dependency: the POSIX `awk` probe
-separates output-sync events and gives operator/runtime control events precedence over the
-secondary `remote_command_exit` they can cause. Both compact shell JSON and spaced Python JSON
-are covered. Phase failures preserve their original exceptions, transport ambiguity is named
-`*_unconfirmed`, and signal exceptions pass through best-effort reporting instead of being
-swallowed.
+Implemented causal status selection without adding a remote dependency: one probe retrieves the
+small non-heartbeat event stream, then Python separates output-sync events and applies typed event
+semantics. Operator/runtime control events take precedence over the secondary
+`remote_command_exit` they can cause only when the event's measured outcome warrants it. Phase
+failures preserve their original exceptions, transport ambiguity is named `*_unconfirmed`, and
+signal exceptions pass through best-effort reporting instead of being swallowed.
 
 Verification: `./format.sh`, `./lint.sh`, and `./test.sh` pass; 1278 tests passed, 1 platform test
 skipped, and total coverage is 95.07%.
+
+### Review follow-up — durable, evidence-based outcomes across backends
+
+- [x] Record `orchestrator_signalled` before salvage so Brev, GCP, and AWS deletion cannot erase
+      the only copy; retain causal precedence over a later cleanup-induced remote exit.
+- [x] Give the direct SSH backend the same signal translation used by provisioned backends, while
+      keeping user-owned-host teardown semantics unchanged.
+- [x] Treat every `runtime_cap_reached` result as causal: confirmed no-op, failed stop, and
+      unconfirmed cleanup all still explain why orchestration ended.
+- [x] Make user kill events carry measured completion state; emit a distinct attempt event for
+      survivors and never let legacy/unconfirmed kills permanently override a later natural exit.
+- [x] Render start-only output-sync history as `completion unknown`, including pre-4.4.3 streams
+      and interrupted transfers.
+- [x] Add regression coverage for persistent and ephemeral dispatch, all four SSH-derived
+      backends, current/legacy kill records, cap cleanup outcomes, and sync history.
+- [ ] Re-run `./format.sh`, `./lint.sh`, and `./test.sh`; update PR #164 and confirm CI.
+
+### Review follow-up results
+
+Signal events are now appended before failure salvage, so the final transfer persists them before
+an ephemeral host is deleted; direct SSH installs the same signal translator without adding host
+teardown. Runtime caps remain causal even when cleanup is unconfirmed, while watchdog and user
+kills override later exits only with explicit no-survivor evidence. A failed `--no-escalate` kill
+is named `kill_attempted_by_user`, and old fieldless kill/stall records yield to a later exit.
+Start-only sync records now say `started (completion unknown)`.
+
+Local verification: `./format.sh`, `./lint.sh`, and `./test.sh` pass; 1290 tests passed, 1 platform
+test skipped, and total coverage is 95.14%. PR/CI update pending.
