@@ -12,16 +12,20 @@ Two image shapes supported:
   .pip_install_local_dir(".")`: rendered as a `modal.Image` op chain.
   All image build layers run on Modal's build cluster and are cached.
 
-Outputs: the remote function tars `/out` and returns the bytes; the
-local entrypoint writes them to a file we extract to the host.
+Outputs, by default: the remote function tars `/out` and returns the
+bytes; the local entrypoint writes them to a file we extract to the host.
+Modal caps a function return at ~256 MB, so that path suits smoketests and
+single-model training (~10 MB weights) but not a full ensemble run.
 
-TODO: Modal function return values are capped at ~256 MB. The tar-
-return pattern works for smoketests, single-model training (~10 MB
-weights + ~50 MB init info), and most pan-allele single runs, but
-will fail on full 4-fold × 4-replicate ensemble runs (>1 GB of
-weights). Switch to `modal.Volume.from_name(..., create_if_missing=
-True)` mounted at /out, then download after the run via
-`volume.batch_iter(...)` before flipping this on for heavy training.
+Above that, mount a volume at the outputs directory:
+
+    @app.function(image=image, volumes={"/out": "training-outputs"})
+
+which renders `modal.Volume.from_name(name, create_if_missing=True)` into
+the generated entrypoint, skips the tar entirely, and downloads the volume
+afterwards with `modal volume get`. Names, not `modal.Volume` objects —
+this backend generates a file and shells to `modal run`, so nothing built
+in the caller's process can reach it (#143).
 """
 
 # `run` and `list_jobs` are the driver contract the registry calls; the
@@ -30,6 +34,7 @@ __all__ = [
     "run",
     "list_jobs",
     "APP_PREFIX",
+    "CONTAINER_OUT",
 ]
 
 
@@ -63,6 +68,12 @@ _MEMORY = {memory!r}
 _TIMEOUT = {timeout!r}
 _OUT_BLOB = {out_blob!r}
 _CONTAINER_ENV = {container_env!r}
+_VOLUMES = {volumes!r}
+# True when the outputs directory itself is volume-backed, in which case the
+# results are already durable and must not also be tarred into the function
+# return -- that return is capped at ~256 MB, which is the whole reason a
+# volume was asked for.
+_OUT_ON_VOLUME = {out_on_volume!r}
 
 
 {image_construction}
@@ -70,16 +81,29 @@ _CONTAINER_ENV = {container_env!r}
 
 app = modal.App(_APP_NAME)
 
+# Built here rather than passed in: a Volume object cannot cross from the
+# process that generated this file into `modal run`.
+volumes = {{
+    path: modal.Volume.from_name(name, create_if_missing=True)
+    for path, name in _VOLUMES.items()
+}}
+
 
 # Modal accepts None for cpu/memory — picks a default. Exact GPU string
 # passed through.
-@app.function(image=image, gpu=_GPU, cpu=_CPU, memory=_MEMORY, timeout=_TIMEOUT)
+@app.function(
+    image=image, gpu=_GPU, cpu=_CPU, memory=_MEMORY, timeout=_TIMEOUT, volumes=volumes
+)
 def runner() -> bytes:
     os.makedirs("/out", exist_ok=True)
     subprocess.run(
         ["python", "-m", "runplz._bootstrap"],
         check=True,
     )
+    if _OUT_ON_VOLUME:
+        # Modal commits the volume on function exit; runplz downloads it
+        # locally afterwards. Nothing goes through the return value.
+        return b""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         tar.add("/out", arcname=".")
@@ -297,6 +321,9 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
             f"maps to real capacity."
         )
 
+    volumes = dict(getattr(function, "volumes", {}) or {})
+    out_on_volume = _outputs_are_volume_backed(volumes)
+
     entrypoint_src = _ENTRYPOINT_TEMPLATE.format(
         app_name=f"{APP_PREFIX}{app.name}-{function.name}",
         gpu=modal_gpu,
@@ -306,6 +333,8 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
         out_blob=blob_path,
         container_env=container_env,
         image_construction=image_src,
+        volumes=volumes,
+        out_on_volume=out_on_volume,
     )
 
     entry_file = tempfile.NamedTemporaryFile(
@@ -326,13 +355,57 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
         except OSError:
             pass
 
-    _check_output_blob_size(blob_path)
-    _extract_tar(blob_path, host_out)
+    if out_on_volume:
+        # The results never entered the return value, so there is no blob to
+        # size-check or unpack -- they are in the volume, and come back here.
+        _download_volume(volumes[CONTAINER_OUT], host_out)
+    else:
+        _check_output_blob_size(blob_path)
+        _extract_tar(blob_path, host_out)
     try:
         os.unlink(blob_path)
     except OSError:
         pass
     print(f"Modal run complete. Outputs in {host_out}", flush=True)
+
+
+# Where the bootstrap writes results inside the container. A volume mounted
+# here is what takes the outputs off the ~256 MB return path entirely.
+CONTAINER_OUT = "/out"
+
+
+def _outputs_are_volume_backed(volumes: dict) -> bool:
+    """True when the outputs directory itself is on a mounted volume.
+
+    Only an exact mount at the outputs directory counts. A volume mounted
+    somewhere else is durable storage the job may use, but the outputs still
+    have to come home through the return value.
+    """
+    return CONTAINER_OUT in volumes
+
+
+def _download_volume(volume_name: str, host_out) -> None:
+    """Copy a volume's contents into the local outputs directory.
+
+    Shells to `modal volume get` for the same reason the rest of this backend
+    shells to `modal run`: it keeps the core dependency-free and matches the
+    CLI the user already authenticated. Modal commits the volume when the
+    function exits, so by here the contents are final.
+    """
+    os.makedirs(host_out, exist_ok=True)
+    print(f"+ modal volume get {volume_name} / -> {host_out}", flush=True)
+    r = subprocess.run(
+        ["modal", "volume", "get", "--force", volume_name, "/", str(host_out)],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"`modal volume get {volume_name}` failed (rc={r.returncode}): "
+            f"{(r.stderr or '').strip()[:300]}\n"
+            f"The run itself succeeded and the outputs are still in the volume — "
+            f"fetch them with `modal volume get {volume_name} / {host_out}`."
+        )
 
 
 # Modal function return values are capped at ~256 MB. We return outputs as

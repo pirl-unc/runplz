@@ -523,3 +523,144 @@ def test_the_prefix_that_is_stamped_is_the_prefix_that_is_filtered():
         "demo",
         "train",
     )
+
+
+# ---------------------------------------------------------------------------
+# Volume-backed outputs (issue #143)
+
+
+def _volume_app(tmp_path, volumes):
+    from runplz import App, Image
+
+    app = App("vision")
+
+    @app.function(image=Image.from_registry("ubuntu:22.04"), volumes=volumes)
+    def train():  # pragma: no cover - never executed locally
+        pass
+
+    fn = app.functions["train"]
+    fn.module_file = str(tmp_path / "job.py")
+    app.repo_root = tmp_path
+    return app, fn
+
+
+def test_the_readme_volume_example_is_accepted():
+    """The contract README has documented since 3.24.31 as *the* answer to
+    Modal's ~256 MB return cap. `App.function()` never accepted `volumes`, so
+    the documented example raised TypeError (#143)."""
+    from runplz import App, Image
+
+    app = App("train")
+
+    @app.function(
+        image=Image.from_registry("ubuntu:22.04"), gpu="T4", volumes={"/out": "training-outputs"}
+    )
+    def train():  # pragma: no cover
+        pass
+
+    assert app.functions["train"].volumes == {"/out": "training-outputs"}
+
+
+def test_a_volume_backed_run_keeps_outputs_off_the_function_return(tmp_path):
+    """The point of the whole feature: a multi-GB outputs directory must not be
+    tarred into a return value capped at ~256 MB. The generated runner returns
+    empty for a volume-backed /out, and the local side downloads instead."""
+    _, fn = _volume_app(tmp_path, {"/out": "training-outputs"})
+    src = modal_backend._ENTRYPOINT_TEMPLATE.format(
+        app_name="runplz-vision-train",
+        gpu=None,
+        cpu=None,
+        memory=None,
+        timeout=60,
+        out_blob=str(tmp_path / "blob"),
+        container_env={},
+        image_construction="image = modal.Image.debian_slim()",
+        volumes=fn.volumes,
+        out_on_volume=modal_backend._outputs_are_volume_backed(fn.volumes),
+    )
+    compile(src, "<generated>", "exec")
+    assert "_OUT_ON_VOLUME = True" in src
+    assert "modal.Volume.from_name(name, create_if_missing=True)" in src
+    assert "volumes=volumes" in src
+    # The tar is still in the file for the non-volume path, but it is now
+    # behind the guard rather than unconditional.
+    assert src.index("if _OUT_ON_VOLUME:") < src.index("tarfile.open")
+
+
+def test_without_a_volume_the_outputs_still_come_back_through_the_return(tmp_path):
+    """Existing small-output behaviour is untouched."""
+    _, fn = _volume_app(tmp_path, None)
+    assert fn.volumes == {}
+    assert modal_backend._outputs_are_volume_backed(fn.volumes) is False
+
+
+def test_a_volume_mounted_elsewhere_does_not_divert_the_outputs(tmp_path):
+    """Durable scratch at /data is not the same claim as durable *outputs*.
+    Only a mount at the outputs directory takes them off the return path."""
+    _, fn = _volume_app(tmp_path, {"/data": "datasets"})
+    assert modal_backend._outputs_are_volume_backed(fn.volumes) is False
+
+
+def test_the_volume_is_downloaded_after_the_run(tmp_path):
+    out = tmp_path / "out"
+    with mock.patch.object(
+        modal_backend.subprocess, "run", return_value=mock.Mock(returncode=0, stderr="")
+    ) as run:
+        modal_backend._download_volume("training-outputs", out)
+    assert run.call_args.args[0][:3] == ["modal", "volume", "get"]
+    assert "training-outputs" in run.call_args.args[0]
+    assert str(out) in run.call_args.args[0]
+
+
+def test_a_failed_download_says_the_outputs_are_still_in_the_volume(tmp_path):
+    """The run itself succeeded and the results are durable — the one thing a
+    user must not conclude here is that their outputs are gone."""
+    with mock.patch.object(
+        modal_backend.subprocess,
+        "run",
+        return_value=mock.Mock(returncode=1, stderr="network unreachable"),
+    ):
+        with pytest.raises(RuntimeError, match="still in the volume"):
+            modal_backend._download_volume("training-outputs", tmp_path / "out")
+
+
+@pytest.mark.parametrize("backend, kwargs", [("local", {}), ("brev", {"instance": "box"})])
+def test_a_backend_that_cannot_mount_refuses_rather_than_dropping_it(tmp_path, backend, kwargs):
+    """A silently ignored volume would run the job and write its outputs to
+    disk that disappears with the box — the failure arriving hours later, as
+    missing results."""
+    app, _ = _volume_app(tmp_path, {"/out": "training-outputs"})
+    with pytest.raises(ValueError, match="cannot mount a volume"):
+        app.bind(backend, **kwargs)
+
+
+def test_a_live_volume_object_is_refused_with_the_reason(tmp_path):
+    """The old README told people to pass `modal.Volume.from_name(...)`. That
+    object cannot reach the generated entrypoint, so the error has to say so
+    rather than surfacing as a generic type complaint."""
+    with pytest.raises(ValueError, match="cannot reach it"):
+        _volume_app(tmp_path, {"/out": object()})
+
+
+def test_the_readme_volume_example_is_executable_as_written():
+    """Not a paraphrase of the README — the README.
+
+    #143 existed because the documented example had never been run against the
+    code. Extracting and executing it means the docs cannot drift back into
+    describing an API that does not exist.
+    """
+    from pathlib import Path as _Path
+
+    from runplz import App, Image
+
+    readme = (_Path(__file__).resolve().parents[1] / "README.md").read_text()
+    section = readme.split("### Large / persistent outputs on Modal")[1]
+    snippet = section.split("```python")[1].split("```")[0]
+    assert "volumes=" in snippet, "the README stopped documenting a volume mount"
+
+    namespace = {"app": App("demo"), "image": Image.from_registry("ubuntu:22.04")}
+    # The body is illustrative torch; only the decorator is under test.
+    body_free = snippet.replace("import torch", "pass").replace("model = ...", "model = None")
+    body_free = body_free.replace('torch.save(model.state_dict(), "/out/weights.pt")', "pass")
+    exec(compile(body_free, "<README>", "exec"), namespace)
+    assert namespace["app"].functions["train"].volumes == {"/out": "training-outputs"}
