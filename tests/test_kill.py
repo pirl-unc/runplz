@@ -1053,3 +1053,40 @@ def test_a_lifecycle_event_name_cannot_break_out_of_the_shell():
 def test_a_container_name_cannot_break_out_of_the_shell():
     with pytest.raises(ValueError, match="container name"):
         ssh_common.build_kill_command("$HOME/m", container='c"; id; :"')
+
+
+def test_the_cap_error_names_the_cap_not_the_shell_that_enforced_it():
+    """The run-scoped stop is a ~4KB shell script. Interpolating it into the
+    RuntimeError buried the one line the user needs -- the cap they hit --
+    under the implementation of the stop. Docker mode used to escape this by
+    taking a one-line `docker kill` branch; #158 removed that branch."""
+    remote_run = ssh_common.make_remote_run_context(
+        backend="ssh", target="box", function_name="train"
+    )
+    remote = _CapRemote()
+
+    with mock.patch.object(ssh_common.subprocess, "run", remote.run):
+        with pytest.raises(RuntimeError) as ei:
+            ssh_common.raise_for_runtime_cap(
+                "box", 60, container_name="runplz-train-abc123", remote_run=remote_run
+            )
+
+    message = str(ei.value)
+    assert "max_runtime_seconds=60" in message
+    assert remote_run.run_id in message
+    assert "SIGTERM, then SIGKILL" in message
+    # The script's innards, not the summary of what it did.
+    assert "runplz_run_pids" not in message
+    assert len(message) < 400, len(message)
+
+
+def test_the_no_context_cap_error_still_names_what_it_ran():
+    """The fallbacks are one-liners and stay legible as themselves."""
+    remote = _CapRemote()
+    with mock.patch.object(ssh_common.subprocess, "run", remote.run):
+        with pytest.raises(RuntimeError, match="docker kill runplz-train-abc123"):
+            ssh_common.raise_for_runtime_cap("box", 60, container_name="runplz-train-abc123")
+
+    with mock.patch.object(ssh_common.subprocess, "run", remote.run):
+        with pytest.raises(RuntimeError, match="pkill -f runplz._bootstrap"):
+            ssh_common.raise_for_runtime_cap("box", 60, container_name=None)
