@@ -146,7 +146,7 @@ pretending to be runplz's. They now use `m6i.large`, which runplz does
 generate. The sixth use stays: it is a cross-CLI *name* rejection test whose
 value is never reached.
 
-### Not done
+### Not done *(closed later in #160)*
 
 `--image-id` / `--instance-ids` have obvious vocabularies (`ami-`, `i-`)
 but are not in #154's three categories and no bug motivates them, so they are
@@ -797,9 +797,9 @@ tests:
 - Unset optional scope is passed explicitly as `None`, matching the ssh call
   shape the existing tests assert.
 
-Deliberately not done: rejecting a scope flag that no selected backend accepts
-(today it is silently ignored; erroring is a new failure mode the issue does
-not ask for).
+Deliberately not done *(closed later in #160)*: rejecting a scope flag that no
+selected backend accepts (today it is silently ignored; erroring is a new
+failure mode the issue does not ask for).
 
 ### Sequencing
 
