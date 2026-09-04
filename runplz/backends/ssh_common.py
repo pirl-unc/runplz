@@ -727,6 +727,8 @@ def _record_remote_event(
     )
     try:
         ssh_exec(target, remote, ssh_opts=ssh_opts)
+    except OrchestratorKilled:
+        raise
     except Exception as exc:  # noqa: BLE001
         print(
             f"+ warning: failed to record remote lifecycle event "
@@ -1212,12 +1214,26 @@ def rsync_down(
     cmd = ["rsync", "-az", *rsync_transport_flags(ssh_opts)]
     cmd.extend([_remote_out_rsync(target, remote_run), f"{local_out}/"])
     # rsync is a sync: repeating it converges on the same result.
-    retry_on_transport_failure(
-        lambda: run_local(cmd),
-        label=f"rsync down from {target}",
-        retriable_exits=RSYNC_TRANSPORT_EXITS,
-        policy=SSH_RESULTS_POLICY,
-    )
+    try:
+        retry_on_transport_failure(
+            lambda: run_local(cmd),
+            label=f"rsync down from {target}",
+            retriable_exits=RSYNC_TRANSPORT_EXITS,
+            policy=SSH_RESULTS_POLICY,
+        )
+    except OrchestratorKilled:
+        raise
+    except Exception as exc:
+        _record_remote_event(
+            target,
+            remote_run,
+            "rsync_down_failed",
+            ssh_opts=ssh_opts,
+            error_type=type(exc).__name__,
+            exit_code=getattr(exc, "returncode", None),
+        )
+        raise
+    _record_remote_event(target, remote_run, "rsync_down_done", ssh_opts=ssh_opts)
 
 
 # --- connectivity helpers ------------------------------------------------
@@ -1642,10 +1658,31 @@ def build_image(
             f"{df}\n"
             f"__EOF__"
         )
-    retry_on_transport_failure(
-        lambda: ssh_exec(target, build, ssh_opts=ssh_opts),
-        label=f"build image on {target}",
-    )
+    try:
+        retry_on_transport_failure(
+            lambda: ssh_exec(target, build, ssh_opts=ssh_opts),
+            label=f"build image on {target}",
+        )
+    except OrchestratorKilled:
+        raise
+    except Exception as exc:
+        # A transport failure says the ssh command did not complete, not that
+        # the remote build did not. Preserve that distinction in the stream.
+        event = (
+            "build_image_unconfirmed"
+            if isinstance(exc, subprocess.CalledProcessError)
+            and is_ssh_transport_failure(exc.returncode)
+            else "build_image_failed"
+        )
+        _record_remote_event(
+            target,
+            remote_run,
+            event,
+            ssh_opts=ssh_opts,
+            error_type=type(exc).__name__,
+            exit_code=getattr(exc, "returncode", None),
+        )
+        raise
     _record_remote_event(target, remote_run, "build_image_done", ssh_opts=ssh_opts)
 
 
@@ -1714,11 +1751,34 @@ def run_container_detached(
     # Same ambiguity as the detached launcher: `docker run -d` may have
     # started the container before the transport dropped. Ask docker before
     # retrying rather than starting a second one (issue #84).
-    retry_on_transport_failure(
-        lambda: ssh_exec(target, start, ssh_opts=ssh_opts),
-        label=f"start container {container_name}",
-        can_retry=lambda: not container_exists(target, container_name, ssh_opts=ssh_opts),
-    )
+    try:
+        retry_on_transport_failure(
+            lambda: ssh_exec(target, start, ssh_opts=ssh_opts),
+            label=f"start container {container_name}",
+            can_retry=lambda: not container_exists(target, container_name, ssh_opts=ssh_opts),
+        )
+    except OrchestratorKilled:
+        raise
+    except Exception as exc:
+        # Exit 255 is ambiguous: docker may have started the container before
+        # ssh dropped. Calling that a launch failure would be as misleading as
+        # retrying it and starting the workload twice.
+        event = (
+            "container_launch_unconfirmed"
+            if isinstance(exc, subprocess.CalledProcessError)
+            and is_ssh_transport_failure(exc.returncode)
+            else "container_launch_failed"
+        )
+        _record_remote_event(
+            target,
+            remote_run,
+            event,
+            ssh_opts=ssh_opts,
+            container=container_name,
+            error_type=type(exc).__name__,
+            exit_code=getattr(exc, "returncode", None),
+        )
+        raise
 
 
 def detached_run_started(
@@ -2609,6 +2669,8 @@ def _check_inactivity(
                 ssh_opts=ssh_opts,
             )
         )
+    except OrchestratorKilled:
+        raise
     except Exception as exc:  # noqa: BLE001
         print(f"+ warning: inactivity probe failed: {type(exc).__name__}: {exc}", flush=True)
         return False, already_reported
@@ -2619,15 +2681,6 @@ def _check_inactivity(
     if already_reported:
         return True, True
 
-    _record_remote_event(
-        target,
-        remote_run,
-        "remote_command_stalled",
-        ssh_opts=ssh_opts,
-        idle_seconds=int(idle),
-        threshold_seconds=int(max_inactivity_seconds),
-        action=inactivity_action,
-    )
     print(
         f"+ WARNING: no application output on {target} for {int(idle)}s "
         f"(max_inactivity_seconds={int(max_inactivity_seconds)}). The process is "
@@ -2642,14 +2695,44 @@ def _check_inactivity(
             ),
             flush=True,
         )
+    except OrchestratorKilled:
+        raise
     except Exception as exc:  # noqa: BLE001
         print(f"+ warning: stall diagnostics failed: {type(exc).__name__}: {exc}", flush=True)
 
+    action = "diagnose"
+    stop_summary: dict[str, str] = {}
+    stop_signalled: Optional[bool] = None
+    stop_alive_after: Optional[bool] = None
     if inactivity_action == "terminate":
         print(f"+ inactivity_action=terminate: stopping run {remote_run.run_id}", flush=True)
-        _terminate_stalled_run(target, remote_run, container_name=container_name, ssh_opts=ssh_opts)
+        stop_summary = _terminate_stalled_run(
+            target, remote_run, container_name=container_name, ssh_opts=ssh_opts
+        )
+        stop_signalled = {"0": False, "1": True}.get(stop_summary.get("signalled"))
+        stop_alive_after = {"0": False, "1": True}.get(stop_summary.get("alive_after"))
+        if stop_signalled is True and stop_alive_after is False:
+            action = "terminate"
+        elif stop_signalled is False and stop_alive_after is False:
+            action = "nothing_to_stop"
+        elif stop_alive_after is True:
+            action = "terminate_failed"
+        else:
+            action = "terminate_unconfirmed"
     else:
         print("+ inactivity_action=diagnose: leaving the run alone", flush=True)
+    _record_remote_event(
+        target,
+        remote_run,
+        "remote_command_stalled",
+        ssh_opts=ssh_opts,
+        idle_seconds=int(idle),
+        threshold_seconds=int(max_inactivity_seconds),
+        action=action,
+        signal=stop_summary.get("signal") or None,
+        signalled=stop_signalled,
+        alive_after=stop_alive_after,
+    )
     return True, True
 
 
@@ -2659,7 +2742,7 @@ def _terminate_stalled_run(
     *,
     container_name: Optional[str] = None,
     ssh_opts: Optional[SshOptions] = None,
-) -> None:
+) -> dict[str, str]:
     """Stop exactly this run, and report what it actually stopped.
 
     `build_kill_command` already emits a bounded SUMMARY / HEARTBEAT / LOGTAIL
@@ -2667,9 +2750,11 @@ def _terminate_stalled_run(
     then throws away. Printing it costs nothing and is precisely the evidence
     an operator needs about a stall.
 
-    The stall is already recorded as `remote_command_stalled` with
-    `action="terminate"`, so the script records nothing: its own
-    `killed_by_user` would say a person did this (#158).
+    The script records no event of its own: ``killed_by_user`` would falsely
+    say a person did this (#158). The caller records
+    ``remote_command_stalled`` only after inspecting this function's returned
+    summary, so ``action="terminate"`` means a stop was observed rather than
+    merely requested.
     """
     cleanup = build_kill_command(
         remote_run.meta_shell,
@@ -2680,11 +2765,17 @@ def _terminate_stalled_run(
     )
     try:
         summary = ssh_capture(target, cleanup, ssh_opts=ssh_opts)
+    except OrchestratorKilled:
+        raise
     except Exception as exc:  # noqa: BLE001
         print(f"+ warning: failed to stop stalled run: {type(exc).__name__}: {exc}", flush=True)
-        return
+        return {}
     if summary.strip():
         print(summary.rstrip(), flush=True)
+    fields = parse_kv_block(parse_probe_sections(summary).get("SUMMARY", ""))
+    if not fields:
+        print("+ warning: stalled-run cleanup returned no usable summary", flush=True)
+    return fields
 
 
 def tail_and_wait_for_detached(
@@ -3156,13 +3247,12 @@ def raise_for_runtime_cap(
     Best-effort cleanup: if the kill ssh hangs or fails, still raise — the
     on_finish action in the caller's finally block will nuke the box anyway.
 
-    Records ``killed_by_runtime_cap`` before raising (#155). Without it the
-    event stream ended at whatever the job last wrote, so a capped run was
-    indistinguishable from a crash — and since #150 the outputs of a capped
-    run survive, meaning a user gets the partial results with no record of why
-    they are partial. Every neighbouring path already records its own terminal
-    event: ``bootstrap_launch_failed``, ``killed_by_user``,
-    ``remote_command_stalled``.
+    Records ``killed_by_runtime_cap`` before raising when the cleanup summary
+    confirms that it stopped something (#155). Without an observed signal it
+    records ``runtime_cap_reached`` instead: the payload can finish in the
+    instant between the deadline check and cleanup, and calling that a kill is
+    false. Since #150 the outputs of a capped run survive, so the stream must
+    also say why partial results stop without overstating what cleanup did.
     """
     # `issued` is what the error message says was done. The command itself is
     # a ~4KB shell script on the run-scoped path, and pasting that into a
@@ -3196,6 +3286,8 @@ def raise_for_runtime_cap(
             timeout=30,
         )
         cleanup_out = completed.stdout or ""
+    except OrchestratorKilled:
+        raise
     except Exception:  # noqa: BLE001
         pass
     # `build_kill_command` reports what it actually stopped; the `pkill`
@@ -3209,16 +3301,39 @@ def raise_for_runtime_cap(
     # process that vanished. The container's own state is the true one there.
     process_state = summary.get("final") if summary.get("pid") else None
     container_state = summary.get("container_state")
-    _record_remote_event(
-        target,
-        remote_run,
-        "killed_by_runtime_cap",
-        ssh_opts=ssh_opts,
-        threshold_seconds=int(cap_s) if isinstance(cap_s, (int, float)) else None,
-        process_state=process_state or None,
-        container=container_name,
-        container_state=container_state if container_state not in (None, "", "none") else None,
-    )
+    event_fields = {
+        "threshold_seconds": int(cap_s) if isinstance(cap_s, (int, float)) else None,
+        "process_state": process_state or None,
+        "container": container_name,
+        "container_state": (container_state if container_state not in (None, "", "none") else None),
+    }
+    if summary.get("signalled") == "1" and summary.get("alive_after") == "0":
+        _record_remote_event(
+            target,
+            remote_run,
+            "killed_by_runtime_cap",
+            ssh_opts=ssh_opts,
+            **event_fields,
+        )
+    else:
+        # Reaching the deadline and killing a run are different facts. A job
+        # can finish in the instant between the monitor's deadline check and
+        # the cleanup probe; missing/unusable output is likewise not proof a
+        # signal landed.
+        if summary.get("signalled") == "0" and summary.get("alive_after") == "0":
+            action = "nothing_to_stop"
+        elif summary.get("signalled") == "1":
+            action = "terminate_unconfirmed"
+        else:
+            action = "cleanup_unconfirmed"
+        _record_remote_event(
+            target,
+            remote_run,
+            "runtime_cap_reached",
+            ssh_opts=ssh_opts,
+            action=action,
+            **event_fields,
+        )
     raise RuntimeError(
         f"Remote run exceeded max_runtime_seconds={cap_s}; "
         f"issued remote cleanup: {issued}. "
@@ -3246,6 +3361,10 @@ CLEANUP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 class OrchestratorKilled(RuntimeError):
     """Raised in place of a termination signal so cleanup still runs."""
 
+    def __init__(self, message: str, *, signal_name: Optional[str] = None):
+        super().__init__(message)
+        self.signal_name = signal_name
+
 
 @contextlib.contextmanager
 def orchestrator_signal_cleanup(label: str):
@@ -3269,7 +3388,8 @@ def orchestrator_signal_cleanup(label: str):
             flush=True,
         )
         raise OrchestratorKilled(
-            f"runplz orchestrator killed by {signame}; cleaning up {label!r} before exit."
+            f"runplz orchestrator killed by {signame}; cleaning up {label!r} before exit.",
+            signal_name=signame,
         )
 
     try:
@@ -3369,20 +3489,33 @@ def dispatch_to_target(
     ensure_remote_rsync(target, ssh_opts=ssh_opts)
     rsync_up(repo, target, outputs_dir=outputs_dir, remote_run=remote_run, ssh_opts=ssh_opts)
 
-    # Probe declared preconditions (issue #56) before bootstrap, so a
-    # misprovisioned box fails fast instead of burning paid GPU minutes.
-    check_preconditions(target, function.preconditions, ssh_opts=ssh_opts)
-
-    rel_script = Path(function.module_file).resolve().relative_to(repo)
-
-    if mode not in ("docker", "native", "container"):
-        raise ValueError(f"mode must be 'docker', 'native' or 'container'; got {mode!r}")
-
     container_name: Optional[str] = None
     exit_code: Optional[int] = None
     failure_tail = ""
     synced = False
+    interruption: Optional[OrchestratorKilled] = None
     try:
+        # Probe declared preconditions (issue #56) before bootstrap, so a
+        # misprovisioned box fails fast instead of burning paid GPU minutes.
+        # It belongs inside the salvage boundary: the run manifest and failure
+        # event must make it home even though no bootstrap was launched.
+        try:
+            check_preconditions(target, function.preconditions, ssh_opts=ssh_opts)
+        except PreconditionFailed as exc:
+            _record_remote_event(
+                target,
+                remote_run,
+                "precondition_failed",
+                ssh_opts=ssh_opts,
+                error_type=type(exc).__name__,
+            )
+            raise
+
+        rel_script = Path(function.module_file).resolve().relative_to(repo)
+
+        if mode not in ("docker", "native", "container"):
+            raise ValueError(f"mode must be 'docker', 'native' or 'container'; got {mode!r}")
+
         if mode == "container":
             exit_code = run_container_mode(
                 target=target,
@@ -3440,6 +3573,13 @@ def dispatch_to_target(
         # results and we could not collect them.
         rsync_down(target, host_out, remote_run=remote_run, ssh_opts=ssh_opts)
         synced = True
+    except OrchestratorKilled as exc:
+        # Defer this record until after container cleanup. The detached docker
+        # monitor can append remote_command_exit when `docker rm -f` signals
+        # the container; recording first would let that secondary status
+        # misreport the operator's signal as a job crash.
+        interruption = exc
+        raise
     finally:
         # Grab the log tail before the container goes away — `docker rm`
         # wipes it, and a provisioning caller is about to delete the box.
@@ -3487,6 +3627,14 @@ def dispatch_to_target(
                     f"+ warning: failed to remove container {container_name}: {exc}",
                     flush=True,
                 )
+        if interruption is not None:
+            _record_remote_event(
+                target,
+                remote_run,
+                "orchestrator_signalled",
+                ssh_opts=ssh_opts,
+                signal=interruption.signal_name,
+            )
 
     result = DispatchResult(
         exit_code=exit_code,

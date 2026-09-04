@@ -179,16 +179,11 @@ def status(
         host_override=host_override,
         run_id_override=run_id_override,
     )
-    # One ssh round-trip pulls last events line, last heartbeat line, and
-    # an event count so we don't pay 3x ssh latency for a status check.
-    ev_q = f'"{remote_shell_path(f"{meta}/events.ndjson")}"'
-    hb_q = f'"{remote_shell_path(f"{meta}/heartbeat.ndjson")}"'
-    remote_cmd = (
-        f"echo '---LAST_EVENT---'; tail -n 1 {ev_q} 2>/dev/null || true; "
-        f"echo '---LAST_HEARTBEAT---'; tail -n 1 {hb_q} 2>/dev/null || true; "
-        f"echo '---EVENT_COUNT---'; wc -l < {ev_q} 2>/dev/null || echo 0; "
-        f"echo '---END---'"
-    )
+    # One ssh round-trip pulls the causally authoritative run event, output
+    # sync state, last heartbeat, and event count. Output salvage necessarily
+    # happens after the run ends; treating its audit event as the run's state
+    # hid every real outcome behind `rsync_down_start` (issue #163).
+    remote_cmd = _status_probe_command(meta)
     cmd = [
         "ssh",
         *ssh_cmd_opts(_effective_ssh_opts(outputs_dir, ssh_overrides)),
@@ -204,6 +199,48 @@ def status(
     sections = parse_probe_sections(r.stdout)
     print(_format_status(target=target, manifest=manifest, sections=sections))
     return 0
+
+
+def _status_probe_command(meta: str) -> str:
+    """Build the single-round-trip probe used by :func:`status`.
+
+    Control events override a later ``remote_command_exit`` because they name
+    why the command exited. This matters when an orchestrator signal or a
+    watchdog stop races the remote docker monitor, which can append the
+    resulting SIGKILL status afterwards. A diagnose-only stall is not an
+    override: if that run later exits, its exit is the current state.
+
+    The event stream is deliberately parsed with POSIX ``awk`` rather than
+    ``jq``; minimal remote images are part of the supported surface.
+    """
+    ev_q = f'"{remote_shell_path(f"{meta}/events.ndjson")}"'
+    hb_q = f'"{remote_shell_path(f"{meta}/heartbeat.ndjson")}"'
+    last_run_event = (
+        "awk '"
+        '/"event"[[:space:]]*:[[:space:]]*"rsync_down_(start|done|failed)"/ { next } '
+        "{ latest = $0; "
+        '  if ($0 ~ /"event"[[:space:]]*:[[:space:]]*"(killed_by_runtime_cap|killed_by_user|'
+        'orchestrator_signalled)"/ || '
+        '      ($0 ~ /"event"[[:space:]]*:[[:space:]]*"remote_command_stalled"/ && '
+        '$0 ~ /"action"[[:space:]]*:[[:space:]]*"terminate"/)) authoritative = $0 } '
+        'END { if (authoritative != "") print authoritative; '
+        'else if (latest != "") print latest }\' '
+        f"{ev_q} 2>/dev/null || true"
+    )
+    last_sync_event = (
+        "awk '"
+        '/"event"[[:space:]]*:[[:space:]]*"rsync_down_(start|done|failed)"/ '
+        "{ latest = $0 } "
+        'END { if (latest != "") print latest }\' '
+        f"{ev_q} 2>/dev/null || true"
+    )
+    return (
+        f"echo '---LAST_EVENT---'; {last_run_event}; "
+        f"echo '---LAST_SYNC_EVENT---'; {last_sync_event}; "
+        f"echo '---LAST_HEARTBEAT---'; tail -n 1 {hb_q} 2>/dev/null || true; "
+        f"echo '---EVENT_COUNT---'; wc -l < {ev_q} 2>/dev/null || echo 0; "
+        f"echo '---END---'"
+    )
 
 
 def kill(
@@ -370,6 +407,7 @@ def _format_status(*, target: str, manifest: dict, sections: dict[str, str]) -> 
     parsing JSON or inventing a UI.
     """
     last_event_raw = sections.get("LAST_EVENT", "")
+    last_sync_raw = sections.get("LAST_SYNC_EVENT", "")
     last_hb_raw = sections.get("LAST_HEARTBEAT", "")
     count_raw = (sections.get("EVENT_COUNT", "") or "0").strip()
 
@@ -386,14 +424,34 @@ def _format_status(*, target: str, manifest: dict, sections: dict[str, str]) -> 
             ts = evt.get("ts", "")
             evt_name = evt.get("event", "?")
             age = _age_str(ts)
-            extra = ""
-            if "exit_code" in evt:
-                extra = f" exit_code={evt['exit_code']}"
+            extra = "".join(
+                f" {key}={evt[key]}"
+                for key in ("action", "signal", "exit_code", "threshold_seconds", "error_type")
+                if key in evt
+            )
             lines.append(f"last event: {evt_name}{extra} at {ts}{age}")
         except json.JSONDecodeError:
             lines.append(f"last event (unparsed): {last_event_raw[:200]}")
     else:
         lines.append("last event: (none recorded)")
+
+    if last_sync_raw:
+        try:
+            sync = json.loads(last_sync_raw)
+            sync_name = sync.get("event", "?")
+            sync_state = {
+                "rsync_down_start": "in progress",
+                "rsync_down_done": "completed",
+                "rsync_down_failed": "failed",
+            }.get(sync_name, sync_name)
+            ts = sync.get("ts", "")
+            age = _age_str(ts)
+            detail = f" error_type={sync['error_type']}" if "error_type" in sync else ""
+            lines.append(f"output sync: {sync_state}{detail} at {ts}{age}")
+        except json.JSONDecodeError:
+            lines.append(f"output sync (unparsed): {last_sync_raw[:200]}")
+    else:
+        lines.append("output sync: (not started)")
 
     if last_hb_raw:
         lines.append(f"last heartbeat: {_render_timestamped(last_hb_raw)}")

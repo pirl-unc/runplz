@@ -308,6 +308,11 @@ def _container_start_attempts(probe_returncode, *, remote_run, stderr=""):
     starts = {"n": 0}
 
     def always_blips(target, cmd, *, ssh_opts=None):
+        # Lifecycle recording also uses ssh_exec. Count only the operation
+        # this helper claims to measure, or a new event write looks like a
+        # duplicate docker launch.
+        if "docker run -d" not in cmd:
+            return
         starts["n"] += 1
         raise _blip()
 

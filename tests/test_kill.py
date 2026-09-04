@@ -910,7 +910,7 @@ def test_the_cap_does_not_record_that_a_user_killed_the_run():
     remote_run = ssh_common.make_remote_run_context(
         backend="ssh", target="box", function_name="train"
     )
-    remote = _CapRemote()
+    remote = _CapRemote(summary=_summary())
 
     with mock.patch.object(ssh_common.subprocess, "run", remote.run):
         with pytest.raises(RuntimeError):
@@ -920,6 +920,32 @@ def test_the_cap_does_not_record_that_a_user_killed_the_run():
 
     assert "killed_by_user" not in remote.cleanup
     assert [e["event"] for e in remote.events] == ["killed_by_runtime_cap"]
+
+
+def test_the_cap_does_not_claim_a_kill_when_the_run_finished_first():
+    """The monitor and payload race at the deadline. If cleanup observes no
+    live process, the cap was reached but it did not kill the run."""
+    remote_run = ssh_common.make_remote_run_context(
+        backend="ssh", target="box", function_name="train"
+    )
+    remote = _CapRemote(
+        summary=_summary(
+            pid="",
+            initial="missing",
+            final="missing",
+            alive_before="0",
+            alive_after="0",
+            signalled="0",
+        )
+    )
+
+    with mock.patch.object(ssh_common.subprocess, "run", remote.run):
+        with pytest.raises(RuntimeError):
+            ssh_common.raise_for_runtime_cap("box", 60, container_name=None, remote_run=remote_run)
+
+    assert not [e for e in remote.events if e["event"] == "killed_by_runtime_cap"]
+    assert [e["event"] for e in remote.events] == ["runtime_cap_reached"]
+    assert remote.events[0]["action"] == "nothing_to_stop"
 
 
 def test_the_cap_still_docker_kills_when_there_is_no_run_to_scope_to():

@@ -31,10 +31,13 @@ class _Remote:
     long the application has been silent.
     """
 
-    def __init__(self, *, idle=0, alive_calls=2, exit_code=0):
+    def __init__(self, *, idle=0, alive_calls=2, exit_code=0, cleanup_summary=None):
         self.idle = idle
         self.alive_calls = alive_calls
         self.exit_code = exit_code
+        self.cleanup_summary = cleanup_summary or (
+            "---SUMMARY---\nsignalled=1\nalive_after=0\nsignal=TERM\nsurvivors=\n---END---\n"
+        )
         self.commands = []
         self.tail_calls = 0
 
@@ -59,7 +62,7 @@ class _Remote:
         if "---NOW---" in cmd:
             return f"---NOW---\n{self.idle}\n---LOG---\n0\n---OUT---\n0\n---END---\n"
         if "runplz_run_pids" in cmd or "alive_after" in cmd:
-            return "---SUMMARY---\nalive_after=0\nsurvivors=\n---END---\n"
+            return self.cleanup_summary
         return ""
 
     def alive(self, *a, **kw):
@@ -183,6 +186,42 @@ def test_terminate_stops_the_run_and_still_syncs_outputs(fast_clock):
     assert isinstance(code, int)
 
 
+def test_terminate_records_nothing_to_stop_when_the_run_wins_the_race(fast_clock):
+    remote = _Remote(
+        idle=3600,
+        alive_calls=6,
+        cleanup_summary=("---SUMMARY---\nsignalled=0\nalive_after=0\nsignal=TERM\n---END---\n"),
+    )
+    _, record = _drive(remote, max_inactivity_seconds=1800, action="terminate")
+
+    stall = next(c for c in record.call_args_list if c.args[2] == "remote_command_stalled")
+    assert stall.kwargs["action"] == "nothing_to_stop"
+    assert stall.kwargs["signalled"] is False
+
+
+def test_terminate_records_an_unconfirmed_stop_when_cleanup_fails(fast_clock):
+    remote = _Remote(idle=3600, alive_calls=6, cleanup_summary="not a summary")
+    _, record = _drive(remote, max_inactivity_seconds=1800, action="terminate")
+
+    stall = next(c for c in record.call_args_list if c.args[2] == "remote_command_stalled")
+    assert stall.kwargs["action"] == "terminate_unconfirmed"
+    assert stall.kwargs["signalled"] is None
+
+
+def test_terminate_records_a_confirmed_failure_when_the_run_survives(fast_clock):
+    remote = _Remote(
+        idle=3600,
+        alive_calls=6,
+        cleanup_summary=("---SUMMARY---\nsignalled=1\nalive_after=1\nsignal=TERM\n---END---\n"),
+    )
+    _, record = _drive(remote, max_inactivity_seconds=1800, action="terminate")
+
+    stall = next(c for c in record.call_args_list if c.args[2] == "remote_command_stalled")
+    assert stall.kwargs["action"] == "terminate_failed"
+    assert stall.kwargs["signalled"] is True
+    assert stall.kwargs["alive_after"] is True
+
+
 def test_watchdog_ticks_do_not_spend_the_reconnect_budget(fast_clock):
     """`reconnects` is cumulative for the run and capped at `max_reconnects`.
     If a poll counted as a reconnect, any legitimately quiet job would burn
@@ -303,11 +342,14 @@ class _DockerRemote:
     `_Remote.alive_calls` does for the detached monitor.
     """
 
-    def __init__(self, *, idle=0, running_calls=2, exit_code=0, clock=None):
+    def __init__(self, *, idle=0, running_calls=2, exit_code=0, clock=None, cleanup_summary=None):
         self.idle = idle
         self.running_calls = running_calls
         self.exit_code = exit_code
         self.clock = clock
+        self.cleanup_summary = cleanup_summary or (
+            "---SUMMARY---\nsignalled=1\nalive_after=0\nsignal=TERM\nsurvivors=\n---END---\n"
+        )
         self.commands = []
         self.log_calls = 0
         self.wait_timeouts = []
@@ -342,7 +384,7 @@ class _DockerRemote:
         if "---NOW---" in cmd:
             return f"---NOW---\n{self.idle}\n---LOG---\n0\n---OUT---\n0\n---DLOG---\n0\n---END---\n"
         if "runplz_run_pids" in cmd:
-            return "---SUMMARY---\nalive_after=0\nsurvivors=\n---END---\n"
+            return self.cleanup_summary
         return ""
 
     def running(self, *a, **kw):

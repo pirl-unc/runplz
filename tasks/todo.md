@@ -2350,3 +2350,57 @@ HEARTBEAT / LOGTAIL block including `gpu_mem_used`, which
 # PR 0 follow-up — runtime-layer fidelity documentation
 - [ ] Document test harness layers and mutation-probe interpretation.
 - [ ] Run format, lint, tests, review, merge, and deploy.
+
+## 2026-09-04 — Truthful remote lifecycle status
+
+### Problem statement
+
+`runplz status` currently renders the literal tail of `events.ndjson`. Output salvage always
+appends `rsync_down_start` after the run's outcome, so the user cannot see
+`killed_by_runtime_cap`, `remote_command_stalled`, or even a normal `remote_command_exit`.
+The sync phase also has no completion/failure event, making a finished download
+indistinguishable from a hung one. Several earlier failure paths likewise leave a progress event
+at the tail or assert a cleanup action before it has been observed.
+
+### Behavioral contract
+
+- [x] `status` reports the latest non-output-sync lifecycle event as `last event`, preserving
+      already-shipped terminal events even though salvage runs later, and reports the latest
+      output-sync event separately.
+- [x] `rsync_down` records start, done, and failed outcomes. Failure recording is best-effort and
+      never replaces the original transfer error.
+- [x] A hard precondition failure records `precondition_failed` and enters the existing salvage
+      path so the remote manifest/event stream is copied locally and `status` can resolve it.
+- [x] A remote image-build failure records `build_image_failed`; a `docker run -d` failure records
+      `container_launch_failed`. Both preserve the original exception.
+- [x] An orchestrator termination signal reaching an active dispatch records
+      `orchestrator_signalled` after container cleanup, so a monitor-written SIGKILL
+      `remote_command_exit` cannot misreport the causal outcome.
+- [x] Watchdog termination records `action="terminate"` only after the cleanup summary confirms a
+      signal was sent and nothing survived; no-op, failed, and incomplete cleanup get truthful
+      action values in `remote_command_stalled`.
+- [x] Runtime-cap cleanup records `killed_by_runtime_cap` only when the cleanup summary confirms
+      something was stopped; a last-second natural exit does not get a false kill event.
+- [x] Regression tests drive production ordering and failure edges, including malformed/missing
+      cleanup summaries, without weakening existing success/failure semantics.
+- [x] Bump the patch version, run `./format.sh`, `./lint.sh`, and `./test.sh`, and review the diff.
+- [ ] Push and open a PR that closes issue #163.
+
+### Implementation notes
+
+Keep event writes best-effort: lifecycle reporting must not mask the operational exception it is
+describing. Do not require `jq` or another remote dependency for `status`; use the existing
+newline-delimited JSON shape and POSIX tools already assumed by the CLI. Keep the scope in the
+backend-agnostic SSH dispatch/event machinery and CLI status rendering.
+
+### Review
+
+Implemented causal status selection without adding a remote dependency: the POSIX `awk` probe
+separates output-sync events and gives operator/runtime control events precedence over the
+secondary `remote_command_exit` they can cause. Both compact shell JSON and spaced Python JSON
+are covered. Phase failures preserve their original exceptions, transport ambiguity is named
+`*_unconfirmed`, and signal exceptions pass through best-effort reporting instead of being
+swallowed.
+
+Verification: `./format.sh`, `./lint.sh`, and `./test.sh` pass; 1278 tests passed, 1 platform test
+skipped, and total coverage is 95.07%.
