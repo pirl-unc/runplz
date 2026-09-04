@@ -14,6 +14,17 @@ just localhost, so the ssh half can run for real too when sshd is up.
 Every invocation is appended to a JSONL log the test can assert on, and
 `fail_times` scripts transient failures so the retry loop is exercised
 rather than described.
+
+Option *values* are validated as well as option names (#154), from the live
+provisioning catalogues. That makes the stubs deliberately *stricter* than the
+real CLIs about machine shapes: `aws` sells `t3.micro`, and this one refuses
+it, because the vocabulary is "what runplz generates" rather than "what the
+provider offers". The point is to fail when runplz's catalogue drifts out of
+the names the provider actually sells -- which a permissive syntactic check
+could not do, since `totally-invented-9000` is shaped exactly like a real GCP
+machine type. A test that legitimately needs a shape runplz never picks -- a
+user's `instance_type=` override -- has to add it to `_option_values`, and
+that should be a deliberate act.
 """
 
 import json
@@ -140,6 +151,75 @@ _REQUIRED_OPTIONS = {
 }
 
 
+def _machine_names(cpu_shapes, gpu_tables) -> list:
+    """Every machine name one provider's catalogue can select."""
+    names = {offering.name for offering in cpu_shapes}
+    for shapes in gpu_tables.values():
+        names.update(offering.name for offering in shapes.offerings)
+    return sorted(names)
+
+
+def _accelerator_names(gpu_tables) -> list:
+    return sorted({s.accelerator for s in gpu_tables.values() if s.accelerator})
+
+
+def _option_values() -> dict:
+    """What each option may *contain*, per route.
+
+    Validating names alone still let the stub take
+    `--machine-type=totally-invented-9000` and `--count abc` with rc=0 -- the
+    first of which is the bug class this module exists to catch.
+
+    Built from the live provisioning catalogues rather than copied beside
+    them, so a shape that is removed upstream and dropped from the table stops
+    being accepted here too. See the module docstring for why that vocabulary
+    is deliberately narrower than the real CLIs'.
+
+    The "*" route applies to every route of that CLI; a per-route entry wins.
+    """
+    from runplz.backends.provisioning import (
+        AWS_CPU_SHAPES,
+        AWS_GPUS,
+        GCP_CPU_SHAPES,
+        GCP_GPUS,
+    )
+
+    return {
+        "gcloud": {
+            "*": {
+                # Parametrized projections (`value(name)`) are not modelled;
+                # runplz only ever asks for json.
+                "--format": {"choices": ["json", "yaml", "text", "csv", "none"]},
+            },
+            "compute/instances/create": {
+                "--machine-type": {"choices": _machine_names(GCP_CPU_SHAPES, GCP_GPUS)},
+                "--accelerator": {"accelerator": _accelerator_names(GCP_GPUS)},
+                "--maintenance-policy": {"choices": ["MIGRATE", "TERMINATE"]},
+                "--provisioning-model": {"choices": ["SPOT", "STANDARD"]},
+                "--boot-disk-size": {"int": True, "units": ["GB", "MB", "TB", "GiB", "TiB"]},
+                "--boot-disk-type": {
+                    "choices": ["pd-standard", "pd-balanced", "pd-ssd", "pd-extreme"]
+                },
+            },
+        },
+        "aws": {
+            "*": {"--output": {"choices": ["json", "text", "table", "yaml", "yaml-stream"]}},
+            "ec2/run-instances": {
+                "--instance-type": {"choices": _machine_names(AWS_CPU_SHAPES, AWS_GPUS)},
+                "--count": {"int": True},
+            },
+        },
+    }
+
+
+def _values_for(name: str) -> dict:
+    """Per-route value specs for one CLI, with the "*" entries folded in."""
+    table = _option_values()[name]
+    shared = table.get("*", {})
+    routes = set(table) | set(_allowed_options(name))
+    return {route: {**shared, **table.get(route, {})} for route in routes if route != "*"}
+
+
 def _allowed_options(name: str) -> dict:
     """Every option each route of one CLI accepts, required ones folded in.
 
@@ -167,6 +247,7 @@ MALFORMED = {malformed!r}
 ALLOWED_OPTIONS = {_ALLOWED_OPTIONS!r}
 REQUIRED_OPTIONS = {_REQUIRED_OPTIONS!r}
 VARIANTS = {_VARIANTS!r}
+OPTION_VALUES = {_OPTION_VALUES!r}
 
 argv = sys.argv[1:]
 positional = [a for a in argv if not a.startswith("-")]
@@ -266,6 +347,52 @@ missing = sorted(REQUIRED_OPTIONS.get("{name}", {{}}).get(route_name, set()) - o
 if missing:
     sys.stderr.write("stub {name}: missing required option(s): " + " ".join(missing) + "\\n")
     sys.exit(2)
+# Option values, not just option names. `--machine-type=totally-invented-9000`
+# and `--count abc` both exited 0 before this: the stub asserted the shape of a
+# command line while accepting anything at all inside it.
+def bad_value(spec, value):
+    if value is None:
+        return "has no value"
+    if "choices" in spec:
+        if value not in spec["choices"]:
+            return "expected one of " + " ".join(spec["choices"])
+        return None
+    if "accelerator" in spec:
+        # gcloud's own shape: type=<name>,count=<n>.
+        fields = dict(
+            piece.split("=", 1) for piece in value.split(",") if "=" in piece
+        )
+        if set(fields) != {{"type", "count"}}:
+            return "expected type=<accelerator>,count=<n>"
+        if fields["type"] not in spec["accelerator"]:
+            return "unknown accelerator " + fields["type"]
+        if not fields["count"].isdigit():
+            return "count must be an integer"
+        return None
+    if spec.get("int"):
+        digits = value
+        for unit in spec.get("units", []):
+            if digits.endswith(unit):
+                digits = digits[: -len(unit)]
+                break
+        if not digits.isdigit():
+            units = spec.get("units")
+            suffix = (" with an optional " + "/".join(units) + " suffix") if units else ""
+            return "expected an integer" + suffix
+        return None
+    return None
+
+for option, spec in sorted(OPTION_VALUES.get(route_name, {{}}).items()):
+    if option not in option_names:
+        continue
+    problem = bad_value(spec, option_value(option))
+    if problem is not None:
+        sys.stderr.write(
+            "stub {name}: invalid value for " + option + ": "
+            + repr(option_value(option)) + " (" + problem + ")\\n"
+        )
+        sys.exit(2)
+
 if key[0:3] == ("compute", "instances", "create") and len(positional) <= 3:
     sys.stderr.write("stub gcloud: create requires an instance name\\n")
     sys.exit(2)
@@ -407,6 +534,7 @@ def install(bin_dir: Path, *, name: str, fail_times=None, fail_message="", malfo
             _ALLOWED_OPTIONS=_allowed_options(name),
             _REQUIRED_OPTIONS=_REQUIRED_OPTIONS,
             _VARIANTS=_VARIANTS,
+            _OPTION_VALUES=_values_for(name),
         )
     )
     script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)

@@ -16,7 +16,7 @@ def _aws_create_args():
         "--image-id",
         "ami-x",
         "--instance-type",
-        "t3.micro",
+        "m6i.large",
         "--key-name",
         "k",
         "--count",
