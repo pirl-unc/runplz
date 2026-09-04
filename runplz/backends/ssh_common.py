@@ -3164,6 +3164,10 @@ def raise_for_runtime_cap(
     event: ``bootstrap_launch_failed``, ``killed_by_user``,
     ``remote_command_stalled``.
     """
+    # `issued` is what the error message says was done. The command itself is
+    # a ~4KB shell script on the run-scoped path, and pasting that into a
+    # RuntimeError buries the one line the user needs — the cap they hit —
+    # under the implementation of the stop.
     if remote_run is not None:
         cleanup = build_kill_command(
             remote_run.meta_shell,
@@ -3175,10 +3179,13 @@ def raise_for_runtime_cap(
             # threshold and the measured state the shell does not have.
             event=None,
         )
+        issued = f"run-scoped stop of {remote_run.run_id} (SIGTERM, then SIGKILL after 5s)"
     elif container_name is not None:
         cleanup = f"sudo docker kill {container_name}"
+        issued = f"docker kill {container_name}"
     else:
         cleanup = "pkill -f 'runplz._bootstrap' || true"
+        issued = "pkill -f runplz._bootstrap"
     cleanup_out = ""
     try:
         completed = subprocess.run(
@@ -3214,7 +3221,7 @@ def raise_for_runtime_cap(
     )
     raise RuntimeError(
         f"Remote run exceeded max_runtime_seconds={cap_s}; "
-        f"issued remote cleanup ({cleanup!r}). "
+        f"issued remote cleanup: {issued}. "
         f"Raise or remove max_runtime_seconds if the job legitimately "
         f"needs longer."
     )
