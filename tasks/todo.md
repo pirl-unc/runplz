@@ -1,3 +1,49 @@
+## 2026-09-03 PR Plan — Container fault injection (#141)
+
+Branch: `test/container-fault-injection` (off `main` @ 4.1.1)
+
+- [x] `DockerSshd.refuse_connections` / `drop_connection`
+- [x] Keep PID 1 off sshd so killing the daemon does not kill the endpoint
+- [x] Make `DockerSshd.start` idempotent, like `LocalSshd.start`
+- [x] Run `test_ssh_faults.py` in the container CI job
+- [x] Contract test that both backends expose the same fault surface
+- [ ] Verify in CI (no Docker daemon on this machine)
+- [ ] Review, merge, deploy
+
+### Why the tier could not run on containers
+
+`test_ssh_faults.py` is the repo's real-ssh-against-real-sshd tier. It only
+ever worked against `LocalSshd`: `DockerSshd` implemented neither fault
+method, so the tier raised AttributeError against the container backend --
+which is what a macOS developer gets by default and what `e2e-container`
+runs in CI.
+
+It did not surface because the file had no `live_ssh` marker until #140. The
+billing guard intercepted every ssh call before the harness methods were
+reached, so the tests passed on the guard's own exception and never got far
+enough to notice the missing methods.
+
+### The PID 1 problem
+
+The container ran `sshd -D` as PID 1, so killing the daemon would kill the
+container and take the published port with it. A "refused connection" would
+then be indistinguishable from an endpoint that vanished. PID 1 is now
+`sleep infinity` and sshd runs beside it, so the port survives the fault and
+`start()` can restore the daemon in place -- the same endpoint, the way
+`LocalSshd.start()` already behaves.
+
+`drop_connection` mirrors the LocalSshd fix from #140: kill the session
+children before the listener, because an in-flight session is a forked child
+that outlives its parent.
+
+### Verification limit, stated plainly
+
+There is no Docker daemon on this machine, so the container path is verified
+by CI, not locally. What is verified here: the LocalSshd path still passes,
+and a contract test asserts both backends expose the same four primitives --
+which is the specific gap that let this go unnoticed.
+
+
 ## 2026-09-03 PR Plan — Pin the cloud selector's minimum contract (#95)
 
 Branch: `test/pin-selector-minimums` (off `main` @ 4.1.0)

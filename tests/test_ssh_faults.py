@@ -82,3 +82,20 @@ def test_mid_command_transport_drop_is_reported(sshd_server):
     finally:
         timer.cancel()
         sshd_server.start()
+
+
+def test_both_backends_offer_the_same_fault_surface():
+    """The tier is only evidence for the backend it actually runs against.
+
+    `DockerSshd` had neither fault method, so this file could only ever run
+    against `LocalSshd` — and it silently did not run against the container
+    backend a macOS developer gets by default, or the one `e2e-container`
+    exercises in CI (#141). A missing method here is an AttributeError at
+    fault-injection time, which reads as a broken test rather than a gap in
+    the harness.
+    """
+    from sshd_harness import DockerSshd, LocalSshd
+
+    for backend in (LocalSshd, DockerSshd):
+        for primitive in ("start", "stop", "refuse_connections", "drop_connection"):
+            assert callable(getattr(backend, primitive, None)), f"{backend.__name__}.{primitive}"

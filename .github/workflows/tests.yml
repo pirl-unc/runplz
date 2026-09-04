@@ -72,6 +72,7 @@ jobs:
         run: |
           set -o pipefail
           pytest tests/test_e2e_localhost.py tests/test_e2e_fake_cloud.py \
+            tests/test_ssh_faults.py \
             -v -rs --e2e-remote=docker \
             | tee e2e-output.txt
           if grep -qE '^SKIPPED' e2e-output.txt; then

@@ -193,7 +193,11 @@ RUN apt-get update \
 COPY authorized_keys /root/.ssh/authorized_keys
 RUN chmod 600 /root/.ssh/authorized_keys \
  && sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
-CMD ["/usr/sbin/sshd", "-D", "-e"]
+# PID 1 is deliberately not sshd: the fault tests kill the daemon, and
+# killing PID 1 would take the container -- and its published port -- with
+# it, so a "refused connection" would be indistinguishable from a vanished
+# endpoint. sshd is started beside it by the harness.
+CMD ["sleep", "infinity"]
 """
 
 
@@ -223,24 +227,64 @@ class DockerSshd:
         from testcontainers.core.container import DockerContainer
         from testcontainers.core.image import DockerImage
 
-        _keygen(self.identity)
-        context = self.root / "ctx"
-        context.mkdir(parents=True, exist_ok=True)
-        (context / "Dockerfile").write_text(DOCKERFILE)
-        (context / "authorized_keys").write_bytes((self.root / "id.pub").read_bytes())
-        self.identity.chmod(0o600)
+        if self._container is None:
+            # Guarded like LocalSshd.start: `ssh-keygen -f <existing>` prompts
+            # before overwriting, and with no tty that is a non-zero exit — so
+            # an unguarded keygen turns the second start() into a hard failure.
+            # Only reachable now that fault tests restore the daemon by calling
+            # start() again.
+            if not self.identity.exists():
+                _keygen(self.identity)
+            context = self.root / "ctx"
+            context.mkdir(parents=True, exist_ok=True)
+            (context / "Dockerfile").write_text(DOCKERFILE)
+            (context / "authorized_keys").write_bytes((self.root / "id.pub").read_bytes())
+            self.identity.chmod(0o600)
 
-        self._image = DockerImage(path=str(context), tag="runplz-e2e-sshd:test").build()
-        self._container = DockerContainer(str(self._image)).with_exposed_ports(22).start()
-        self.host = self._container.get_container_host_ip()
-        self.port = int(self._container.get_exposed_port(22))
-        # The container's only account is root. `SshOptions` cannot express
-        # a user, so it has to ride in the target -- and the harness probe
-        # must use the same address, or it will report a healthy box that
-        # the code under test cannot reach.
-        self.target = f"root@{self.host}"
+            self._image = DockerImage(path=str(context), tag="runplz-e2e-sshd:test").build()
+            self._container = DockerContainer(str(self._image)).with_exposed_ports(22).start()
+            self.host = self._container.get_container_host_ip()
+            self.port = int(self._container.get_exposed_port(22))
+            # The container's only account is root. `SshOptions` cannot express
+            # a user, so it has to ride in the target -- and the harness probe
+            # must use the same address, or it will report a healthy box that
+            # the code under test cannot reach.
+            self.target = f"root@{self.host}"
+        # Idempotent like LocalSshd.start: a fault test kills the daemon and
+        # calls start() to restore it, and must get the same endpoint back.
+        self._start_sshd()
         self._await_ready()
         return self
+
+    _SSHD_PID = "/run/sshd.pid"
+
+    def _sh(self, script: str):
+        """Run a shell snippet inside the container."""
+        return self._container.exec(["sh", "-c", script])
+
+    def _start_sshd(self) -> None:
+        # No -D: sshd daemonizes, so this exec returns once it is listening.
+        self._sh(f"/usr/sbin/sshd -e -o PidFile={self._SSHD_PID}")
+
+    def refuse_connections(self) -> None:
+        """Stop accepting connections while keeping the endpoint addressable.
+
+        The container and its published port stay up, so a client gets a
+        refusal rather than the endpoint disappearing underneath it.
+        """
+        self._sh(f"[ -f {self._SSHD_PID} ] && kill $(cat {self._SSHD_PID}) || true")
+
+    def drop_connection(self) -> None:
+        """Sever sessions that are already established, not just the listener.
+
+        Same shape as the LocalSshd fix: an in-flight session is a forked child
+        of the daemon and outlives it, so killing the listener alone lets a
+        running command finish normally.
+        """
+        self._sh(
+            f"[ -f {self._SSHD_PID} ] && pkill -P $(cat {self._SSHD_PID}) || true; "
+            f"[ -f {self._SSHD_PID} ] && kill $(cat {self._SSHD_PID}) || true"
+        )
 
     _await_ready = LocalSshd._await_ready
     probe = LocalSshd.probe
