@@ -1,3 +1,88 @@
+## 2026-09-03 PR Plan — Implement the documented Modal Volume contract (#143)
+
+Branch: `feat/modal-volumes` (off `main` @ 4.0.6)
+
+- [x] `@app.function(volumes={"/out": "name"})` on `Function` / `App.function`
+- [x] Backends that cannot mount a volume raise instead of ignoring it
+- [x] Render the mount on the generated Modal function
+- [x] Skip the tar when the outputs dir is volume-backed
+- [x] Download the volume into the local outputs dir after the run
+- [x] README: replace the example that never worked
+- [x] Bump `runplz/version.py` to 4.1.0
+- [x] `./format.sh`, `./lint.sh`, `./test.sh`
+- [ ] Review, merge, deploy
+
+### The gap
+
+The README has documented a Volume mount as *the* answer to Modal's ~256 MB
+return-value cap since 3.24.31:
+
+    @app.function(image=image, gpu="T4", volumes={"/out": volume})
+
+`App.function()` has never accepted `volumes`, so that example raises
+TypeError. The backend has no volume field to render and still tars `/out`
+into a single function return. `modal.py`'s own module TODO says as much.
+
+So the only documented escape from the cap did not exist, and #19 -- which
+added the size detection that tells users to go use a Volume -- was closed
+before the Volume half was built.
+
+### API decision
+
+Per-function `volumes={mount_path: volume_name}` on `@app.function`, taking a
+volume **name**, not a live `modal.Volume`.
+
+The object cannot work: the Modal backend generates a Python file at module
+scope and shells to `modal run`, so nothing constructed in the user's process
+crosses into the generated entrypoint. Only a name can, and the generated file
+calls `modal.Volume.from_name(name, create_if_missing=True)` itself. The
+README example therefore changes regardless of where the kwarg lives.
+
+`ModalConfig` was the other candidate -- its docstring says it exists as the
+slot for Modal fields -- but it is per-App, so two functions in one App could
+not mount different volumes. Volumes are a per-function property, so they go
+on the per-function decorator.
+
+### Silence is the failure mode
+
+A backend that ignored `volumes=` would drop a durability request without
+saying so, which is the same class of bug as #142 (Modal listing) and the
+`min_disk` handling this repo already fixed loudly in #20. Backends declare
+whether they can mount, and the ones that cannot raise at bind time -- before
+anything is provisioned or billed.
+
+### Verification honesty
+
+There is no Modal account in the test environment, so the download and mount
+are asserted at the argv/rendered-source level, the same fidelity the fake
+cloud tier gives aws/gcloud. What *is* executable: the README example is
+accepted by the real decorator, and a volume-backed run does not put the
+outputs directory through the function return.
+
+### Review
+
+The README example is now extracted from README.md and `exec`'d, rather than
+paraphrased into a test. #143 existed because a documented example had never
+been run against the code; a test that re-types the example could drift the
+same way, and this one cannot.
+
+Mutation-checked: dropping the `volumes=` passthrough fails three tests,
+including the README one.
+
+Only a mount at the outputs directory diverts outputs. A volume at `/data`
+is durable scratch and leaves the return path alone, which keeps the existing
+small-output behaviour exactly as it was.
+
+If the download fails the error says the outputs are still in the volume and
+gives the command to fetch them. The run succeeded and the data is durable --
+the one conclusion a user must not reach there is that their results are gone.
+
+Minor bump, not patch: `@app.function(volumes=...)` is new public surface, and
+`min_disk`'s error message on Modal now points at a feature that exists.
+
+1173 passing, coverage 95.36%.
+
+
 ## 2026-09-03 PR Plan — Close the executable-test fidelity gaps (#96)
 
 Branch: `test/close-fidelity-gaps` (off `main` @ `c47b504`)

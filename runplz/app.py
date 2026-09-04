@@ -48,6 +48,7 @@ class Function:
         num_gpus: int = 1,
         min_gpus: Optional[int] = None,
         preconditions: Optional[dict] = None,
+        volumes: Optional[dict] = None,
     ):
         # min_gpus is the canonical name going forward (parallels min_cpu /
         # min_memory / min_gpu_memory). num_gpus is the legacy alias — kept
@@ -67,6 +68,12 @@ class Function:
         self.app = app
         self.fn = fn
         self.image = image
+        # {mount_path: volume_name}. Durable storage the backend mounts into
+        # the container, for outputs too large or too long-lived to come back
+        # through the normal return path. Names, not live volume objects: the
+        # Modal backend generates an entrypoint file and shells to `modal run`,
+        # so nothing constructed in this process crosses into it.
+        self.volumes = _validate_volumes(fn.__name__, volumes)
         # Resource requests — all minimums. Units: vCPUs (float OK), GB for
         # everything memory/disk-related. Each backend picks a matching
         # instance (Modal: direct; Brev: via `brev search`).
@@ -181,6 +188,7 @@ class App:
         timeout: int = 60 * 60,
         env: Optional[dict] = None,
         preconditions: Optional[dict] = None,
+        volumes: Optional[dict] = None,
     ):
         def decorator(fn: Callable) -> Function:
             f = Function(
@@ -197,6 +205,7 @@ class App:
                 timeout=timeout,
                 env=env or {},
                 preconditions=preconditions,
+                volumes=volumes,
             )
             self.functions[f.name] = f
             return f
@@ -286,6 +295,21 @@ class App:
                 f"(it skips `docker build`). On backend={backend!r} it would be "
                 f"silently ignored."
             )
+        if not spec.accepts_volumes:
+            mounted = sorted(
+                f"{fn.name}({', '.join(sorted(fn.volumes))})"
+                for fn in self.functions.values()
+                if fn.volumes
+            )
+            if mounted:
+                raise ValueError(
+                    f"backend={backend!r} cannot mount a volume, but "
+                    f"{'; '.join(mounted)} asks for one. Dropping the mount would run "
+                    f"the job and write its outputs to container-local disk that "
+                    f"disappears with the box — so this fails before anything is "
+                    f"provisioned. Run these on modal, or remove volumes= and let the "
+                    f"outputs come back through the normal path."
+                )
         if not outputs_dir or not str(outputs_dir).strip():
             raise ValueError("outputs_dir must be a non-empty path string.")
         # Only needed to *infer* the repo root — with one handed in, or a
@@ -488,6 +512,42 @@ def validate_image_vs_brev_mode(*, fn_name: str, image: Image, brev_config: Brev
             f"runs the function natively over ssh and ignores any Dockerfile. "
             f"Use Image.from_registry(...) or flip use_docker=True."
         )
+
+
+def _validate_volumes(fn_name: str, volumes) -> dict:
+    """Normalize and check `{mount_path: volume_name}`.
+
+    Names rather than live volume objects, because the Modal backend renders a
+    standalone entrypoint file and shells to `modal run` — an object built in
+    this process cannot reach it. The README documented the object form for
+    several releases without it ever being implemented (#143), so that mistake
+    gets its own message rather than a generic type error.
+    """
+    if volumes is None:
+        return {}
+    if not isinstance(volumes, dict):
+        raise ValueError(
+            f"{fn_name}: volumes must be a dict of {{mount_path: volume_name}}; "
+            f"got {type(volumes).__name__}."
+        )
+    checked = {}
+    for mount_path, name in volumes.items():
+        if not isinstance(mount_path, str) or not mount_path.startswith("/"):
+            raise ValueError(
+                f"{fn_name}: volume mount path must be an absolute path; got {mount_path!r}."
+            )
+        if not isinstance(name, str):
+            raise ValueError(
+                f"{fn_name}: volume for {mount_path!r} must be the volume's *name*, not a "
+                f"{type(name).__name__}. runplz generates a standalone entrypoint and runs it "
+                f"in a separate process, so a volume object created here cannot reach it — "
+                f'pass volumes={{{mount_path!r}: "my-volume"}} and runplz will call '
+                f"modal.Volume.from_name(..., create_if_missing=True) for you."
+            )
+        if not name.strip():
+            raise ValueError(f"{fn_name}: volume name for {mount_path!r} must not be empty.")
+        checked[mount_path.rstrip("/") or "/"] = name.strip()
+    return checked
 
 
 def _validate_resources(

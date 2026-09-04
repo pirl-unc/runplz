@@ -63,6 +63,10 @@ class BackendSpec:
     accepts_host: bool = False
     # Only `local` can skip the image build and reuse a tagged image.
     accepts_no_build: bool = False
+    # True when the backend can mount a named durable volume into the run.
+    # A backend that cannot must reject `volumes=` rather than drop it: a
+    # silently ignored durability request is how outputs go missing.
+    accepts_volumes: bool = False
 
 
 BACKENDS = {
@@ -86,6 +90,7 @@ BACKENDS = {
             name="modal",
             module="runplz.backends.modal",
             listing=ListingSpec(),
+            accepts_volumes=True,
         ),
         BackendSpec(
             name="ssh",

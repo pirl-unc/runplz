@@ -807,29 +807,30 @@ persist across runs without being re-rsynced — mount a Modal Volume
 at `/out`:
 
 ```python
-import modal
-
-volume = modal.Volume.from_name("training-outputs", create_if_missing=True)
-
-@app.function(image=image, gpu="T4", volumes={"/out": volume})
+@app.function(image=image, gpu="T4", volumes={"/out": "training-outputs"})
 def train():
-    import os, torch
+    import torch
     model = ...
     torch.save(model.state_dict(), "/out/weights.pt")
-    # volume.commit() not needed — Modal auto-commits on function exit
 ```
 
-Then download locally after the run:
+Pass the volume's **name**, not a `modal.Volume` object. runplz generates a
+standalone Modal entrypoint and runs it in a separate process, so an object
+built in your script cannot reach it — runplz calls
+`modal.Volume.from_name(name, create_if_missing=True)` for you inside the
+generated file.
 
-```python
-# jobs/download.py — a separate script, or a follow-up local_entrypoint
-import modal
-vol = modal.Volume.from_name("training-outputs")
-for entry in vol.iterdir("/"):
-    with open(f"./out/{entry.path.lstrip('/')}", "wb") as f:
-        for chunk in vol.read_file(entry.path):
-            f.write(chunk)
-```
+With `/out` on a volume, runplz stops tarring the outputs into the function
+return — which is the point, since that return is what the ~256 MB cap
+applies to. Modal commits the volume when the function exits, and runplz
+then downloads it into your local outputs dir, so `runplz modal job.py`
+leaves results in `./out/` exactly as it does without a volume. Mount a
+volume somewhere other than `/out` (say `/data` for a dataset) and outputs
+still come back the normal way.
+
+Backends that cannot mount a volume reject `volumes=` at bind time rather
+than ignoring it — a dropped mount would write results to disk that
+disappears with the box, and you would find out hours later.
 
 Brev / ssh don't have a direct volume equivalent — for durable output
 on those backends, write to a mounted network drive the box already
