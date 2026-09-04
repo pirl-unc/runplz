@@ -1,3 +1,75 @@
+## 2026-09-03 PR Plan — Pin the cloud selector's minimum contract (#95)
+
+Branch: `test/pin-selector-minimums` (off `main` @ 4.1.0)
+
+- [x] Reproduce #95's four examples against main before writing anything
+- [x] Property test: every selection satisfies every declared minimum, or raises
+- [x] Pin that the raise happens before any billed CLI call
+- [x] Bump `runplz/version.py` to 4.1.1
+- [x] `./format.sh`, `./lint.sh`, `./test.sh`
+- [ ] Review, merge, deploy
+
+### The behaviour is already correct
+
+#95 says AWS/GCP selection clamps past the largest known CPU shape instead of
+failing, and that GPU selection ignores `min_cpu` / `min_memory`. Checked all
+four of its literal examples on main first, the same way #96 turned out to be
+mostly stale:
+
+| example | on main |
+|---|---|
+| `min_cpu=200` (aws, gcp) | raises `CloudCliError` |
+| `min_memory=2048` (aws, gcp) | raises `CloudCliError` |
+| `gpu=T4, min_cpu=100` | raises `CloudCliError` |
+
+`select_machine` carries the contract, and its docstring names it: "count
+validation, CPU/RAM validation and the fail-instead-of-clamp contract live
+here once". That landed in `e861671` -- the same commit that closed most of
+#96, both filed while reviewing PR #94.
+
+### What is actually missing
+
+Nothing pins it. **No test in the suite calls `select_machine` directly.** It
+reaches 98% line coverage entirely through `gcp.resolve_shape` and
+`aws.resolve_instance_type`, in example-based tests.
+
+Coverage is not the same as the property. Every one of those examples would
+still pass if the selector went back to clamping, because a clamp returns a
+*finite smaller shape* rather than an error -- and no example probes past the
+largest offering. That is exactly the bug #95 describes, and it is currently
+invisible to the suite.
+
+So the work is the property, not a fix: for every offering catalogue, GPU
+label and GPU count, a selection either satisfies every declared minimum or
+raises. Swept ~5000 combinations by hand first -- 2974 satisfied, 1987 raised,
+zero under-provisioned -- which is what the test now asserts permanently.
+
+### The other half of the requirement
+
+"...or raise **before a billed CLI runs**". Verified separately by driving
+`aws.run` / `gcp.run` with an impossible minimum and counting subprocess
+calls: both raise with zero. Pinned too, since the cost of regressing that is
+a provisioned box rather than a failed test.
+
+### Review
+
+The mutation check is the whole argument. Reintroducing the clamp -- one
+`return largest` where the raise used to be -- fails all nine new tests and
+leaves **all 87 pre-existing cloud-backend tests passing**. The suite could
+not see this bug before; it can now.
+
+That asymmetry is the reason to write the property rather than more examples.
+A clamp returns a plausible smaller machine, not an error, so it is invisible
+to any test that does not deliberately ask for more than the catalogue holds.
+
+One guard on the guard: `test_the_sweep_actually_exercises_the_refusal_path`
+asserts the sweep really does reach the raising branch. Without it, a
+catalogue change that made everything satisfiable would leave the main
+property holding vacuously.
+
+1182 passing, coverage 95.36%.
+
+
 ## 2026-09-03 PR Plan — Implement the documented Modal Volume contract (#143)
 
 Branch: `feat/modal-volumes` (off `main` @ 4.0.6)
