@@ -29,6 +29,7 @@ True)` mounted at /out, then download after the run via
 __all__ = [
     "run",
     "list_jobs",
+    "APP_PREFIX",
 ]
 
 
@@ -135,6 +136,31 @@ def list_jobs() -> list[JobRecord]:
     return _jobs_from_modal_text(r.stdout)
 
 
+# The prefix `_ENTRYPOINT_TEMPLATE` stamps on every app runplz creates, and the
+# only thing that distinguishes ours from the user's other Modal apps.
+APP_PREFIX = "runplz-"
+
+# Where the display name lives depends on the Modal client. 1.1.4 reports it
+# under `Description`; older shapes used `name`. Listed rather than assumed
+# because the failure mode when it moves is silence, not an error.
+_NAME_FIELDS = ("name", "App Name", "Name", "Description")
+
+
+def _display_name(row: dict) -> str:
+    """The app's display name, wherever this Modal CLI decided to put it.
+
+    Prefers whichever candidate actually carries a runplz app name over field
+    order. Modal moved the display name to `Description` in 1.1.4 and runplz
+    went blind: no field matched, the name came back empty, every app failed
+    the prefix filter, and `runplz ps` reported no Modal jobs at all rather
+    than erroring (#142). Trusting the first non-empty field would break the
+    same way the next time a field is added ahead of the real one.
+    """
+    candidates = [str(row.get(field) or "").strip() for field in _NAME_FIELDS]
+    ours = next((c for c in candidates if c.startswith(APP_PREFIX)), None)
+    return ours if ours is not None else next((c for c in candidates if c), "")
+
+
 def _jobs_from_modal_json(stdout: str) -> list[JobRecord]:
     try:
         data = json.loads(stdout)
@@ -147,9 +173,9 @@ def _jobs_from_modal_json(stdout: str) -> list[JobRecord]:
     for row in rows:
         if not isinstance(row, dict):
             continue
-        name = row.get("name") or row.get("App Name") or row.get("Name") or ""
+        name = _display_name(row)
         state = row.get("state") or row.get("State") or ""
-        if not name.startswith("runplz-"):
+        if not name.startswith(APP_PREFIX):
             continue
         # Skip terminal states — we want running/active apps.
         if str(state).lower() in {"stopped", "finished", "terminated", "deleted"}:
@@ -178,10 +204,10 @@ def _jobs_from_modal_text(stdout: str) -> list[JobRecord]:
     """
     jobs = []
     for line in stdout.splitlines():
-        if "runplz-" not in line:
+        if APP_PREFIX not in line:
             continue
         parts = [p.strip() for p in re.split(r"\s{2,}|\|", line.strip()) if p.strip()]
-        name = next((p for p in parts if p.startswith("runplz-")), "")
+        name = next((p for p in parts if p.startswith(APP_PREFIX)), "")
         if not name:
             continue
         app_name, fn_name = _split_modal_app_name(name)
@@ -206,9 +232,9 @@ def _jobs_from_modal_text(stdout: str) -> list[JobRecord]:
 def _split_modal_app_name(name: str) -> tuple[str, str]:
     """Reverse of ``runplz-{app}-{function}``. Takes the final hyphen segment
     as the function name and everything before it as the app name."""
-    if not name.startswith("runplz-"):
+    if not name.startswith(APP_PREFIX):
         return ("", "")
-    core = name[len("runplz-") :]
+    core = name[len(APP_PREFIX) :]
     parts = core.split("-")
     if len(parts) < 2:
         return ("", "")
@@ -272,7 +298,7 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
         )
 
     entrypoint_src = _ENTRYPOINT_TEMPLATE.format(
-        app_name=f"runplz-{app.name}-{function.name}",
+        app_name=f"{APP_PREFIX}{app.name}-{function.name}",
         gpu=modal_gpu,
         cpu=function.min_cpu,
         memory=modal_memory,
