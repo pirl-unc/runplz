@@ -1,3 +1,59 @@
+## 2026-09-04 PR Plan — Preserve outputs when a run is cut short (#150)
+
+Branch: `fix/preserve-outputs-on-runtime-cap` (off `main` @ 4.2.0)
+
+- [x] Salvage outputs on the failure path without masking the original error
+- [x] Fetch and surface the failure tail when the run raised
+- [x] Keep the success path strict about a failed sync
+- [x] Bump `runplz/version.py` to 4.2.1
+- [x] `./format.sh`, `./lint.sh`, `./test.sh`
+- [ ] Review, merge, deploy
+
+### The bug
+
+`rsync_down` sat inside the `try` and after the runner, so any raising path
+skipped it. `max_runtime_seconds` -- documented as a kill-switch for a wedged
+job, which is exactly the case where partial output is the only evidence --
+therefore discarded everything the run had written. `exit_code` was also still
+None on that path, so the `finally` did not even fetch the failure tail, and
+on a provisioning backend `teardown()` then deleted the box.
+
+Found while implementing the #122 watchdog, whose terminate mode had to avoid
+copying this shape in order to meet its own "preserve outputs" requirement.
+
+### Design
+
+Collection moves into the `finally`, guarded by a `synced` flag:
+
+- success path keeps calling `rsync_down` inside the `try`, so a genuine sync
+  failure on a healthy run is still a hard error -- swallowing it would lose
+  outputs silently, which is the failure mode this issue is about;
+- the `finally` retries only when the success path did not run, and is
+  best-effort: an exception is already unwinding and must not be replaced by
+  an rsync error naming the wrong problem.
+
+Safe because everything inside that `try` happens after `rsync_up` proved the
+box reachable -- `prepare_remote_run`, `ensure_remote_rsync`, `rsync_up` and
+`check_preconditions` are all outside it.
+
+The failure-tail gate widens from `exit_code is not None and exit_code != 0`
+to include the raising path, and the tail is printed: the raised error is
+unchanged in type and message, so computing a tail and dropping it would be
+worse than not fetching one.
+
+### Also in this PR
+
+Two lessons from my own mistakes while building #122, recorded in
+`tasks/lessons.md` rather than left in a chat log: a scripted edit anchored on
+text that was not unique broke `ssh_common.py` mid-function, and a test fake
+raised `TimeoutExpired` for a call that had been handed `timeout=None`, which
+the real `subprocess.run` cannot do.
+
+Audited the suite's other `TimeoutExpired` fakes afterwards. Each raises on a
+call that genuinely carries a timeout, so they are faithful and nothing else
+needed changing -- reported rather than turned into busywork.
+
+
 ## 2026-09-03 PR Plan — Container fault injection (#141)
 
 Branch: `test/container-fault-injection` (off `main` @ 4.1.1)

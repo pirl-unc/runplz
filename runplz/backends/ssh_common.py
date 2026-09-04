@@ -3160,6 +3160,7 @@ def dispatch_to_target(
     container_name: Optional[str] = None
     exit_code: Optional[int] = None
     failure_tail = ""
+    synced = False
     try:
         if mode == "container":
             exit_code = run_container_mode(
@@ -3211,17 +3212,45 @@ def dispatch_to_target(
                 inactivity_action=inactivity_action,
                 ssh_opts=ssh_opts,
             )
+        # On the success path a failed sync is a real error: the run produced
+        # results and we could not collect them.
         rsync_down(target, host_out, remote_run=remote_run, ssh_opts=ssh_opts)
+        synced = True
     finally:
         # Grab the log tail before the container goes away — `docker rm`
         # wipes it, and a provisioning caller is about to delete the box.
-        if exit_code is not None and exit_code != 0:
+        if exit_code is None or exit_code != 0:
             failure_tail = fetch_failure_tail(
                 target=target,
                 container_name=container_name,
                 remote_run=remote_run,
                 ssh_opts=ssh_opts,
             )
+        if not synced:
+            # Something is already unwinding — a runtime cap, a stream error,
+            # a box reclaimed mid-run. Whatever the job managed to write is
+            # often the only evidence of what went wrong, and `max_runtime_seconds`
+            # exists precisely to salvage a wedged run (#150). Everything inside
+            # this `try` happens after rsync_up proved the box reachable, so a
+            # sync here is worth attempting.
+            #
+            # Best-effort on purpose: an exception is on its way out and must
+            # not be replaced by an rsync error naming the wrong problem.
+            try:
+                rsync_down(target, host_out, remote_run=remote_run, ssh_opts=ssh_opts)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"+ warning: could not collect outputs after failure: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+            if failure_tail:
+                print(
+                    f"--- last {FAILURE_TAIL_LINES} lines of remote output ---\n"
+                    f"{failure_tail}\n"
+                    f"--- end remote output ---",
+                    flush=True,
+                )
         if container_name is not None:
             try:
                 ssh_capture(

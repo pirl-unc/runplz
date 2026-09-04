@@ -52,3 +52,20 @@
 - A test that identifies a line of generated script by a keyword pins the wrong thing.
   Five tests found the spawn by grepping for `nohup`; when nohup became conditional they
   matched the probe instead. Identify it by what it does -- the script it launches.
+- A fake may only produce outcomes the real thing can produce. A `subprocess.run` stub that
+  raises `TimeoutExpired` regardless of the `timeout=` it was handed is describing an event
+  that cannot happen — `timeout=None` never expires — so the test it supports proves nothing
+  about the branch it claims to cover. When a fake and an assertion disagree, check which one
+  is lying before changing either; here the fake was, and fixing it exposed a real branch.
+  (Audited the other `TimeoutExpired` fakes afterwards: each raises on a call that genuinely
+  carries a timeout, so they are faithful.)
+- Anchor a scripted edit on text that is unique in the file, and prove the file still imports
+  before moving on. A `str.replace` of `driver_log = f"{remote_run.meta_shell}/run_driver.log"`
+  matched a second, unrelated site in a 3000-line module and produced a mid-function syntax
+  error. Lint caught it immediately, which is the point: run the check between edits, not at
+  the end of a batch, so the failure names the edit that caused it.
+- Where cleanup lives decides whether evidence survives. `rsync_down` sat inside the `try`
+  after the runner, so every raising path -- including the `max_runtime_seconds` kill-switch
+  whose entire purpose is salvaging a wedged run -- discarded the outputs. Put collection in
+  the `finally`, best-effort so it cannot replace the original exception, and keep the success
+  path strict so a genuine sync failure is still an error.
