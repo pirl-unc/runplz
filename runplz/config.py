@@ -269,6 +269,11 @@ class GcpConfig:
     # python venv natively (False). Same meaning as SshConfig.use_docker.
     use_docker: bool = True
     max_runtime_seconds: Optional[int] = None
+    # Application-progress watchdog, same semantics as BrevConfig/SshConfig.
+    # Disabled by default because build and download phases are legitimately
+    # quiet.
+    max_inactivity_seconds: Optional[int] = None
+    inactivity_action: str = "diagnose"
     ssh_ready_wait_seconds: int = 1800
     # Print every gcloud command instead of running it. Nothing is created,
     # nothing is billed — for checking what a config would actually do.
@@ -344,6 +349,9 @@ class AwsConfig:
     on_finish: str = "delete"
     use_docker: bool = True
     max_runtime_seconds: Optional[int] = None
+    # Same watchdog as the other three remote configs; see GcpConfig.
+    max_inactivity_seconds: Optional[int] = None
+    inactivity_action: str = "diagnose"
     ssh_ready_wait_seconds: int = 1800
     dry_run: bool = False
 

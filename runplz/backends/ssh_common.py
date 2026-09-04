@@ -2214,7 +2214,9 @@ def wait_for_detached_start(
 INACTIVITY_POLL_INTERVAL_S = 60
 
 
-def build_inactivity_probe(remote_run: RemoteRunContext) -> str:
+def build_inactivity_probe(
+    remote_run: RemoteRunContext, container_name: Optional[str] = None
+) -> str:
     """Shell that reports how long the *application* has been silent.
 
     Deliberately not the heartbeat. `runplz_heartbeat_loop` runs on a timer as
@@ -2227,6 +2229,14 @@ def build_inactivity_probe(remote_run: RemoteRunContext) -> str:
     checkpoint file updates its mtime — so this stays one cheap `stat` rather
     than a walk of a multi-gigabyte tree every minute.
 
+    ``container_name`` adds the third signal, for VM+docker mode (#153). That
+    path writes no driver log — the application's output goes to `docker logs`
+    — so without this leg the probe would watch only the outputs directory and
+    call a job that prints steadily but writes no files stalled. An empty
+    LogPath (a log driver other than `json-file`) stats to 0, which reads as
+    "never written" and loses the `max` to the outputs directory, so an unusual
+    driver degrades to the weaker signal rather than inventing a stall.
+
     Both timestamps and `now` come from the remote, so idle time is computed
     entirely in the box's own clock; skew against the laptop cannot invent a
     stall or hide one.
@@ -2238,6 +2248,15 @@ def build_inactivity_probe(remote_run: RemoteRunContext) -> str:
     # `printf '%s\\n' '---NAME---'` rather than `printf '---NAME---\\n'`:
     # a leading `--` is parsed as options by printf, which the section
     # markers are made entirely of.
+    docker_leg = ""
+    if container_name is not None:
+        quoted = shlex.quote(container_name)
+        docker_leg = (
+            "printf '%s\\n' '---DLOG---'; "
+            "runplz_mtime "
+            f"\"$(sudo docker inspect --format '{{{{.LogPath}}}}' {quoted} 2>/dev/null)\"; "
+            "printf '%s\\n' ''; "
+        )
     return (
         "runplz_mtime() { "
         'stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || printf 0; '
@@ -2247,6 +2266,7 @@ def build_inactivity_probe(remote_run: RemoteRunContext) -> str:
         f"runplz_mtime \"{driver_log}\"; printf '%s\\n' ''; "
         "printf '%s\\n' '---OUT---'; "
         f"runplz_mtime \"{outputs_shell}\"; printf '%s\\n' ''; "
+        f"{docker_leg}"
         "printf '%s\\n' '---END---'"
     )
 
@@ -2271,7 +2291,8 @@ def seconds_since_activity(probe_output: str) -> Optional[float]:
     now = _stamp("NOW")
     if now is None:
         return None
-    latest = max((t for t in (_stamp("LOG"), _stamp("OUT")) if t is not None), default=None)
+    legs = (_stamp("LOG"), _stamp("OUT"), _stamp("DLOG"))
+    latest = max((t for t in legs if t is not None), default=None)
     if latest is None:
         return None
     return max(0.0, float(now - latest))
@@ -2511,6 +2532,7 @@ def _check_inactivity(
     inactivity_action: str,
     *,
     already_reported: bool,
+    container_name: Optional[str] = None,
     ssh_opts: Optional[SshOptions] = None,
 ) -> tuple:
     """One watchdog tick. Returns ``(stalled_now, reported)``.
@@ -2519,12 +2541,19 @@ def _check_inactivity(
     trip, and terminating a healthy job over one would be a worse failure
     than the deadlock this exists to catch — so anything short of a
     confidently-measured silence leaves the run alone.
+
+    ``container_name`` is set in VM+docker mode, where the application's
+    output is the container's log rather than a driver log on the box.
     """
     if remote_run is None or max_inactivity_seconds is None:
         return False, already_reported
     try:
         idle = seconds_since_activity(
-            ssh_capture(target, build_inactivity_probe(remote_run), ssh_opts=ssh_opts)
+            ssh_capture(
+                target,
+                build_inactivity_probe(remote_run, container_name),
+                ssh_opts=ssh_opts,
+            )
         )
     except Exception as exc:  # noqa: BLE001
         print(f"+ warning: inactivity probe failed: {type(exc).__name__}: {exc}", flush=True)
@@ -2790,6 +2819,9 @@ def stream_and_wait(
     container_name: str,
     max_reconnects: int = 20,
     max_runtime_seconds: Optional[int] = None,
+    max_inactivity_seconds: Optional[int] = None,
+    inactivity_action: str = "diagnose",
+    remote_run: Optional[RemoteRunContext] = None,
     ssh_opts: Optional[SshOptions] = None,
 ) -> int:
     """Stream container logs and return its exit code.
@@ -2799,15 +2831,41 @@ def stream_and_wait(
     the exit code. Gives up after `max_reconnects` consecutive reconnect
     attempts. Wall-clock cap from `max_runtime_seconds` tracked across
     reconnects so a streaming job can't dodge it.
+
+    ``max_inactivity_seconds`` is the same opt-in application-silence
+    watchdog the detached monitor runs (#122), on the mode that is actually
+    the default — `use_docker=True` on ssh/gcp/aws all land here, and until
+    #153 this function did not take the parameter at all, so setting it did
+    nothing at all on a default config.
     """
     print(f"+ streaming logs from {container_name} (resilient to reconnects)", flush=True)
     started = time.monotonic()
+    watching = max_inactivity_seconds is not None and remote_run is not None
+    # Fires once per stall, re-armed when work resumes, so a job that is quiet
+    # for ten hours warns once rather than every poll interval.
+    stall_reported = False
 
-    def _remaining_s() -> Optional[float]:
+    def _runtime_remaining_s() -> Optional[float]:
         if max_runtime_seconds is None:
             return None
-        left = max_runtime_seconds - (time.monotonic() - started)
-        return max(1.0, left)
+        return max(1.0, max_runtime_seconds - (time.monotonic() - started))
+
+    def _remaining_s() -> Optional[float]:
+        bounds = []
+        runtime_left = _runtime_remaining_s()
+        if runtime_left is not None:
+            bounds.append(runtime_left)
+        if watching:
+            # `docker logs -f` blocks until the container ends, so without a
+            # bound there is no moment at which silence could be noticed. This
+            # is what wakes the loop; it is not a timeout on anything.
+            bounds.append(float(min(INACTIVITY_POLL_INTERVAL_S, max_inactivity_seconds)))
+        return min(bounds) if bounds else None
+
+    def _runtime_cap_reached() -> bool:
+        return (
+            max_runtime_seconds is not None and (time.monotonic() - started) >= max_runtime_seconds
+        )
 
     tail = "all"
     reconnects = 0
@@ -2819,15 +2877,53 @@ def stream_and_wait(
                 timeout=_remaining_s(),
             )
         except subprocess.TimeoutExpired:
-            raise_for_runtime_cap(
-                target, max_runtime_seconds, container_name=container_name, ssh_opts=ssh_opts
+            # Two things end the stream early, and they are not the same
+            # event. Only an exhausted runtime budget is the cap; otherwise
+            # this is the watchdog's own wake-up.
+            if _runtime_cap_reached() or not watching:
+                raise_for_runtime_cap(
+                    target,
+                    max_runtime_seconds,
+                    container_name=container_name,
+                    ssh_opts=ssh_opts,
+                    remote_run=remote_run,
+                )
+            if not container_running(target, container_name, ssh_opts=ssh_opts):
+                break
+            stalled, stall_reported = _check_inactivity(
+                target,
+                remote_run,
+                max_inactivity_seconds,
+                inactivity_action,
+                already_reported=stall_reported,
+                container_name=container_name,
+                ssh_opts=ssh_opts,
             )
+            if stalled and inactivity_action == "terminate":
+                # Deliberately not raise_for_runtime_cap's shape: that raises
+                # out of dispatch_to_target, and `docker rm -f` in its finally
+                # then takes the container's logs with it. Stopping the run and
+                # falling through to `docker wait` keeps the normal completion
+                # path — and the outputs sync — intact, matching the detached
+                # monitor.
+                break
+            # A watchdog tick is not a dropped connection. Falling through
+            # would spend one of `max_reconnects` per poll and silently kill
+            # the live log stream on any legitimately quiet job. Reattaching
+            # with `--tail 0` for the same reason a reconnect does: `all`
+            # would reprint the entire log every poll.
+            tail = "0"
+            continue
         running = container_running(target, container_name, ssh_opts=ssh_opts)
         if not running:
             break
         if max_runtime_seconds is not None and (time.monotonic() - started) >= max_runtime_seconds:
             raise_for_runtime_cap(
-                target, max_runtime_seconds, container_name=container_name, ssh_opts=ssh_opts
+                target,
+                max_runtime_seconds,
+                container_name=container_name,
+                ssh_opts=ssh_opts,
+                remote_run=remote_run,
             )
         reconnects += 1
         if reconnects > max_reconnects:
@@ -2852,11 +2948,19 @@ def stream_and_wait(
             ["ssh", *ssh_cmd_opts(ssh_opts), target, f"sudo docker wait {container_name}"],
             capture_output=True,
             text=True,
-            timeout=_remaining_s(),
+            # The runtime budget only. `_remaining_s()` is the min of that and
+            # the watchdog's poll interval, and there is nothing to poll here —
+            # using it would turn a 60s tick into a spurious cap raise on a
+            # container this call is merely waiting on.
+            timeout=_runtime_remaining_s(),
         )
     except subprocess.TimeoutExpired:
         raise_for_runtime_cap(
-            target, max_runtime_seconds, container_name=container_name, ssh_opts=ssh_opts
+            target,
+            max_runtime_seconds,
+            container_name=container_name,
+            ssh_opts=ssh_opts,
+            remote_run=remote_run,
         )
     try:
         return int(r.stdout.strip() or "1")
@@ -3196,6 +3300,9 @@ def dispatch_to_target(
                 target,
                 container_name,
                 max_runtime_seconds=max_runtime_seconds,
+                max_inactivity_seconds=max_inactivity_seconds,
+                inactivity_action=inactivity_action,
+                remote_run=remote_run,
                 ssh_opts=ssh_opts,
             )
         else:

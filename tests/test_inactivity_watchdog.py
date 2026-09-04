@@ -276,7 +276,272 @@ def test_the_config_reaches_the_monitor(config_cls):
         sc.run_native,
         sc.launch_detached_and_wait,
         sc.tail_and_wait_for_detached,
+        # Absent from this list until #153, which is exactly how the default
+        # configuration — `use_docker=True` on ssh/gcp/aws — ended up
+        # accepting the option and ignoring it.
+        sc.stream_and_wait,
     ):
         params = inspect.signature(fn).parameters
         assert "max_inactivity_seconds" in params, fn.__name__
         assert "inactivity_action" in params, fn.__name__
+
+
+# ---------------------------------------------------------------------------
+# VM + docker mode (#153)
+#
+# `use_docker` defaults to True on SshConfig, GcpConfig and AwsConfig, so this
+# is the mode almost every remote run actually takes. `stream_and_wait` did not
+# take the watchdog parameters at all, so setting `max_inactivity_seconds` on a
+# default config validated, was documented, reached `dispatch_to_target` — and
+# then did nothing.
+
+
+class _DockerRemote:
+    """A scriptable container host for `stream_and_wait`.
+
+    `running_calls` counts down the `container_running` answers, the way
+    `_Remote.alive_calls` does for the detached monitor.
+    """
+
+    def __init__(self, *, idle=0, running_calls=2, exit_code=0, clock=None):
+        self.idle = idle
+        self.running_calls = running_calls
+        self.exit_code = exit_code
+        self.clock = clock
+        self.commands = []
+        self.log_calls = 0
+        self.wait_timeouts = []
+
+    def run(self, argv, **kwargs):
+        cmd = argv[-1] if isinstance(argv, list) else str(argv)
+        self.commands.append(cmd)
+        if "docker logs" in cmd:
+            self.log_calls += 1
+            timeout = kwargs.get("timeout")
+            if timeout is None:
+                # An unbounded stream cannot time out. It ends only when the
+                # container exits or ssh drops, so returning is the only
+                # faithful answer a fake can give.
+                return mock.Mock(returncode=255, stdout="", stderr="")
+            # A bounded call that raises TimeoutExpired spent the whole
+            # timeout doing it. A fake that skips that cannot reach any
+            # expiry, which is the FakeClock gap this module's docstring is
+            # about — one tier up.
+            if self.clock is not None:
+                self.clock.sleep(timeout)
+            # A bounded stream is bounded *by the watchdog*: expiring is the
+            # wake-up, not a failure.
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        if "docker wait" in cmd:
+            self.wait_timeouts.append(kwargs.get("timeout"))
+            return mock.Mock(returncode=0, stdout=f"{self.exit_code}\n", stderr="")
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    def capture(self, target, cmd, **kwargs):
+        self.commands.append(cmd)
+        if "---NOW---" in cmd:
+            return f"---NOW---\n{self.idle}\n---LOG---\n0\n---OUT---\n0\n---DLOG---\n0\n---END---\n"
+        if "runplz_run_pids" in cmd:
+            return "---SUMMARY---\nalive_after=0\nsurvivors=\n---END---\n"
+        return ""
+
+    def running(self, *a, **kw):
+        self.running_calls -= 1
+        return self.running_calls > 0
+
+
+def _drive_docker(remote, *, max_inactivity_seconds, action="diagnose", **kw):
+    """Run `stream_and_wait` against a scripted container host."""
+    rr = _remote_run()
+    with (
+        mock.patch.object(sc.subprocess, "run", side_effect=remote.run),
+        mock.patch.object(sc, "ssh_capture", side_effect=remote.capture),
+        mock.patch.object(sc, "container_running", side_effect=remote.running),
+        mock.patch.object(sc, "_record_remote_event") as record,
+    ):
+        code = sc.stream_and_wait(
+            "box",
+            "runplz-train-abc123",
+            max_inactivity_seconds=max_inactivity_seconds,
+            inactivity_action=action,
+            remote_run=rr,
+            **kw,
+        )
+    return code, record
+
+
+def test_the_probe_watches_the_container_log_in_docker_mode():
+    """Docker mode writes no driver log — the application's output is the
+    container's log. Without this leg the probe sees only the outputs
+    directory, and a job that prints steadily but writes no files reads as
+    permanently silent."""
+    rr = _remote_run()
+    probe = sc.build_inactivity_probe(rr, "runplz-train-abc123")
+    assert "LogPath" in probe
+    assert "runplz-train-abc123" in probe
+    # Still not the heartbeat, which ticks on a timer whatever the job does.
+    assert "heartbeat" not in probe
+
+
+def test_the_docker_leg_is_absent_when_there_is_no_container():
+    """The detached and native paths have a real driver log; asking their box
+    about a container would be a wasted `docker inspect` per poll."""
+    assert "LogPath" not in sc.build_inactivity_probe(_remote_run())
+
+
+def test_a_container_that_is_printing_is_not_stalled():
+    """The fidelity requirement for #153. `---OUT---` is stale because the job
+    writes no files; the container log is fresh because it is printing. Taking
+    the outputs directory alone would terminate a healthy job."""
+    out = "---NOW---\n1000\n---LOG---\n0\n---OUT---\n100\n---DLOG---\n990\n---END---\n"
+    assert sc.seconds_since_activity(out) == 10.0
+
+
+def test_an_unusual_log_driver_falls_back_rather_than_inventing_a_stall():
+    """A non-`json-file` driver reports an empty LogPath, which stats to 0.
+    That must read as "never written" and lose to the outputs directory, not
+    drag the answer down to it."""
+    out = "---NOW---\n1000\n---LOG---\n0\n---OUT---\n950\n---DLOG---\n0\n---END---\n"
+    assert sc.seconds_since_activity(out) == 50.0
+
+
+def test_docker_mode_diagnose_records_the_stall_and_keeps_streaming(fast_clock):
+    remote = _DockerRemote(idle=3600, running_calls=4, exit_code=7)
+    code, record = _drive_docker(remote, max_inactivity_seconds=1800, action="diagnose")
+
+    stalls = [c for c in record.call_args_list if c.args[2] == "remote_command_stalled"]
+    assert len(stalls) == 1
+    assert stalls[0].kwargs["idle_seconds"] == 3600
+    assert stalls[0].kwargs["action"] == "diagnose"
+    # Kept streaming: the container still produced its own exit code, and
+    # nothing was killed.
+    assert code == 7
+    assert not [c for c in remote.commands if "runplz_run_pids" in c]
+
+
+def test_docker_mode_terminate_stops_the_run_and_still_returns(fast_clock):
+    """Returning rather than raising is what leaves `rsync_down` reachable in
+    `dispatch_to_target`. Raising would also lose the container's logs, which
+    the `finally` removes with `docker rm -f`."""
+    remote = _DockerRemote(idle=3600, running_calls=6, exit_code=137)
+    code, record = _drive_docker(remote, max_inactivity_seconds=1800, action="terminate")
+
+    stalls = [c for c in record.call_args_list if c.args[2] == "remote_command_stalled"]
+    assert stalls[0].kwargs["action"] == "terminate"
+    # Run-scoped kill, not a broad pkill — and `build_kill_command` signals the
+    # container too, since it is a child of dockerd rather than of the bootstrap.
+    kills = [c for c in remote.commands if "runplz_run_pids" in c]
+    assert kills, remote.commands
+    assert "docker kill --signal=" in kills[0]
+    assert code == 137
+
+
+def test_docker_watchdog_ticks_do_not_spend_the_reconnect_budget(fast_clock):
+    """A poll that counted as a reconnect would burn the budget on any
+    legitimately quiet job and silently drop the live log stream."""
+    remote = _DockerRemote(idle=10, running_calls=12)
+    _drive_docker(remote, max_inactivity_seconds=1800, max_reconnects=3)
+    assert remote.log_calls > 3, remote.log_calls
+
+
+def test_a_watchdog_tick_reattaches_without_reprinting_the_whole_log(fast_clock):
+    """`--tail all` on every poll would replay the entire log each minute."""
+    remote = _DockerRemote(idle=10, running_calls=6)
+    _drive_docker(remote, max_inactivity_seconds=1800)
+    logs = [c for c in remote.commands if "docker logs" in c]
+    assert "--tail all" in logs[0]
+    assert all("--tail 0" in c for c in logs[1:]), logs
+
+
+def test_docker_wait_is_bounded_by_the_cap_not_the_poll_interval(fast_clock):
+    """`docker wait` has nothing to poll for. Bounding it by the watchdog's
+    60s tick would raise a spurious runtime-cap error on a container this call
+    is merely waiting on."""
+    remote = _DockerRemote(idle=10, running_calls=1)
+    _drive_docker(remote, max_inactivity_seconds=60, max_runtime_seconds=86_400)
+    assert remote.wait_timeouts
+    assert remote.wait_timeouts[0] > sc.INACTIVITY_POLL_INTERVAL_S
+
+
+def test_the_runtime_cap_still_raises_with_the_watchdog_on(fast_clock):
+    """Two things end the stream early and they are not the same event. An
+    exhausted budget must still be the cap, not a watchdog tick."""
+    remote = _DockerRemote(idle=10, running_calls=99, clock=fast_clock)
+    with pytest.raises(RuntimeError, match="max_runtime_seconds=120"):
+        _drive_docker(remote, max_inactivity_seconds=1800, max_runtime_seconds=120)
+    # Reached by spending the budget one poll at a time, not on the first tick.
+    assert remote.log_calls > 1, remote.log_calls
+
+
+def test_the_watchdog_reaches_docker_mode_from_a_default_config(tmp_path):
+    """The regression test for #153 itself.
+
+    Every existing watchdog test drives the detached monitor, which is why a
+    silently-inert option on the *default* configuration went unnoticed. This
+    drives the real `ssh.run` — `SshConfig(use_docker=True)` — and asserts the
+    threshold arrives at the function that does the streaming.
+    """
+    from runplz import App, Image, SshConfig
+    from runplz.backends import ssh
+
+    cfg = SshConfig(max_inactivity_seconds=1800, inactivity_action="terminate")
+    app = App("demo", ssh_config=cfg)
+    app.repo_root = tmp_path
+
+    @app.function(image=Image.from_registry("ubuntu:22.04"))
+    def train():  # pragma: no cover
+        return "ok"
+
+    fn = app.functions["train"]
+    jobs = tmp_path / "jobs"
+    jobs.mkdir(parents=True, exist_ok=True)
+    (jobs / "job.py").write_text("# fake\n")
+    fn.module_file = str(jobs / "job.py")
+
+    seen = {}
+
+    def capture_stream(target, container_name, **kw):
+        seen.update(kw)
+        return 0
+
+    with mock.patch.multiple(
+        "runplz.backends.ssh_common",
+        ensure_remote_rsync=mock.DEFAULT,
+        wait_until_ssh_reachable=mock.DEFAULT,
+        prepare_remote_run=mock.DEFAULT,
+        ensure_docker=mock.DEFAULT,
+        rsync_up=mock.DEFAULT,
+        rsync_down=mock.DEFAULT,
+        remote_has_nvidia=mock.Mock(return_value=False),
+        build_image=mock.DEFAULT,
+        run_container_detached=mock.DEFAULT,
+        check_preconditions=mock.DEFAULT,
+        ssh_capture=mock.DEFAULT,
+        stream_and_wait=mock.Mock(side_effect=capture_stream),
+    ):
+        with (
+            mock.patch.object(ssh, "_warn_on_spec_mismatch"),
+            # ssh.py imports these by name, so patching them on ssh_common
+            # leaves its own references untouched.
+            mock.patch.object(ssh, "wait_until_ssh_reachable"),
+        ):
+            ssh.run(app, fn, [], {}, host="box")
+
+    assert seen.get("max_inactivity_seconds") == 1800
+    assert seen.get("inactivity_action") == "terminate"
+    # Without a run context the watchdog cannot probe or scope its kill.
+    assert seen.get("remote_run") is not None
+
+
+@pytest.mark.parametrize("config_cls", ["BrevConfig", "SshConfig", "GcpConfig", "AwsConfig"])
+def test_every_remote_config_declares_the_watchdog(config_cls):
+    """GcpConfig and AwsConfig did not, though `_validate_remote_common`
+    already validated the fields for them via `getattr` — so the four remote
+    configs disagreed about an option all four dispatch through."""
+    import dataclasses
+
+    import runplz
+
+    fields = {f.name for f in dataclasses.fields(getattr(runplz, config_cls))}
+    assert "max_inactivity_seconds" in fields
+    assert "inactivity_action" in fields

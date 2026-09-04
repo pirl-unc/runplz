@@ -1,3 +1,81 @@
+## 2026-09-04 PR Plan — Watchdog in docker mode (#153)
+
+Branch: `fix/watchdog-in-docker-mode` (off `main` @ 4.2.2)
+
+- [x] Give the probe a docker-log activity leg, so an actively-printing
+      container is never mistaken for a stalled one
+- [x] Thread `remote_run` + the watchdog params into `stream_and_wait`
+- [x] Keep the watchdog's wake-ups off the reconnect budget
+- [x] Terminate stops the run and returns, so outputs are still collected
+- [x] Declare the fields on `GcpConfig` / `AwsConfig` and thread them through
+- [x] Add `stream_and_wait` to the signature test that should have caught this
+- [x] Bump `runplz/version.py` to 4.3.0
+- [x] `./format.sh`, `./lint.sh`, `./test.sh`
+- [ ] Review, merge, deploy
+
+### The bug
+
+`use_docker` defaults to `True` on `SshConfig`, `GcpConfig` and `AwsConfig`,
+so all three dispatch with `mode="docker"`. That branch calls
+`stream_and_wait`, which never took the watchdog parameters -- only
+`run_container_mode` and `run_native` did. So `max_inactivity_seconds`
+validates, is documented, is threaded the whole way through dispatch, and
+then does nothing on the default configuration. No warning, no error.
+
+A watchdog that is believed but inert is worse than no watchdog: the operator
+who sets it stops watching manually.
+
+### Why "support" rather than "refuse"
+
+Both were open in #153. Refusing would leave a README-advertised option
+working only on brev container mode and the native path -- never on the
+default -- and this repo has spent 4.1.0 and #142/#143/#20 removing exactly
+that shape of limitation. The mechanics port cleanly: same reconnect shape,
+and `build_kill_command` already signals the container (it reads the
+container file `run_container_detached` writes), so terminate needs nothing
+new.
+
+### The part the issue missed
+
+`build_inactivity_probe` watches two things that move only when the
+application moves: `run_driver.log` and the outputs directory. **Docker mode
+writes no `run_driver.log`** -- the container's output goes to `docker logs`,
+and the detached driver log belongs to the native/container launcher.
+
+Wiring the watchdog in as-is would therefore leave only the outputs-dir leg,
+and a job that prints steadily but writes no files would be declared stalled
+and, under `terminate`, killed. That is a worse failure than the silent no-op
+being fixed, and it is the "fake faithfulness" FIDELITY.md just named: a
+probe that looks like it measures activity while measuring almost none of it.
+
+So the probe gains a third leg for docker mode -- the mtime of the container's
+own log file, via `docker inspect --format {{.LogPath}}`. An empty LogPath (a
+non-`json-file` log driver) stats to 0, which reads as "never written" and is
+dropped by the `max` over the legs, so an unusual log driver degrades to the
+outputs-dir signal rather than inventing a stall.
+
+### Two details in `stream_and_wait`
+
+- The final `docker wait` must be bounded by the *runtime* budget only. Reusing
+  the loop's bound -- which is the min of the cap and the poll interval -- would
+  turn a 60s watchdog tick into a spurious runtime-cap raise on a container the
+  loop is merely waiting on.
+- A watchdog wake-up reattaches with `--tail 0`, like a reconnect, but must not
+  spend a reconnect. Reattaching with `--tail all` would reprint the whole log
+  every poll; counting it as a reconnect would burn the budget and silently
+  drop the live stream on any legitimately quiet job.
+
+After the loop gives up the live stream, only the runtime cap applies -- the
+detached path already behaves that way, and the watchdog needs a stream to
+wake up from.
+
+### Why it was missed
+
+`test_the_config_reaches_the_monitor` walks a list of functions and asserts
+each takes the watchdog parameters. `stream_and_wait` was not in the list.
+It is now.
+
+
 ## 2026-09-04 PR Plan — Preserve outputs when a run is cut short (#150)
 
 Branch: `fix/preserve-outputs-on-runtime-cap` (off `main` @ 4.2.0)
