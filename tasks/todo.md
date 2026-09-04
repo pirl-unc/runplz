@@ -1,3 +1,62 @@
+## 2026-09-04 PR Plan — A lifecycle event for the runtime cap (#155)
+
+Branch: `feat/runtime-cap-lifecycle-event` (off `main` @ 4.3.0)
+
+- [x] Record `killed_by_runtime_cap` before raising, from what cleanup measured
+- [x] Leave the raised error unchanged in type and message
+- [x] Assert the event by observation, not by mocking the recorder
+- [x] Bump `runplz/version.py` to 4.3.1
+- [x] `./format.sh`, `./lint.sh`, `./test.sh`
+- [ ] Review, merge, deploy
+
+### The gap
+
+`raise_for_runtime_cap` killed the run and raised, but recorded nothing. Every
+neighbouring path already leaves a terminal event -- `bootstrap_launch_failed`,
+`killed_by_user`, `remote_command_stalled` -- so a capped run was the one stop
+reason `events.ndjson` could not explain. Its last entry was whatever the job
+wrote before it was killed, which reads like an abrupt crash.
+
+That matters more since #150: a capped run's outputs now survive, so the
+artefacts a user gets include the partial results with no record of why they
+are partial, and telling "hit the cap" from "crashed" needed the driver log
+rather than the event stream `runplz status` and `runplz tail` actually read.
+
+### What the event carries
+
+The cleanup `raise_for_runtime_cap` already runs was throwing away its own
+answer. `build_kill_command` emits a SUMMARY block -- final process state,
+survivors, container state -- and the function captured it only to discard it.
+So `process_state` is measured, not guessed.
+
+`docker kill` and the `pkill` fallback report nothing, so on those paths the
+field is *absent* rather than filled with an assumption about what the signal
+probably did; the docker path names the container it stopped instead.
+
+`_record_remote_event` drops None fields and warns rather than raising, so it
+cannot mask the cap error on its way out -- pinned by a test that breaks the
+event write and asserts the RuntimeError is unchanged.
+
+### Also in this PR
+
+`_parse_kv_block` moved from `runs.py` to `ssh_common.parse_kv_block`. Both
+the `kill` CLI and the cap path read the same SUMMARY block, and the command
+that emits it is built in `ssh_common`, so that is where its parser belongs --
+`runs.py` already imports from there. Not deduped: `runs._parse_status_sections`
+is still a copy of `ssh_common.parse_probe_sections`; filed rather than folded
+in, since nothing here needed a second section parser.
+
+### Deliberately not in this PR
+
+In docker mode the cap stops the container with a bare `docker kill`, which is
+an immediate SIGKILL. Now that `stream_and_wait` carries a `remote_run` (#153),
+`build_kill_command` could stop it instead -- TERM first, then escalate, and it
+signals the container anyway via the container file. That would give the job a
+chance to flush partial output, which is the thing #150 was about, and would
+make the event uniform across modes. It changes what the cap does, not what it
+records, so it is its own issue.
+
+
 ## 2026-09-04 PR Plan — Watchdog in docker mode (#153)
 
 Branch: `fix/watchdog-in-docker-mode` (off `main` @ 4.2.2)
