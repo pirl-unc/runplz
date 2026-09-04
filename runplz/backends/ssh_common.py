@@ -101,6 +101,7 @@ __all__ = [
     "ssh_cmd_opts",
     "run_local",
     "parse_probe_sections",
+    "parse_kv_block",
     "container_running",
     "raise_for_runtime_cap",
     "render_image_ops_script",
@@ -1044,6 +1045,21 @@ def parse_probe_sections(stdout: str) -> dict[str, str]:
     if current and current != "END":
         sections[current] = "\n".join(buf).strip()
     return sections
+
+
+def parse_kv_block(block: str) -> dict[str, str]:
+    """`key=value` lines from one section of a remote report into a dict.
+
+    Lives here rather than in `runs.py` because both the `kill` CLI and
+    `raise_for_runtime_cap` read the same SUMMARY block `build_kill_command`
+    emits, and that command is built here.
+    """
+    out: dict[str, str] = {}
+    for line in (block or "").splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            out[key.strip()] = value.strip()
+    return out
 
 
 def _first_int(text: Optional[str]) -> Optional[int]:
@@ -3081,6 +3097,14 @@ def raise_for_runtime_cap(
 
     Best-effort cleanup: if the kill ssh hangs or fails, still raise — the
     on_finish action in the caller's finally block will nuke the box anyway.
+
+    Records ``killed_by_runtime_cap`` before raising (#155). Without it the
+    event stream ended at whatever the job last wrote, so a capped run was
+    indistinguishable from a crash — and since #150 the outputs of a capped
+    run survive, meaning a user gets the partial results with no record of why
+    they are partial. Every neighbouring path already records its own terminal
+    event: ``bootstrap_launch_failed``, ``killed_by_user``,
+    ``remote_command_stalled``.
     """
     if container_name is not None:
         cleanup = f"sudo docker kill {container_name}"
@@ -3092,16 +3116,32 @@ def raise_for_runtime_cap(
         )
     else:
         cleanup = "pkill -f 'runplz._bootstrap' || true"
+    cleanup_out = ""
     try:
-        subprocess.run(
+        completed = subprocess.run(
             ["ssh", *ssh_cmd_opts(ssh_opts), target, cleanup],
             check=False,
             capture_output=True,
             text=True,
             timeout=30,
         )
+        cleanup_out = completed.stdout or ""
     except Exception:  # noqa: BLE001
         pass
+    # `build_kill_command` reports what it actually stopped; `docker kill` and
+    # the pkill fallback report nothing, so the field is simply absent there
+    # rather than guessed. `_record_remote_event` drops None values and warns
+    # instead of raising, so it cannot mask the cap error on its way out.
+    summary = parse_kv_block(parse_probe_sections(cleanup_out).get("SUMMARY", ""))
+    _record_remote_event(
+        target,
+        remote_run,
+        "killed_by_runtime_cap",
+        ssh_opts=ssh_opts,
+        threshold_seconds=int(cap_s) if isinstance(cap_s, (int, float)) else None,
+        process_state=summary.get("final") or None,
+        container=container_name,
+    )
     raise RuntimeError(
         f"Remote run exceeded max_runtime_seconds={cap_s}; "
         f"issued remote cleanup ({cleanup!r}). "

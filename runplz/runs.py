@@ -42,6 +42,7 @@ from runplz.backends.ssh_common import (
     SshOptions,
     build_kill_command,
     is_safe_run_id,
+    parse_kv_block,
     read_local_ssh_options,
     remote_shell_path,
     ssh_cmd_opts,
@@ -268,21 +269,12 @@ def kill(
         if r.stdout.strip():
             print(r.stdout.strip()[:500], file=sys.stderr)
         return 2
-    fields = _parse_kv_block(sections["SUMMARY"])
+    fields = parse_kv_block(sections["SUMMARY"])
     print(_format_kill(target=target, run_id=run_id, fields=fields, sections=sections))
     # Survivors mean the kill failed. Exiting 0 here would let
     # `runplz kill && runplz brev job.py` start a second job on a GPU the
     # first one still holds.
     return KILL_SURVIVED_RC if fields.get("alive_after") == "1" else 0
-
-
-def _parse_kv_block(block: str) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for line in block.splitlines():
-        if "=" in line:
-            key, _, value = line.partition("=")
-            out[key.strip()] = value.strip()
-    return out
 
 
 def _format_kill(

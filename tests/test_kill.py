@@ -203,7 +203,7 @@ class _FakeBox:
         r = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=180)
         assert r.returncode == 0, r.stderr
         sections = runs._parse_status_sections(r.stdout)
-        return runs._parse_kv_block(sections.get("SUMMARY", ""))
+        return ssh_common.parse_kv_block(sections.get("SUMMARY", ""))
 
     def cleanup(self):
         self._stop.set()
@@ -697,34 +697,150 @@ if sys.platform == "win32":  # pragma: no cover - runplz targets POSIX hosts
 # runtime cap cleanup is scoped to the run
 
 
+class _CapRemote:
+    """Collects every remote command the cap path issues.
+
+    The cap now sends two: the cleanup, then the lifecycle event (#155). A
+    fake that kept only the last one would silently start asserting against
+    the wrong command.
+    """
+
+    def __init__(self, summary=""):
+        self.summary = summary
+        self.commands = []
+
+    def run(self, cmd, **kwargs):
+        remote = cmd[-1] if isinstance(cmd, list) else str(cmd)
+        self.commands.append(remote)
+        stdout = self.summary if "runplz_run_pids" in remote else ""
+        return mock.Mock(returncode=0, stdout=stdout, stderr="")
+
+    # The event goes out through `ssh_exec`, which wraps its payload in
+    # `bash -lc`; the cleanup is sent as a bare remote command. Splitting on
+    # that rather than on "events.ndjson", which `build_kill_command` also
+    # names — it appends `killed_by_user` from inside the same script.
+    @staticmethod
+    def _is_event(command):
+        return command.startswith("bash -lc ")
+
+    @property
+    def cleanup(self):
+        """The stop command."""
+        return next(c for c in self.commands if not self._is_event(c))
+
+    @property
+    def events(self):
+        """Every lifecycle event this path recorded, as runplz wrote it.
+
+        Parsed back out of the real remote command rather than read off a
+        mock, so a payload that is not valid JSON fails here.
+        """
+        out = []
+        for command in self.commands:
+            if not self._is_event(command):
+                continue
+            start = command.find('{"')
+            if start == -1:
+                continue
+            out.append(json.loads(command[start : command.rindex("}") + 1]))
+        return out
+
+
 def test_runtime_cap_stops_only_this_run_when_the_context_is_known():
     """`pkill -f runplz._bootstrap` would take a co-tenant run down too."""
     remote_run = ssh_common.make_remote_run_context(
         backend="ssh", target="box", function_name="train"
     )
-    sent = {}
+    remote = _CapRemote()
 
-    def fake_run(cmd, **kwargs):
-        sent["cmd"] = cmd
-        return mock.Mock(returncode=0, stdout="", stderr="")
-
-    with mock.patch.object(ssh_common.subprocess, "run", fake_run):
+    with mock.patch.object(ssh_common.subprocess, "run", remote.run):
         with pytest.raises(RuntimeError):
             ssh_common.raise_for_runtime_cap("box", 60, container_name=None, remote_run=remote_run)
-    remote_cmd = sent["cmd"][-1]
-    assert "pkill" not in remote_cmd
-    assert f"{ssh_common.RUN_ID_ENV_VAR}=$runplz_run_id" in remote_cmd
-    assert remote_run.run_id in remote_cmd
+    assert "pkill" not in remote.cleanup
+    assert f"{ssh_common.RUN_ID_ENV_VAR}=$runplz_run_id" in remote.cleanup
+    assert remote_run.run_id in remote.cleanup
 
 
 def test_runtime_cap_falls_back_to_pkill_without_a_run_context():
-    sent = {}
+    remote = _CapRemote()
 
-    def fake_run(cmd, **kwargs):
-        sent["cmd"] = cmd
-        return mock.Mock(returncode=0, stdout="", stderr="")
-
-    with mock.patch.object(ssh_common.subprocess, "run", fake_run):
+    with mock.patch.object(ssh_common.subprocess, "run", remote.run):
         with pytest.raises(RuntimeError):
             ssh_common.raise_for_runtime_cap("box", 60, container_name=None)
-    assert "pkill" in sent["cmd"][-1]
+    assert "pkill" in remote.cleanup
+
+
+# -- the cap leaves a lifecycle event (#155) ------------------------------
+#
+# Every neighbouring path already records one -- `bootstrap_launch_failed`,
+# `killed_by_user`, `remote_command_stalled`. The cap recorded nothing, so
+# `events.ndjson` ended at whatever the job last wrote and a capped run read
+# like an abrupt crash. Since #150 a capped run's outputs survive, so the
+# artefacts included the partial results with no record of why they stop.
+
+
+def test_a_capped_run_records_a_terminal_event_naming_the_cap():
+    remote_run = ssh_common.make_remote_run_context(
+        backend="ssh", target="box", function_name="train"
+    )
+    remote = _CapRemote(summary=_summary(final="dead", alive_after="0"))
+
+    with mock.patch.object(ssh_common.subprocess, "run", remote.run):
+        with pytest.raises(RuntimeError):
+            ssh_common.raise_for_runtime_cap("box", 900, container_name=None, remote_run=remote_run)
+
+    events = [e for e in remote.events if e["event"] == "killed_by_runtime_cap"]
+    assert len(events) == 1, remote.commands
+    assert events[0]["run_id"] == remote_run.run_id
+    assert events[0]["threshold_seconds"] == 900
+    # `build_kill_command` measured this; it is not a guess about what the
+    # signal probably did.
+    assert events[0]["process_state"] == "dead"
+
+
+def test_the_docker_path_records_the_cap_without_inventing_a_process_state():
+    """`docker kill` reports nothing, so the field is absent rather than
+    guessed. The container it stopped is named instead."""
+    remote_run = ssh_common.make_remote_run_context(
+        backend="ssh", target="box", function_name="train"
+    )
+    remote = _CapRemote()
+
+    with mock.patch.object(ssh_common.subprocess, "run", remote.run):
+        with pytest.raises(RuntimeError):
+            ssh_common.raise_for_runtime_cap(
+                "box", 60, container_name="runplz-train-abc123", remote_run=remote_run
+            )
+
+    event = next(e for e in remote.events if e["event"] == "killed_by_runtime_cap")
+    assert "process_state" not in event
+    assert event["container"] == "runplz-train-abc123"
+
+
+def test_the_cap_error_is_unchanged_by_a_failed_event_write():
+    """The event is a remote record, not the local error. `_record_remote_event`
+    warns rather than raising precisely so it cannot mask the cap."""
+    remote_run = ssh_common.make_remote_run_context(
+        backend="ssh", target="box", function_name="train"
+    )
+
+    def explode(cmd, **kwargs):
+        remote = cmd[-1] if isinstance(cmd, list) else str(cmd)
+        if "events.ndjson" in remote:
+            raise OSError("ssh died before the event landed")
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch.object(ssh_common.subprocess, "run", explode):
+        with pytest.raises(RuntimeError, match="max_runtime_seconds=60"):
+            ssh_common.raise_for_runtime_cap("box", 60, container_name=None, remote_run=remote_run)
+
+
+def test_no_run_context_means_no_event_rather_than_an_unattributed_one():
+    """Without a run there is no events file to append to, and an event with
+    no run_id would be worse than none."""
+    remote = _CapRemote()
+
+    with mock.patch.object(ssh_common.subprocess, "run", remote.run):
+        with pytest.raises(RuntimeError):
+            ssh_common.raise_for_runtime_cap("box", 60, container_name=None)
+    assert remote.events == []
