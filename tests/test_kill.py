@@ -2,6 +2,7 @@
 
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -194,13 +195,74 @@ class _FakeBox:
         (entry / "environ").write_bytes(env.encode())
         return p
 
+    def fake_container(self, name: str, *, honours_term: bool = True) -> Path:
+        """Install `sudo` and `docker` stubs modelling one running container.
+
+        The kill script's only handle on a docker-mode run is
+        `docker kill --signal=...`, so asserting that TERM comes before KILL
+        needs a docker that actually answers. State lives in files, like the
+        cloud CLI stubs: `docker inspect` reads it, `docker kill` writes it.
+
+        `honours_term=False` is a job that traps TERM, which is what forces
+        the escalation the timeout exists for.
+        """
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        state = self.root / "container.state"
+        state.write_text("running")
+        signals = self.root / "container.signals"
+        signals.write_text("")
+
+        # `sudo` is not installed on every CI image and would prompt anyway;
+        # the script only ever uses it as a prefix, so run the rest.
+        (bin_dir / "sudo").write_text('#!/bin/sh\nexec "$@"\n')
+        (bin_dir / "docker").write_text(
+            "#!/bin/sh\n"
+            f'STATE="{state}"\n'
+            f'SIGNALS="{signals}"\n'
+            f'NAME="{name}"\n'
+            'case "$1" in\n'
+            "  inspect)\n"
+            # Only this container exists; anything else is absent, so a script
+            # that signalled the wrong name would not see it running.
+            '    [ "$4" = "$NAME" ] || exit 1\n'
+            '    if [ "$(cat "$STATE")" = "running" ]; then echo true; '
+            "else echo false; fi\n"
+            "    ;;\n"
+            "  kill)\n"
+            '    [ "$3" = "$NAME" ] || exit 1\n'
+            '    sig=$(printf %s "$2" | sed "s/--signal=//")\n'
+            '    printf "%s\\n" "$sig" >> "$SIGNALS"\n'
+            f'    if [ "$sig" = "KILL" ] || [ "{int(honours_term)}" = "1" ]; then\n'
+            '      echo stopped > "$STATE"\n'
+            "    fi\n"
+            "    ;;\n"
+            "esac\n"
+            "exit 0\n"
+        )
+        for stub in ("sudo", "docker"):
+            path = bin_dir / stub
+            path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        self.bin_dir = bin_dir
+        return signals
+
+    def signals_sent(self) -> list[str]:
+        path = self.root / "container.signals"
+        return [line for line in path.read_text().split() if line]
+
     def run_kill(self, **kwargs) -> dict[str, str]:
         kwargs.setdefault("run_id", RUN_ID)
         kwargs.setdefault("timeout_s", 3)
         kwargs.setdefault("proc_root", str(self.proc))
         script = self.root / "kill.sh"
         script.write_text(ssh_common.build_kill_command(str(self.meta), **kwargs))
-        r = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=180)
+        env = dict(os.environ)
+        bin_dir = getattr(self, "bin_dir", None)
+        if bin_dir is not None:
+            env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+        r = subprocess.run(
+            ["bash", str(script)], capture_output=True, text=True, timeout=180, env=env
+        )
         assert r.returncode == 0, r.stderr
         sections = runs._parse_status_sections(r.stdout)
         return ssh_common.parse_kv_block(sections.get("SUMMARY", ""))
@@ -798,9 +860,32 @@ def test_a_capped_run_records_a_terminal_event_naming_the_cap():
     assert events[0]["process_state"] == "dead"
 
 
-def test_the_docker_path_records_the_cap_without_inventing_a_process_state():
-    """`docker kill` reports nothing, so the field is absent rather than
-    guessed. The container it stopped is named instead."""
+def test_the_docker_path_reports_the_container_not_an_invented_process_state():
+    """Docker mode has no bootstrap pid -- the job's processes are in the
+    container's namespace -- and the script reports "missing" for a pid that
+    was never there. Recording that would read as a process that vanished, so
+    the container's own state is what the event carries."""
+    remote_run = ssh_common.make_remote_run_context(
+        backend="ssh", target="box", function_name="train"
+    )
+    remote = _CapRemote(summary=_summary(pid="", final="missing", container_state="stopped"))
+
+    with mock.patch.object(ssh_common.subprocess, "run", remote.run):
+        with pytest.raises(RuntimeError):
+            ssh_common.raise_for_runtime_cap(
+                "box", 60, container_name="runplz-train-abc123", remote_run=remote_run
+            )
+
+    event = next(e for e in remote.events if e["event"] == "killed_by_runtime_cap")
+    assert "process_state" not in event
+    assert event["container"] == "runplz-train-abc123"
+    assert event["container_state"] == "stopped"
+
+
+def test_the_cap_stops_a_container_gracefully_rather_than_sigkilling_it():
+    """#158. `docker kill` is an immediate SIGKILL, and it was the *first*
+    branch -- so the default configuration was the one that stopped least
+    gracefully, on the path where partial output is the only evidence."""
     remote_run = ssh_common.make_remote_run_context(
         backend="ssh", target="box", function_name="train"
     )
@@ -812,9 +897,42 @@ def test_the_docker_path_records_the_cap_without_inventing_a_process_state():
                 "box", 60, container_name="runplz-train-abc123", remote_run=remote_run
             )
 
-    event = next(e for e in remote.events if e["event"] == "killed_by_runtime_cap")
-    assert "process_state" not in event
-    assert event["container"] == "runplz-train-abc123"
+    cleanup = remote.cleanup
+    assert 'sudo docker kill --signal="$1"' in cleanup
+    assert 'runplz_signal "TERM"' in cleanup
+    assert "sudo docker kill runplz-train-abc123" not in cleanup
+    # The name the orchestrator started, not only whatever the file says.
+    assert 'runplz_container="runplz-train-abc123"' in cleanup
+
+
+def test_the_cap_does_not_record_that_a_user_killed_the_run():
+    """The script's own event would contradict `killed_by_runtime_cap`."""
+    remote_run = ssh_common.make_remote_run_context(
+        backend="ssh", target="box", function_name="train"
+    )
+    remote = _CapRemote()
+
+    with mock.patch.object(ssh_common.subprocess, "run", remote.run):
+        with pytest.raises(RuntimeError):
+            ssh_common.raise_for_runtime_cap(
+                "box", 60, container_name="runplz-train-abc123", remote_run=remote_run
+            )
+
+    assert "killed_by_user" not in remote.cleanup
+    assert [e["event"] for e in remote.events] == ["killed_by_runtime_cap"]
+
+
+def test_the_cap_still_docker_kills_when_there_is_no_run_to_scope_to():
+    """Without a run context there is no meta dir to read, no run id to scan
+    for, and no events file to append to -- but the container name is still in
+    hand, and a paid container must not be left running."""
+    remote = _CapRemote()
+
+    with mock.patch.object(ssh_common.subprocess, "run", remote.run):
+        with pytest.raises(RuntimeError):
+            ssh_common.raise_for_runtime_cap("box", 60, container_name="runplz-train-abc123")
+
+    assert remote.cleanup == "sudo docker kill runplz-train-abc123"
 
 
 def test_the_cap_error_is_unchanged_by_a_failed_event_write():
@@ -844,3 +962,94 @@ def test_no_run_context_means_no_event_rather_than_an_unattributed_one():
         with pytest.raises(RuntimeError):
             ssh_common.raise_for_runtime_cap("box", 60, container_name=None)
     assert remote.events == []
+
+
+# -- the cap and the watchdog stop a container gracefully (#158) -----------
+#
+# `raise_for_runtime_cap` branched on shape, and the docker branch came first:
+# a bare `docker kill`, which is an immediate SIGKILL. The other branch sends
+# TERM and escalates only if the job does not go. So the mode that is the
+# default for ssh/gcp/aws was the one that stopped least gracefully, on the
+# exact path the cap exists for -- a wedged job whose partial output is the
+# only evidence of what went wrong.
+
+
+def test_a_container_is_asked_to_stop_before_it_is_killed(box):
+    """The point of #158. TERM first, so the job can flush what it has."""
+    box.fake_container("runplz-train-abc123", honours_term=True)
+    fields = box.run_kill(container="runplz-train-abc123")
+
+    assert box.signals_sent() == ["TERM"]
+    assert fields["escalated"] == "0"
+    assert fields["alive_after"] == "0"
+    assert fields["container_state"] == "stopped"
+
+
+def test_a_container_that_ignores_term_is_still_killed(box):
+    """Graceful is not optional-to-comply-with: the cap is still a hard stop,
+    it just is not an instant one."""
+    box.fake_container("runplz-train-abc123", honours_term=False)
+    fields = box.run_kill(container="runplz-train-abc123", timeout_s=1)
+
+    assert box.signals_sent() == ["TERM", "KILL"]
+    assert fields["escalated"] == "1"
+    assert fields["alive_after"] == "0"
+
+
+def test_the_caller_s_container_name_is_used_without_the_file(box):
+    """In docker mode the container is the run's only handle -- its processes
+    live in the container's PID namespace, so the marker scan finds none and
+    no bootstrap.pid is written. The orchestrator holds the name in memory;
+    depending on the file instead would trade a guarantee for tidiness."""
+    box.fake_container("runplz-train-abc123")
+    assert not (box.meta / ssh_common.CONTAINER_FILENAME).exists()
+
+    fields = box.run_kill(container="runplz-train-abc123")
+    assert fields["container"] == "runplz-train-abc123"
+    assert box.signals_sent() == ["TERM"]
+
+
+def test_the_container_file_is_still_read_when_the_caller_does_not_say(box):
+    """`runplz kill` learns the name no other way."""
+    box.fake_container("runplz-train-abc123")
+    (box.meta / ssh_common.CONTAINER_FILENAME).write_text("runplz-train-abc123\n")
+
+    fields = box.run_kill()
+    assert fields["container"] == "runplz-train-abc123"
+    assert box.signals_sent() == ["TERM"]
+
+
+# -- the script no longer claims a user did it (#158) ---------------------
+#
+# `build_kill_command` appended `killed_by_user` whenever it signalled, and it
+# is not only used by `runplz kill`: the runtime cap's native branch and the
+# watchdog's terminate both used it, so a capped run and a stalled run each
+# recorded that a person killed them. Nobody did. Unifying the cap onto this
+# script without fixing that would have spread the false attribution to docker
+# mode, next to the truthful `killed_by_runtime_cap` #155 had just added.
+
+
+def test_the_script_records_nothing_when_the_caller_owns_the_event(box):
+    box.spawn(RUN_ID)
+    fields = box.run_kill(event=None)
+    assert fields["signalled"] == "1"
+    assert not (box.meta / "events.ndjson").exists()
+
+
+def test_runplz_kill_still_records_killed_by_user(box):
+    """The default is the CLI's, and it must not drift while the other callers
+    opt out."""
+    box.spawn(RUN_ID)
+    box.run_kill()
+    event = json.loads((box.meta / "events.ndjson").read_text().strip())
+    assert event["event"] == "killed_by_user"
+
+
+def test_a_lifecycle_event_name_cannot_break_out_of_the_shell():
+    with pytest.raises(ValueError, match="lifecycle event name"):
+        ssh_common.build_kill_command("$HOME/m", event='x","cmd":"$(id)')
+
+
+def test_a_container_name_cannot_break_out_of_the_shell():
+    with pytest.raises(ValueError, match="container name"):
+        ssh_common.build_kill_command("$HOME/m", container='c"; id; :"')

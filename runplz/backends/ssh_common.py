@@ -1893,6 +1893,25 @@ def remote_shell_path(path: str) -> str:
     return validate_remote_path(path, what="remote path from the run manifest")
 
 
+def _kill_event_shell(event: Optional[str], *, meta: str, run_id: str, events_file: str) -> str:
+    """The event append, or nothing when the caller records its own.
+
+    Empty rather than a no-op branch: a caller that passes ``event=None`` has
+    its own terminal event, and a second one saying something else happened
+    would be worse than silence.
+    """
+    if event is None:
+        return ""
+    return (
+        'if [ "$runplz_signalled" = "1" ]; then\n'
+        f'  mkdir -p "{meta}" 2>/dev/null || true\n'
+        f'  printf \'{{"ts":"%s","run_id":"%s","event":"{event}","escalated":%s}}\\n\' \\\n'
+        f'    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "{run_id}" "$runplz_escalated" \\\n'
+        f'    >> "{events_file}" 2>/dev/null || true\n'
+        "fi"
+    )
+
+
 def build_kill_command(
     meta: str,
     *,
@@ -1901,6 +1920,8 @@ def build_kill_command(
     escalate: bool = True,
     first_signal: str = "TERM",
     proc_root: str = "/proc",
+    container: str = "",
+    event: Optional[str] = "killed_by_user",
 ) -> str:
     """Build the remote shell that stops one detached run in a single hop.
 
@@ -1917,7 +1938,18 @@ def build_kill_command(
     process and can be recycled by PID wraparound.
 
     The container in VM+docker mode is signalled separately: it is a child of
-    dockerd, so it is in neither the marker set nor the pid's descendants.
+    dockerd, so it is in neither the marker set nor the pid's descendants. It
+    is also the *only* handle on such a run -- the job's processes live in the
+    container's PID namespace, so the host marker scan finds none of them and
+    no ``bootstrap.pid`` is written. ``container`` lets a caller that already
+    knows the name say so rather than depend on the file; `runplz kill` learns
+    it no other way and keeps reading it.
+
+    ``event`` is the lifecycle event recorded when this script actually
+    signals something. It defaults to ``killed_by_user`` for the CLI, but the
+    runtime cap and the inactivity watchdog also stop runs, and recording that
+    a user did it would be false (#158). They pass ``None`` and record their
+    own, with fields the shell does not have.
 
     Every value interpolated here is validated first -- the meta path in
     particular arrives from a manifest rsynced off the remote box.
@@ -1930,6 +1962,11 @@ def build_kill_command(
     meta = validate_remote_path(meta, what="meta path")
     proc_root = validate_remote_path(proc_root, what="proc root").rstrip("/")
     validate_run_id(run_id)
+    # Same character class, same reason: it lands in a double-quoted shell
+    # word, where `$(...)` and backticks still run.
+    validate_run_id(container, what="container name")
+    if event is not None:
+        validate_run_id(event, what="lifecycle event name")
     if first_signal not in _KILL_SIGNALS:
         raise ValueError(f"unsupported signal {first_signal!r}; expected one of {_KILL_SIGNALS}")
     timeout_s = int(timeout_s)
@@ -1945,9 +1982,15 @@ def build_kill_command(
     return f"""\
 runplz_run_id='{run_id}'
 runplz_pid=""
-runplz_container=""
+# A caller that started the container knows its name; only fall back to the
+# file when it did not say. In docker mode this is the run's only handle --
+# its processes are in the container's PID namespace, so the marker scan
+# below cannot see them.
+runplz_container="{container}"
 if [ -r "{pid_file}" ]; then IFS= read -r runplz_pid < "{pid_file}" || true; fi
-if [ -r "{container_file}" ]; then IFS= read -r runplz_container < "{container_file}" || true; fi
+if [ -z "$runplz_container" ] && [ -r "{container_file}" ]; then
+  IFS= read -r runplz_container < "{container_file}" || true
+fi
 
 # Numeric comparison, not a string case: "0000001" is pid 1 to kill(1), and
 # `kill -TERM 0` signals every process in our own group -- i.e. this script.
@@ -2060,12 +2103,7 @@ if runplz_container_running; then runplz_container_state=running; \
 elif [ -n "$runplz_container" ]; then runplz_container_state=stopped; \
 else runplz_container_state=none; fi
 
-if [ "$runplz_signalled" = "1" ]; then
-  mkdir -p "{meta}" 2>/dev/null || true
-  printf '{{"ts":"%s","run_id":"%s","event":"killed_by_user","escalated":%s}}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "{run_id}" "$runplz_escalated" \
-    >> "{events_file}" 2>/dev/null || true
-fi
+{_kill_event_shell(event, meta=meta, run_id=run_id, events_file=events_file)}
 
 runplz_gpu=""
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -2609,7 +2647,7 @@ def _check_inactivity(
 
     if inactivity_action == "terminate":
         print(f"+ inactivity_action=terminate: stopping run {remote_run.run_id}", flush=True)
-        _terminate_stalled_run(target, remote_run, ssh_opts=ssh_opts)
+        _terminate_stalled_run(target, remote_run, container_name=container_name, ssh_opts=ssh_opts)
     else:
         print("+ inactivity_action=diagnose: leaving the run alone", flush=True)
     return True, True
@@ -2619,6 +2657,7 @@ def _terminate_stalled_run(
     target: str,
     remote_run: RemoteRunContext,
     *,
+    container_name: Optional[str] = None,
     ssh_opts: Optional[SshOptions] = None,
 ) -> None:
     """Stop exactly this run, and report what it actually stopped.
@@ -2627,8 +2666,18 @@ def _terminate_stalled_run(
     block — including gpu_mem_used — which `raise_for_runtime_cap` captures and
     then throws away. Printing it costs nothing and is precisely the evidence
     an operator needs about a stall.
+
+    The stall is already recorded as `remote_command_stalled` with
+    `action="terminate"`, so the script records nothing: its own
+    `killed_by_user` would say a person did this (#158).
     """
-    cleanup = build_kill_command(remote_run.meta_shell, run_id=remote_run.run_id, timeout_s=5)
+    cleanup = build_kill_command(
+        remote_run.meta_shell,
+        run_id=remote_run.run_id,
+        timeout_s=5,
+        container=container_name or "",
+        event=None,
+    )
     try:
         summary = ssh_capture(target, cleanup, ssh_opts=ssh_opts)
     except Exception as exc:  # noqa: BLE001
@@ -3087,13 +3136,22 @@ def raise_for_runtime_cap(
 ):
     """Shared timeout-path cleanup + raise for issue #16.
 
-    container_name: set for VM+docker mode (kill the container with docker kill);
-    None for container-mode / native.
+    container_name: set for VM+docker mode; None for container-mode / native.
 
-    When the run context is known, stop exactly this run's processes via
-    :func:`build_kill_command`. The fallback -- ``pkill -f runplz._bootstrap``
-    -- matches on a cmdline substring, so on a box running two jobs it takes
-    the innocent one down too; it is only used when we have no run to scope to.
+    When the run context is known, stop exactly this run via
+    :func:`build_kill_command` — TERM, then KILL if it does not go — whatever
+    the mode. The fallback -- ``pkill -f runplz._bootstrap`` -- matches on a
+    cmdline substring, so on a box running two jobs it takes the innocent one
+    down too; it is only used when we have no run to scope to.
+
+    Docker mode used to take a `docker kill` branch ahead of that, which is an
+    immediate SIGKILL, so the default configuration was the one that stopped
+    least gracefully — on the exact path the cap exists for, where the job's
+    partial output is the only evidence of what went wrong (#158). That branch
+    existed because `stream_and_wait` had no run context to scope a kill to;
+    #153 gave it one. The container name is still passed through, because in
+    docker mode it is the run's only handle: the job's processes are in the
+    container's PID namespace, invisible to the marker scan.
 
     Best-effort cleanup: if the kill ssh hangs or fails, still raise — the
     on_finish action in the caller's finally block will nuke the box anyway.
@@ -3106,14 +3164,19 @@ def raise_for_runtime_cap(
     event: ``bootstrap_launch_failed``, ``killed_by_user``,
     ``remote_command_stalled``.
     """
-    if container_name is not None:
-        cleanup = f"sudo docker kill {container_name}"
-    elif remote_run is not None:
+    if remote_run is not None:
         cleanup = build_kill_command(
             remote_run.meta_shell,
             run_id=remote_run.run_id,
             timeout_s=5,
+            container=container_name or "",
+            # This is not a user kill. The script's own event would contradict
+            # the `killed_by_runtime_cap` recorded below, which carries the
+            # threshold and the measured state the shell does not have.
+            event=None,
         )
+    elif container_name is not None:
+        cleanup = f"sudo docker kill {container_name}"
     else:
         cleanup = "pkill -f 'runplz._bootstrap' || true"
     cleanup_out = ""
@@ -3128,19 +3191,26 @@ def raise_for_runtime_cap(
         cleanup_out = completed.stdout or ""
     except Exception:  # noqa: BLE001
         pass
-    # `build_kill_command` reports what it actually stopped; `docker kill` and
-    # the pkill fallback report nothing, so the field is simply absent there
-    # rather than guessed. `_record_remote_event` drops None values and warns
-    # instead of raising, so it cannot mask the cap error on its way out.
+    # `build_kill_command` reports what it actually stopped; the `pkill`
+    # fallback reports nothing, so the fields are simply absent there rather
+    # than guessed. `_record_remote_event` drops None values and warns instead
+    # of raising, so it cannot mask the cap error on its way out.
     summary = parse_kv_block(parse_probe_sections(cleanup_out).get("SUMMARY", ""))
+    # `final` is the state of the recorded bootstrap pid. Docker mode has none
+    # — the job's processes are in the container's namespace — and the script
+    # reports "missing" for a pid that was never there, which would read as a
+    # process that vanished. The container's own state is the true one there.
+    process_state = summary.get("final") if summary.get("pid") else None
+    container_state = summary.get("container_state")
     _record_remote_event(
         target,
         remote_run,
         "killed_by_runtime_cap",
         ssh_opts=ssh_opts,
         threshold_seconds=int(cap_s) if isinstance(cap_s, (int, float)) else None,
-        process_state=summary.get("final") or None,
+        process_state=process_state or None,
         container=container_name,
+        container_state=container_state if container_state not in (None, "", "none") else None,
     )
     raise RuntimeError(
         f"Remote run exceeded max_runtime_seconds={cap_s}; "

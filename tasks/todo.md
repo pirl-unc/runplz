@@ -1,3 +1,73 @@
+## 2026-09-04 PR Plan — Stop the container gracefully on the cap (#158)
+
+Branch: `fix/graceful-container-stop-on-cap` (off `main` @ 4.3.2)
+
+- [x] `build_kill_command` takes the container name instead of only reading it
+- [x] `build_kill_command` takes the event it records, instead of always
+      claiming a user did it
+- [x] The cap uses one stop path whenever the run context is known
+- [x] The watchdog's terminate stops claiming `killed_by_user` too
+- [x] Bump `runplz/version.py` to 4.4.0
+- [x] `./format.sh`, `./lint.sh`, `./test.sh`
+- [ ] Review, merge, deploy
+
+### The bug
+
+`raise_for_runtime_cap` branches on shape, and the docker branch comes first:
+
+    if container_name is not None:   cleanup = f"sudo docker kill {container_name}"
+    elif remote_run is not None:     cleanup = build_kill_command(...)
+    else:                            cleanup = "pkill -f 'runplz._bootstrap'"
+
+`docker kill` defaults to **SIGKILL**. The job gets no chance to flush a
+partial checkpoint or close a writer. The other branch sends TERM, waits 5s,
+and only then escalates. So the mode that is the default for ssh/gcp/aws is
+the one that stops least gracefully -- on the exact path `max_runtime_seconds`
+exists for, which is a wedged job whose partial output is the only evidence of
+what went wrong. #150 made those outputs survive collection; this makes there
+be more of them to collect.
+
+The special case existed because `stream_and_wait` had no run context to scope
+a kill to. #153 gave it one.
+
+### The second bug, which blocks the first
+
+`build_kill_command` unconditionally appends `killed_by_user` when it signals.
+It is not only used by `runplz kill`: `raise_for_runtime_cap`'s native branch
+and the watchdog's `_terminate_stalled_run` both use it, so a capped run and a
+stalled run each already record that a user killed them. Nobody did.
+
+Unifying the cap onto `build_kill_command` without fixing that would spread
+the false attribution to docker mode as well -- and #155 has just added a
+truthful `killed_by_runtime_cap` beside it, so the stream would carry both a
+correct event and a contradictory one.
+
+So the recorded event becomes a parameter. `runplz kill` keeps
+`killed_by_user`; the cap and the watchdog pass `event=None` and record their
+own, which they already do, with fields the shell does not have
+(`threshold_seconds`, `idle_seconds`).
+
+### Why the container name is passed, not just read
+
+In docker mode the run's processes live in the container's PID namespace, so
+the host `/proc` marker scan finds nothing, and `run_container_detached`
+writes no `bootstrap.pid`. The script's only handle on the run is
+`{meta}/container`.
+
+Reading that file is fine today -- the same shell that starts the container
+writes it, under `set -euo pipefail`. But the orchestrator already holds the
+name in memory, and `docker kill <name>` could not miss. Preserving that
+exactly means passing the name rather than trading a guarantee for elegance:
+an explicit container wins, and the file remains the fallback for `runplz
+kill`, which learns the name no other way.
+
+### What `max_runtime_seconds` now promises
+
+Still a hard stop, no longer an instant one: TERM, then KILL after 5s. Worth
+saying in the README, since "kills the remote container/process" now takes up
+to the escalation budget.
+
+
 ## 2026-09-04 PR Plan — Fake cloud CLIs validate option values (#154)
 
 Branch: `test/fake-cloud-value-validation` (off `main` @ 4.3.1)
