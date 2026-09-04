@@ -1,3 +1,59 @@
+## 2026-09-04 PR Plan — Fake cloud CLIs validate option values (#154)
+
+Branch: `test/fake-cloud-value-validation` (off `main` @ 4.3.1)
+
+- [x] Declare per-option value specs beside the existing per-route vocabularies
+- [x] Machine/instance types and accelerators from the live catalogues
+- [x] Numeric and enumerated options
+- [x] Reject before any state mutation, like the missing-option check
+- [x] Update hand-written argv that used a shape runplz never generates
+- [x] Bump `runplz/version.py` to 4.3.2
+- [x] `./format.sh`, `./lint.sh`, `./test.sh`
+- [ ] Review, merge, deploy
+
+### The gap
+
+`tests/fake_cloud.py` validated option *names* and never option *values*, so
+both of these exited 0:
+
+    gcloud compute instances create x ... --machine-type=totally-invented-9000
+    aws ec2 run-instances ... --count abc
+
+The module's own docstring names the bug class it exists to catch -- "invented
+machine types, retry strings written from memory" -- so the harness still
+could not catch the first of the two failures it was built for.
+
+### Why a syntactic check would not have worked
+
+The obvious cheap fix is a shape check: machine types look like
+`family-class-number` on GCP and `family.size` on AWS. But #154's own example,
+`totally-invented-9000`, is *exactly* that shape. A grammar check passes it.
+
+Only membership in runplz's own catalogue rejects it -- which is also the
+check that catches the thing actually worth catching, a catalogue entry that
+stops existing upstream.
+
+### The asymmetry, stated rather than hidden
+
+That makes the stubs deliberately stricter than the real CLIs: `aws` sells
+`t3.micro` and this one refuses it, because the vocabulary is "what runplz
+generates", not "what the provider offers". Recorded in the module docstring,
+because it is a trap otherwise -- a future test exercising a user's
+`instance_type=` override has to extend `_option_values`, and that should be a
+deliberate act.
+
+Five tests hand-wrote `--instance-type t3.micro` in argv that was otherwise
+pretending to be runplz's. They now use `m6i.large`, which runplz does
+generate. The sixth use stays: it is a cross-CLI *name* rejection test whose
+value is never reached.
+
+### Not done
+
+`--image-id` / `--instance-ids` have obvious vocabularies (`ami-`, `i-`)
+but are not in #154's three categories and no bug motivates them, so they are
+left alone rather than folded in.
+
+
 ## 2026-09-04 PR Plan — A lifecycle event for the runtime cap (#155)
 
 Branch: `feat/runtime-cap-lifecycle-event` (off `main` @ 4.3.0)
