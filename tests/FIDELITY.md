@@ -30,3 +30,18 @@ vendor tools because their executables are created inside `sandbox_bin`.
 The fake CLI logs every invocation. Use `fake_cloud.assert_observed(...)` (and
 an exact `count` for retries) so a test cannot pass after the production path
 silently stops invoking the command it claims to exercise.
+
+A fake may only produce outcomes the real call can produce. Simulating an
+impossible one makes the test pass without exercising the branch it names, and
+that is indistinguishable from coverage. Two that have actually bitten:
+
+- Raising `subprocess.TimeoutExpired` regardless of the `timeout=` the fake was
+  handed. `timeout=None` never expires, so a fake that raises anyway invents an
+  event the branch under test can never see.
+- Returning a nonzero `returncode` for a command production runs with
+  `check=True`. Real `subprocess.run` raises `CalledProcessError` there, so the
+  fake skips the error handling the test claims to cover.
+
+When a fake and an assertion disagree, work out which one is lying before
+changing either. Fixing the fake is usually what exposes the real branch;
+loosening the assertion only hides it.
