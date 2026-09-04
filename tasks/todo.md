@@ -1948,14 +1948,47 @@ Implemented; verification is recorded in the final review below.
 - [ ] Open, review, merge, and deploy a versioned PR if the change is validated.
 # Issue #122 — Detached inactivity watchdog
 
-- [ ] Add opt-in `max_inactivity_seconds` and `inactivity_action` to SSH/Brev
-      configuration with validation; default disabled.
-- [ ] Thread the options through dispatch and detached/container monitoring.
-- [ ] Use heartbeat/progress timestamps (not stdout silence alone), bounded
+- [x] Add opt-in `max_inactivity_seconds` and `inactivity_action` to SSH/Brev
+      configuration with validation; default disabled. *(landed earlier in
+      #124 — the fields and validation existed, nothing read them.)*
+- [x] Thread the options through dispatch and detached/container monitoring.
+- [x] Use heartbeat/progress timestamps (not stdout silence alone), bounded
       diagnostics, and exact-run termination when requested.
-- [ ] Add tests for healthy silence, diagnose, terminate, reconnect, and output
+- [x] Add tests for healthy silence, diagnose, terminate, reconnect, and output
       preservation; verify event and command observation.
-- [ ] Run format, lint, full tests, review, merge, and deploy as its own PR.
+- [x] Run format, lint, full tests (1197 passing, 95.30%).
+- [ ] Review, merge, and deploy as its own PR.
+
+### Notes from implementing it
+
+**The heartbeat is not a progress signal.** `runplz_heartbeat_loop` runs on a
+timer as a background job of the wrapper shell, independent of the user's
+command, so it keeps ticking while the job is wedged. It proves the process
+exists — which is exactly the signal that failed in the reported incident. The
+watchdog reads the driver log and the outputs directory instead, both of which
+move only when the application moves.
+
+**Where the wake-up came from.** `tail_and_wait_for_detached` blocks in
+`tail -F` with `timeout=None` unless a runtime cap is set, so there was no
+moment at which silence could be noticed. The watchdog bounds that timeout;
+a `TimeoutExpired` is then either the cap or a watchdog tick, told apart by
+whether the runtime budget is actually spent.
+
+**The reconnect trap.** `reconnects` is cumulative for the run and capped at
+20, so a tick that fell through to `reconnects += 1` would burn the budget on
+any legitimately quiet job and silently drop its live log stream. Ticks
+`continue` before that line. Mutation-checked: removing the `continue` fails
+three tests.
+
+**Terminate cannot raise.** `rsync_down` sits inside the `try` and before the
+`finally` in `dispatch_to_target`, so `raise_for_runtime_cap` skips the
+outputs sync entirely — a capped run loses what it produced. The watchdog
+stops the run and returns normally instead, leaving the completion path and
+the sync intact. Worth filing that the runtime cap has this bug.
+
+**Free diagnostics.** `build_kill_command` already emits a bounded SUMMARY /
+HEARTBEAT / LOGTAIL block including `gpu_mem_used`, which
+`raise_for_runtime_cap` captures and discards. Terminate mode prints it.
 # PR 0 — Test-fidelity audit
 - [ ] Add shared command-observation assertions to every subprocess fake.
 - [ ] Add mutation probes for each failure scenario and document exercised runtime layers.
