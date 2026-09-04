@@ -2384,7 +2384,7 @@ at the tail or assert a cleanup action before it has been observed.
 - [x] Regression tests drive production ordering and failure edges, including malformed/missing
       cleanup summaries, without weakening existing success/failure semantics.
 - [x] Bump the patch version, run `./format.sh`, `./lint.sh`, and `./test.sh`, and review the diff.
-- [ ] Push and open a PR that closes issue #163.
+- [x] Push and open PR #164, closing issue #163.
 
 ### Implementation notes
 
