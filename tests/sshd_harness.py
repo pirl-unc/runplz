@@ -227,14 +227,20 @@ class DockerSshd:
         from testcontainers.core.container import DockerContainer
         from testcontainers.core.image import DockerImage
 
-        _keygen(self.identity)
-        context = self.root / "ctx"
-        context.mkdir(parents=True, exist_ok=True)
-        (context / "Dockerfile").write_text(DOCKERFILE)
-        (context / "authorized_keys").write_bytes((self.root / "id.pub").read_bytes())
-        self.identity.chmod(0o600)
-
         if self._container is None:
+            # Guarded like LocalSshd.start: `ssh-keygen -f <existing>` prompts
+            # before overwriting, and with no tty that is a non-zero exit — so
+            # an unguarded keygen turns the second start() into a hard failure.
+            # Only reachable now that fault tests restore the daemon by calling
+            # start() again.
+            if not self.identity.exists():
+                _keygen(self.identity)
+            context = self.root / "ctx"
+            context.mkdir(parents=True, exist_ok=True)
+            (context / "Dockerfile").write_text(DOCKERFILE)
+            (context / "authorized_keys").write_bytes((self.root / "id.pub").read_bytes())
+            self.identity.chmod(0o600)
+
             self._image = DockerImage(path=str(context), tag="runplz-e2e-sshd:test").build()
             self._container = DockerContainer(str(self._image)).with_exposed_ports(22).start()
             self.host = self._container.get_container_host_ip()
