@@ -394,7 +394,7 @@ All fields are validated at construction time — an invalid config raises
 | `use_docker`             | `True`  | VM-mode only. `False` skips docker and installs a native venv on the box. Legacy escape hatch for providers where container mode isn't available. |
 | `on_finish`              | `"stop"` | What runplz does to the Brev box when the App exits (success **or** failure). `"stop"` → `brev stop` (disk cached, small ongoing charge). `"delete"` → `brev delete` (zero ongoing cost, cold rebuild). `"leave"` → never touch the box (opt-in for interactive dev workflows). |
 | `max_runtime_seconds`    | `None`  | Wall-clock kill-switch. When set, runplz kills the remote container/process and raises `RuntimeError` after this many seconds so a wedged job can't keep billing forever. `None` = unlimited.                                                                       |
-| `max_inactivity_seconds` | `None`  | Opt-in watchdog on *application silence*, independent of `max_runtime_seconds`. When set, runplz checks how long it has been since the job last wrote to its driver log or outputs dir; past this many seconds it records a `remote_command_stalled` event and captures bounded diagnostics (this run's processes and their states, including zombies, plus `nvidia-smi`). Deliberately not the heartbeat — that ticks on a timer and proves only that the process exists. `None` = no watchdog. |
+| `max_inactivity_seconds` | `None`  | Opt-in watchdog on *application silence*, independent of `max_runtime_seconds`. When set, runplz checks how long it has been since the job last produced output — its driver log, its container's log in docker mode, or its outputs dir; past this many seconds it records a `remote_command_stalled` event and captures bounded diagnostics (this run's processes and their states, including zombies, plus `nvidia-smi`). Deliberately not the heartbeat — that ticks on a timer and proves only that the process exists. `None` = no watchdog. |
 | `inactivity_action`      | `"diagnose"` | What to do on expiry. `"diagnose"` warns once per stall and keeps monitoring; `"terminate"` stops exactly this run. Outputs are synced back either way. |
 | `ssh_ready_wait_seconds` | `1800` (30 min) | How long to wait for the freshly-provisioned Brev box to become SSH-reachable. Default covers 8×A100/H100 cold boots on Denvr / OCI (15-18 min in practice). Bump for slower provider / shape combos. |
 | `instance_type_fallback_count` | `3` | When auto-picking, how many ranked candidate types to pass to `brev create` for transparent fallback (Brev's CLI tries them in order if A fails on Nebius, B on OCI, etc.). Set to 1 for single-type behavior. Ignored when `instance_type=` is pinned. |
@@ -429,7 +429,7 @@ native), and rsyncs outputs back.
 | `use_docker`             | `True`  | Build + `docker run` the image on the remote. `False` = native venv install (mirrors `BrevConfig(mode="vm", use_docker=False)`). |
 | `on_finish`              | `"leave"` | Pinned to `"leave"`; runplz doesn't touch the lifecycle of a user-owned box. Setting `"stop"` / `"delete"` raises at config construction. |
 | `max_runtime_seconds`    | `None`  | Wall-clock kill-switch — same semantics as `BrevConfig.max_runtime_seconds`.                                                     |
-| `max_inactivity_seconds` | `None`  | Opt-in watchdog on *application silence*, independent of `max_runtime_seconds`. When set, runplz checks how long it has been since the job last wrote to its driver log or outputs dir; past this many seconds it records a `remote_command_stalled` event and captures bounded diagnostics (this run's processes and their states, including zombies, plus `nvidia-smi`). Deliberately not the heartbeat — that ticks on a timer and proves only that the process exists. `None` = no watchdog. |
+| `max_inactivity_seconds` | `None`  | Opt-in watchdog on *application silence*, independent of `max_runtime_seconds`. When set, runplz checks how long it has been since the job last produced output — its driver log, its container's log in docker mode, or its outputs dir; past this many seconds it records a `remote_command_stalled` event and captures bounded diagnostics (this run's processes and their states, including zombies, plus `nvidia-smi`). Deliberately not the heartbeat — that ticks on a timer and proves only that the process exists. `None` = no watchdog. |
 | `inactivity_action`      | `"diagnose"` | What to do on expiry. `"diagnose"` warns once per stall and keeps monitoring; `"terminate"` stops exactly this run. Outputs are synced back either way. |
 | `ssh_ready_wait_seconds` | `1800` (30 min) | How long to wait for the SSH box to become reachable before giving up. Mostly useful when the user is booting the box just before the runplz invocation. |
 
@@ -498,6 +498,8 @@ and you can ssh to a `on_finish="leave"` box yourself afterwards.
 | `network`, `subnet` | project default | pinned, never created — runplz opens no firewall rules |
 | `spot` | `False` | cheaper, reclaimable. No retry-on-reclaim yet |
 | `on_finish` | `"delete"` | `"stop"` / `"leave"` also valid |
+| `max_runtime_seconds` | `None` | wall-clock kill-switch, same semantics as `BrevConfig.max_runtime_seconds` |
+| `max_inactivity_seconds`, `inactivity_action` | `None`, `"diagnose"` | application-silence watchdog, same semantics as `BrevConfig` |
 | `dry_run` | `False` | print every gcloud command, execute none |
 
 ### AwsConfig
@@ -534,6 +536,8 @@ runplz, or the run will sit in the ssh wait until it times out.
 | `volume_gb` | `Function.min_disk` | always sent with `DeleteOnTermination`, so `on_finish="delete"` takes the disk too |
 | `spot` | `False` | cheaper, reclaimable. No retry-on-reclaim yet |
 | `on_finish` | `"delete"` | `"stop"` / `"leave"` also valid |
+| `max_runtime_seconds` | `None` | wall-clock kill-switch, same semantics as `BrevConfig.max_runtime_seconds` |
+| `max_inactivity_seconds`, `inactivity_action` | `None`, `"diagnose"` | application-silence watchdog, same semantics as `BrevConfig` |
 | `dry_run` | `False` | print every aws command, execute none |
 
 Both drivers shell out to the vendor CLI rather than an SDK: it keeps
