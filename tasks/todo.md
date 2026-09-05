@@ -2350,3 +2350,113 @@ HEARTBEAT / LOGTAIL block including `gpu_mem_used`, which
 # PR 0 follow-up — runtime-layer fidelity documentation
 - [ ] Document test harness layers and mutation-probe interpretation.
 - [ ] Run format, lint, tests, review, merge, and deploy.
+
+## 2026-09-04 — Truthful remote lifecycle status
+
+### Problem statement
+
+`runplz status` currently renders the literal tail of `events.ndjson`. Output salvage always
+appends `rsync_down_start` after the run's outcome, so the user cannot see
+`killed_by_runtime_cap`, `remote_command_stalled`, or even a normal `remote_command_exit`.
+The sync phase also has no completion/failure event, making a finished download
+indistinguishable from a hung one. Several earlier failure paths likewise leave a progress event
+at the tail or assert a cleanup action before it has been observed.
+
+### Behavioral contract
+
+- [x] `status` reports the latest non-output-sync lifecycle event as `last event`, preserving
+      already-shipped terminal events even though salvage runs later, and reports the latest
+      output-sync event separately.
+- [x] `rsync_down` records start, done, and failed outcomes. Failure recording is best-effort and
+      never replaces the original transfer error.
+- [x] A hard precondition failure records `precondition_failed` and enters the existing salvage
+      path so the remote manifest/event stream is copied locally and `status` can resolve it.
+- [x] A remote image-build failure records `build_image_failed`; a `docker run -d` failure records
+      `container_launch_failed`. Both preserve the original exception.
+- [x] An orchestrator termination signal reaching an active dispatch records
+      `orchestrator_signalled` after container cleanup, so a monitor-written SIGKILL
+      `remote_command_exit` cannot misreport the causal outcome.
+- [x] Watchdog termination records `action="terminate"` only after the cleanup summary confirms a
+      signal was sent and nothing survived; no-op, failed, and incomplete cleanup get truthful
+      action values in `remote_command_stalled`.
+- [x] Runtime-cap cleanup records `killed_by_runtime_cap` only when the cleanup summary confirms
+      something was stopped; a last-second natural exit does not get a false kill event.
+- [x] Regression tests drive production ordering and failure edges, including malformed/missing
+      cleanup summaries, without weakening existing success/failure semantics.
+- [x] Bump the patch version, run `./format.sh`, `./lint.sh`, and `./test.sh`, and review the diff.
+- [x] Push and open PR #164, closing issue #163.
+
+### Implementation notes
+
+Keep event writes best-effort: lifecycle reporting must not mask the operational exception it is
+describing. Do not require `jq` or another remote dependency for `status`; use the existing
+newline-delimited JSON shape and POSIX tools already assumed by the CLI. Keep the scope in the
+backend-agnostic SSH dispatch/event machinery and CLI status rendering.
+
+### Review
+
+Implemented causal status selection without adding a remote dependency: one probe retrieves the
+small non-heartbeat event stream, then Python separates output-sync events and applies typed event
+semantics. Operator/runtime control events take precedence over the secondary
+`remote_command_exit` they can cause only when the event's measured outcome warrants it. Phase
+failures preserve their original exceptions, transport ambiguity is named `*_unconfirmed`, and
+signal exceptions pass through best-effort reporting instead of being swallowed.
+
+Verification: `./format.sh`, `./lint.sh`, and `./test.sh` pass; 1278 tests passed, 1 platform test
+skipped, and total coverage is 95.07%.
+
+### Review follow-up — durable, evidence-based outcomes across backends
+
+- [x] Record `orchestrator_signalled` before salvage so Brev, GCP, and AWS deletion cannot erase
+      the only copy; retain causal precedence over a later cleanup-induced remote exit.
+- [x] Give the direct SSH backend the same signal translation used by provisioned backends, while
+      keeping user-owned-host teardown semantics unchanged.
+- [x] Treat every `runtime_cap_reached` result as causal: confirmed no-op, failed stop, and
+      unconfirmed cleanup all still explain why orchestration ended.
+- [x] Make user kill events carry measured completion state; emit a distinct attempt event for
+      survivors and never let legacy/unconfirmed kills permanently override a later natural exit.
+- [x] Render start-only output-sync history as `completion unknown`, including pre-4.4.3 streams
+      and interrupted transfers.
+- [x] Add regression coverage for persistent and ephemeral dispatch, all four SSH-derived
+      backends, current/legacy kill records, cap cleanup outcomes, and sync history.
+- [x] Re-run `./format.sh`, `./lint.sh`, and `./test.sh`; update PR #164 and confirm CI.
+
+### Review follow-up results
+
+Signal events are now appended before failure salvage, so the final transfer persists them before
+an ephemeral host is deleted; direct SSH installs the same signal translator without adding host
+teardown. Runtime caps remain causal even when cleanup is unconfirmed, while watchdog and user
+kills override later exits only with explicit no-survivor evidence. A failed `--no-escalate` kill
+is named `kill_attempted_by_user`, and old fieldless kill/stall records yield to a later exit.
+Start-only sync records now say `started (completion unknown)`.
+
+Verification: `./format.sh`, `./lint.sh`, and `./test.sh` pass; 1290 tests passed, 1 platform test
+skipped, and total coverage is 95.14%. PR #164 is updated and its lint, Python 3.10–3.12, and
+container end-to-end checks all pass.
+
+### Second review follow-up — cancellation and locally durable sync outcomes
+
+#### Specification
+
+- [x] Make `OrchestratorKilled` bypass every ordinary `except Exception` boundary by construction,
+      while retaining the explicit dispatch catch that records the signal and the outer lifecycle
+      `finally` that tears provisioned hosts down.
+- [x] Record `rsync_down_done` and `rsync_down_failed` directly in the local downloaded metadata as
+      well as remotely; local reporting is best-effort and must never replace a transfer error.
+- [x] Treat non-string `event` fields as malformed/non-authoritative without performing a set
+      lookup, so arrays, objects, and other externally edited values cannot crash status.
+- [x] Add regressions through the existing broad catches, successful and failed transfer paths,
+      ephemeral-survival semantics, and malformed event objects.
+- [x] Run `./format.sh`, `./lint.sh`, and `./test.sh`; push PR #164 and confirm every CI job.
+
+#### Review
+
+`OrchestratorKilled` now inherits directly from `BaseException`, so routine best-effort
+`except Exception` blocks cannot turn operator cancellation into continued staging or launch.
+Successful and failed output transfers append their terminal outcome to the local surviving event
+stream as well as the remote live stream; a local reporting error remains a warning and cannot
+replace the transfer exception. Status validates event-name types before selection and rendering,
+so externally edited arrays/objects remain reportable rather than crashing set lookup.
+
+Local verification: `./format.sh`, `./lint.sh`, and `./test.sh` pass; 1293 tests passed, 1 platform
+test skipped, and total coverage is 95.14%.

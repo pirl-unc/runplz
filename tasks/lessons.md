@@ -69,3 +69,20 @@
   whose entire purpose is salvaging a wedged run -- discarded the outputs. Put collection in
   the `finally`, best-effort so it cannot replace the original exception, and keep the success
   path strict so a genuine sync failure is still an error.
+- A remote lifecycle event is not durable evidence when teardown deletes the remote. Record every
+  causal outcome before the final salvage transfer, then let semantic status selection handle any
+  lower-level exit event appended afterward. Ordering for display and ordering for persistence are
+  separate concerns.
+- An attempted action is not an outcome. Only prioritize `killed`/`terminated` events when measured
+  cleanup state confirms no survivors; failed and legacy-unconfirmed attempts must yield to a later
+  natural exit. Likewise, a start event without a matching finish proves only "completion unknown,"
+  never that the operation is still active.
+- A control-flow sentinel implemented as an ordinary `Exception` is only as reliable as the weakest
+  broad catch in its call tree. Signal cancellation must bypass routine best-effort handlers by
+  construction; do not depend on auditing every present and future `except Exception` boundary.
+- A remote event written after a download is not part of the downloaded evidence. For terminal
+  transfer outcomes, write the local surviving stream explicitly as well as the remote live stream;
+  otherwise ephemeral teardown makes every successful transfer look start-only forever.
+- Tolerating malformed JSON means validating field types too. Parsing an object is insufficient
+  before hash/set operations: externally edited values can be arrays or objects and therefore
+  unhashable.

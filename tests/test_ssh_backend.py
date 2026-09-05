@@ -10,7 +10,7 @@ from unittest import mock
 import pytest
 
 from runplz import App, Image, SshConfig
-from runplz.backends import ssh  # noqa: I001
+from runplz.backends import ssh, ssh_common  # noqa: I001
 from runplz.backends.ssh_common import SshOptions
 
 # --- helpers -------------------------------------------------------------
@@ -271,6 +271,50 @@ def test_ssh_run_end_to_end_passes_port_through_to_helpers(tmp_path):
         ssh.run(app, fn, [], {}, host="gpu.example.com")
 
     assert all(v == 2222 for v in seen_ports.values()), seen_ports
+
+
+def test_ssh_run_translates_signals_without_taking_ownership_of_the_host(tmp_path):
+    app = _app(tmp_path)
+    fn = _function(app, Image.from_registry("ubuntu:22.04"))
+    cleanup = mock.MagicMock()
+
+    with (
+        mock.patch.object(ssh, "wait_until_ssh_reachable"),
+        mock.patch.object(ssh, "_warn_on_spec_mismatch"),
+        mock.patch.object(ssh, "dispatch_to_target") as dispatch,
+        mock.patch.object(
+            ssh, "orchestrator_signal_cleanup", return_value=cleanup
+        ) as signal_cleanup,
+    ):
+        ssh.run(app, fn, [], {}, host="gpu.example.com")
+
+    signal_cleanup.assert_called_once_with("gpu.example.com")
+    cleanup.__enter__.assert_called_once_with()
+    cleanup.__exit__.assert_called_once()
+    dispatch.assert_called_once()
+
+
+def test_ssh_signal_during_repo_inspection_cancels_before_remote_launch(tmp_path):
+    app = _app(tmp_path)
+    fn = _function(
+        app,
+        Image.from_registry("ubuntu:22.04"),
+        module_file=_job_inside(tmp_path),
+    )
+    interruption = ssh_common.OrchestratorKilled("terminated", signal_name="SIGTERM")
+    with (
+        mock.patch.object(ssh, "wait_until_ssh_reachable"),
+        mock.patch.object(ssh, "_warn_on_spec_mismatch"),
+        mock.patch.object(ssh_common.subprocess, "run", side_effect=interruption),
+        mock.patch.object(ssh_common, "prepare_remote_run") as prepare,
+        mock.patch.object(ssh_common, "run_container_detached") as launch,
+        pytest.raises(ssh_common.OrchestratorKilled) as raised,
+    ):
+        ssh.run(app, fn, [], {}, host="gpu.example.com")
+
+    assert raised.value is interruption
+    prepare.assert_not_called()
+    launch.assert_not_called()
 
 
 # --- App.bind wiring -----------------------------------------------------
