@@ -185,9 +185,10 @@ def status(
     # happens after the run ends; treating its audit event as the run's state
     # hid every real outcome behind `rsync_down_start` (issue #163).
     remote_cmd = _status_probe_command(meta)
+    ssh_opts = _effective_ssh_opts(outputs_dir, ssh_overrides)
     cmd = [
         "ssh",
-        *ssh_cmd_opts(_effective_ssh_opts(outputs_dir, ssh_overrides)),
+        *ssh_cmd_opts(ssh_opts),
         target,
         remote_cmd,
     ]
@@ -201,7 +202,9 @@ def status(
         print(f"ssh to {target} failed (rc={rc})")
         if error:
             print(error.strip())
-        snapshot = _local_status_snapshot(outputs_dir, target, meta, run_id_override)
+        snapshot = _local_status_snapshot(
+            outputs_dir, target, meta, run_id_override, ssh_port=ssh_opts.port
+        )
         if snapshot is None:
             return rc
         manifest, sections = snapshot
@@ -212,13 +215,17 @@ def status(
     return 0
 
 
-def _local_status_snapshot(outputs_dir, target, meta, run_id_override):
-    """Only use evidence belonging to the requested host and run."""
+def _local_status_snapshot(outputs_dir, target, meta, run_id_override, *, ssh_port=None):
+    """Only use evidence belonging to the requested SSH endpoint and run."""
     try:
         local_target, local_meta, manifest = resolve_target_and_meta(
             outputs_dir=outputs_dir, host_override=None, run_id_override=None
         )
         if local_target != target or remote_shell_path(local_meta) != remote_shell_path(meta):
+            return None
+        # Forwarded ports can reach different machines behind the same host.
+        # None means SSH-config-selected, not necessarily the default port 22.
+        if ssh_port != _recorded_ssh_opts(outputs_dir).port:
             return None
         run_id = manifest.get("run_id")
         if run_id_override and run_id_override != run_id:

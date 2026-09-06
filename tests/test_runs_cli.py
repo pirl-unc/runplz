@@ -102,6 +102,53 @@ def test_status_never_borrows_a_different_hosts_or_runs_snapshot(tmp_path, capsy
     assert "source: local snapshot" not in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("explicit_run_id", [False, True])
+@pytest.mark.parametrize(
+    "recorded_port,extra_args,probe_port,allow_snapshot",
+    [
+        (2222, ["--ssh-port", "2223"], 2223, False),
+        (2222, ["--ssh-port", "2222"], 2222, True),
+        (2222, [], 2222, True),
+        (None, ["--ssh-port", "2222"], 2222, False),
+        # Unspecified ports come from SSH config, not necessarily port 22.
+        (None, ["--ssh-port", "22"], 22, False),
+        (None, [], None, True),
+        (22, [], 22, True),
+        (2222, ["--ssh-key", "/keys/replacement.pem"], 2222, True),
+    ],
+)
+def test_cli_status_snapshot_requires_the_recorded_ssh_port(
+    tmp_path, capsys, explicit_run_id, recorded_port, extra_args, probe_port, allow_snapshot
+):
+    manifest = _manifest(target="localhost")
+    _write_manifest(tmp_path, manifest)
+    ssh_common.write_local_ssh_options(tmp_path, ssh_common.SshOptions(port=recorded_port))
+    (tmp_path / ".runplz" / "events.ndjson").write_text(
+        json.dumps({"event": "remote_command_exit", "run_id": manifest["run_id"], "exit_code": 0})
+        + "\n"
+    )
+
+    def unavailable(cmd, **kwargs):
+        assert kwargs["timeout"] == runs._STATUS_TIMEOUT_S
+        assert cmd[-2] == "localhost"
+        if probe_port is None:
+            assert "-p" not in cmd
+        else:
+            assert cmd[cmd.index("-p") + 1] == str(probe_port)
+        return subprocess.CompletedProcess(cmd, 255, stdout="", stderr="connection refused")
+
+    args = ["status", "--outputs-dir", str(tmp_path), "--host", "localhost", *extra_args]
+    if explicit_run_id:
+        args.extend(["--run-id", manifest["run_id"]])
+    with mock.patch.object(runs.subprocess, "run", side_effect=unavailable):
+        rc = cli.main(args)
+
+    assert rc == (0 if allow_snapshot else 255)
+    rendered = capsys.readouterr().out
+    assert ("source: local snapshot" in rendered) is allow_snapshot
+    assert ("last event: remote_command_exit" in rendered) is allow_snapshot
+
+
 @pytest.mark.parametrize("events", ["", "not-json\n[]\n", '{"event":"old","run_id":"other"}\n'])
 def test_status_rejects_empty_or_unrelated_snapshot(tmp_path, events):
     manifest = _manifest()

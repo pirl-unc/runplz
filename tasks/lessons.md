@@ -92,3 +92,6 @@
   successful signal delivery and an explicit no-survivor probe are separate facts.
 - A retry deadline bounds retries, not a blocked subprocess. Give best-effort cleanup operations
   their own subprocess timeouts, and distinguish transfer inactivity from total transfer duration.
+- Match offline evidence against the full recorded endpoint, not just its hostname: forwarded
+  SSH ports can select different machines. Use the same effective options as the live probe, and
+  test overrides that change endpoint identity separately from overrides that only change credentials.

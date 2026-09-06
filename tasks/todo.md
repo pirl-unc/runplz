@@ -2494,5 +2494,24 @@ Verification: `./format.sh`, `./lint.sh`, and `./test.sh` pass: 1368 passed, 1 p
 verify timeout enforcement, and cover shared SSH/Brev/GCP/AWS cleanup paths. The full suite also
 exercises local loopback SSH and stub cloud CLIs; no paid cloud workloads were launched.
 
-Next handoff: open the PR and check GitHub CI. This request ends at an open PR; no merge or
-deployment is authorized for this follow-up yet.
+PR #167 is open. This request ends at an open PR; no merge or deployment is authorized for
+this follow-up yet.
+
+### PR #167 review follow-up: match the snapshot's SSH endpoint
+
+The hostname and run path are insufficient when forwarded ports select different machines.
+Reuse the status probe's effective SSH options and compare its port with the locally recorded
+`ssh.json` port before accepting an offline snapshot. An unspecified port remains unspecified:
+SSH config may choose a nonstandard port, so do not equate it with an explicit port 22.
+Credential-only overrides must not invalidate an otherwise matching endpoint.
+
+- [x] Add CLI regressions for different, equal, inherited, and unspecified SSH ports.
+- [x] Require a matching recorded port before returning a successful offline status snapshot.
+- [x] Record the review lesson and tracking issue; keep the PR's existing 4.4.4 version bump.
+- [x] Run `./format.sh`, `./lint.sh`, and `./test.sh`; prepare the update for PR #167.
+
+Review results: tracked by https://github.com/pirl-unc/runplz/issues/168. The new CLI tests
+reproduced six unsafe fallback cases before the fix; all 16 port-matching cases now pass,
+including both manifest-selected and explicitly selected run IDs. A credential-only override
+still permits the same snapshot. Formatting and lint pass; the full suite passes with 1384 tests,
+1 platform test skipped, and 95.49% coverage. The PR update and CI results are tracked on GitHub.
