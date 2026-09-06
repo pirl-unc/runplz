@@ -54,6 +54,7 @@ META_FILENAME = "run.json"
 # `kill` exit code for "signalled, but something is still alive" - distinct
 # from 0 (stopped) and from ssh / protocol failures.
 KILL_SURVIVED_RC = 3
+_STATUS_TIMEOUT_S = 10
 
 
 class ManifestNotFound(RuntimeError):
@@ -184,23 +185,78 @@ def status(
     # happens after the run ends; treating its audit event as the run's state
     # hid every real outcome behind `rsync_down_start` (issue #163).
     remote_cmd = _status_probe_command(meta)
+    ssh_opts = _effective_ssh_opts(outputs_dir, ssh_overrides)
     cmd = [
         "ssh",
-        *ssh_cmd_opts(_effective_ssh_opts(outputs_dir, ssh_overrides)),
+        *ssh_cmd_opts(ssh_opts),
         target,
         remote_cmd,
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        print(f"ssh to {target} failed (rc={r.returncode})")
-        if r.stderr:
-            print(r.stderr.strip())
-        return r.returncode
-    sections = parse_probe_sections(r.stdout)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=_STATUS_TIMEOUT_S)
+        rc, error = r.returncode, r.stderr
+        sections = parse_probe_sections(r.stdout) if rc == 0 else {}
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        rc, error, sections = 2, str(exc), {}
+    if rc != 0:
+        print(f"ssh to {target} failed (rc={rc})")
+        if error:
+            print(error.strip())
+        snapshot = _local_status_snapshot(
+            outputs_dir, target, meta, run_id_override, ssh_port=ssh_opts.port
+        )
+        if snapshot is None:
+            return rc
+        manifest, sections = snapshot
+        print("source: local snapshot (remote unavailable; not live status)")
     if "EVENTS" in sections:
         sections.update(_status_event_sections(sections["EVENTS"]))
     print(_format_status(target=target, manifest=manifest, sections=sections))
     return 0
+
+
+def _local_status_snapshot(outputs_dir, target, meta, run_id_override, *, ssh_port=None):
+    """Only use evidence belonging to the requested SSH endpoint and run."""
+    try:
+        local_target, local_meta, manifest = resolve_target_and_meta(
+            outputs_dir=outputs_dir, host_override=None, run_id_override=None
+        )
+        if local_target != target or remote_shell_path(local_meta) != remote_shell_path(meta):
+            return None
+        # Forwarded ports can reach different machines behind the same host.
+        # None means SSH-config-selected, not necessarily the default port 22.
+        if ssh_port != _recorded_ssh_opts(outputs_dir).port:
+            return None
+        run_id = manifest.get("run_id")
+        if run_id_override and run_id_override != run_id:
+            return None
+        local_meta_dir = outputs_dir / REMOTE_META_DIRNAME
+        events = (local_meta_dir / "events.ndjson").read_text()
+        # Reused output directories can contain partial downloads from another
+        # run. Never borrow their authoritative events (legacy lines have no id).
+        matching = []
+        for line in events.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict) and event.get("run_id", run_id) == run_id:
+                matching.append(line)
+        if not matching:
+            return None
+        heartbeat_path = local_meta_dir / "heartbeat.ndjson"
+        heartbeat = ""
+        if heartbeat_path.is_file():
+            for line in heartbeat_path.read_text().splitlines():
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict) and record.get("run_id", run_id) == run_id:
+                    heartbeat = line
+        return manifest, {"EVENTS": "\n".join(matching), "LAST_HEARTBEAT": heartbeat}
+    except (OSError, ValueError, RuntimeError, TypeError, AttributeError):
+        return None
 
 
 def _status_probe_command(meta: str) -> str:
@@ -359,7 +415,9 @@ def kill(
     # Survivors mean the kill failed. Exiting 0 here would let
     # `runplz kill && runplz brev job.py` start a second job on a GPU the
     # first one still holds.
-    return KILL_SURVIVED_RC if fields.get("alive_after") == "1" else 0
+    if fields.get("alive_after") == "1":
+        return KILL_SURVIVED_RC
+    return 0 if fields.get("alive_after") == "0" else 2
 
 
 def _format_kill(
@@ -382,7 +440,11 @@ def _format_kill(
     if container:
         lines.append(f"container:  {container} ({container_state})")
 
-    if not signalled:
+    if fields.get("alive_after") not in {"0", "1"}:
+        lines.append("action:     stop unconfirmed - the run may still be running")
+    elif not signalled and alive_after:
+        lines.append("action:     STOP FAILED - no signal delivered; run still alive")
+    elif not signalled:
         lines.append(f"action:     nothing to kill - the run was already {initial}")
     elif not alive_after:
         how = f"SIG{signal}, escalated to SIGKILL" if escalated else f"SIG{signal}"
@@ -433,7 +495,7 @@ def _render_timestamped(line: str) -> str:
         ts = json.loads(line).get("ts", "")
     except (json.JSONDecodeError, AttributeError):
         return f"(unparsed) {line[:200]}"
-    if not ts:
+    if not isinstance(ts, str) or not ts:
         return f"(unparsed) {line[:200]}"
     return f"{ts}{_age_str(ts)}"
 
@@ -442,9 +504,12 @@ _ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
 def _parse_iso_z(ts: str) -> Optional[datetime]:
-    if not ts or not _ISO_RE.match(ts):
+    if not isinstance(ts, str) or not _ISO_RE.match(ts):
         return None
-    return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    try:
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
 
 
 def _format_status(*, target: str, manifest: dict, sections: dict[str, str]) -> str:

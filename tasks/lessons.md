@@ -86,3 +86,12 @@
 - Tolerating malformed JSON means validating field types too. Parsing an object is insufficient
   before hash/set operations: externally edited values can be arrays or objects and therefore
   unhashable.
+- Cleanup has its own cancellation boundaries: a sentinel escaping one finally action must not
+  skip subsequent salvage or removal. Test signals during cleanup, not only during the workload.
+- Failed observation is not a negative observation. Docker inspection errors mean unknown;
+  successful signal delivery and an explicit no-survivor probe are separate facts.
+- A retry deadline bounds retries, not a blocked subprocess. Give best-effort cleanup operations
+  their own subprocess timeouts, and distinguish transfer inactivity from total transfer duration.
+- Match offline evidence against the full recorded endpoint, not just its hostname: forwarded
+  SSH ports can select different machines. Use the same effective options as the live probe, and
+  test overrides that change endpoint identity separately from overrides that only change credentials.

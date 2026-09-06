@@ -1,6 +1,7 @@
 """Coverage for ``runplz tail`` / ``runplz status`` (issue #57)."""
 
 import json
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -9,6 +10,178 @@ import pytest
 
 from runplz import cli, runs
 from runplz.backends import ssh_common
+
+
+@pytest.mark.parametrize(
+    "timestamp", [123, [], {}, None, "", "2026-99-01T00:00:00Z", "2026-02-30T00:00:00Z"]
+)
+def test_malformed_timestamps_do_not_break_status_or_kill(timestamp):
+    raw = json.dumps({"ts": timestamp, "event": "remote_command_exit", "exit_code": 0})
+    rendered = runs._format_status(
+        target="box",
+        manifest={},
+        sections={
+            "LAST_EVENT": raw,
+            "LAST_SYNC_EVENT": raw,
+            "LAST_HEARTBEAT": raw,
+        },
+    )
+    assert "last event: remote_command_exit exit_code=0" in rendered
+    assert "last heartbeat:" in rendered
+    assert runs._parse_iso_z(timestamp) is None
+    assert "heartbeat:" in runs._format_kill(
+        target="box", run_id="run", fields={}, sections={"HEARTBEAT": raw}
+    )
+
+
+@pytest.mark.parametrize("failure", ["connection", "timeout", "missing_ssh"])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_status_falls_back_to_matching_local_snapshot(tmp_path, capsys, failure, explicit):
+    manifest = _manifest()
+    _write_manifest(tmp_path, manifest)
+    meta = tmp_path / ".runplz"
+    (meta / "events.ndjson").write_text(
+        "bad-json\n[]\n"
+        + json.dumps(
+            {
+                "event": "killed_by_user",
+                "run_id": "another-run",
+                "signalled": True,
+                "alive_after": False,
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {"event": "orchestrator_signalled", "run_id": manifest["run_id"], "signal": "SIGTERM"}
+        )
+        + "\n"
+        + json.dumps({"event": "rsync_down_done", "run_id": manifest["run_id"]})
+        + "\n"
+    )
+    (meta / "heartbeat.ndjson").write_text(
+        "bad-json\n[]\n"
+        + json.dumps({"ts": "2026-09-05T01:02:03Z", "run_id": manifest["run_id"]})
+        + "\n"
+        + json.dumps({"ts": "1999-01-01T00:00:00Z", "run_id": "another-run"})
+        + "\n"
+    )
+
+    def fail(cmd, **kwargs):
+        assert kwargs["timeout"] == runs._STATUS_TIMEOUT_S
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+        if failure == "missing_ssh":
+            raise FileNotFoundError("ssh")
+        return mock.Mock(returncode=255, stdout="", stderr="host deleted")
+
+    with mock.patch.object(runs.subprocess, "run", side_effect=fail):
+        rc = runs.status(
+            outputs_dir=tmp_path,
+            host_override=manifest["target"] if explicit else None,
+            run_id_override=manifest["run_id"] if explicit else None,
+        )
+    assert rc == 0
+    rendered = capsys.readouterr().out
+    assert "source: local snapshot" in rendered
+    assert "not live status" in rendered
+    assert "last event: orchestrator_signalled signal=SIGTERM" in rendered
+    assert "output sync: completed" in rendered
+    assert "events recorded: 2" in rendered
+    assert "1999" not in rendered
+
+
+@pytest.mark.parametrize("host,run_id", [("different-box", None), ("my-gpu-box", "different-run")])
+def test_status_never_borrows_a_different_hosts_or_runs_snapshot(tmp_path, capsys, host, run_id):
+    _write_manifest(tmp_path, _manifest())
+    (tmp_path / ".runplz" / "events.ndjson").write_text('{"event":"remote_command_exit"}\n')
+    with mock.patch.object(
+        runs.subprocess, "run", return_value=mock.Mock(returncode=255, stderr="", stdout="")
+    ):
+        rc = runs.status(outputs_dir=tmp_path, host_override=host, run_id_override=run_id)
+    assert rc == 255
+    assert "source: local snapshot" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("explicit_run_id", [False, True])
+@pytest.mark.parametrize(
+    "recorded_port,extra_args,probe_port,allow_snapshot",
+    [
+        (2222, ["--ssh-port", "2223"], 2223, False),
+        (2222, ["--ssh-port", "2222"], 2222, True),
+        (2222, [], 2222, True),
+        (None, ["--ssh-port", "2222"], 2222, False),
+        # Unspecified ports come from SSH config, not necessarily port 22.
+        (None, ["--ssh-port", "22"], 22, False),
+        (None, [], None, True),
+        (22, [], 22, True),
+        (2222, ["--ssh-key", "/keys/replacement.pem"], 2222, True),
+    ],
+)
+def test_cli_status_snapshot_requires_the_recorded_ssh_port(
+    tmp_path, capsys, explicit_run_id, recorded_port, extra_args, probe_port, allow_snapshot
+):
+    manifest = _manifest(target="localhost")
+    _write_manifest(tmp_path, manifest)
+    ssh_common.write_local_ssh_options(tmp_path, ssh_common.SshOptions(port=recorded_port))
+    (tmp_path / ".runplz" / "events.ndjson").write_text(
+        json.dumps({"event": "remote_command_exit", "run_id": manifest["run_id"], "exit_code": 0})
+        + "\n"
+    )
+
+    def unavailable(cmd, **kwargs):
+        assert kwargs["timeout"] == runs._STATUS_TIMEOUT_S
+        assert cmd[-2] == "localhost"
+        if probe_port is None:
+            assert "-p" not in cmd
+        else:
+            assert cmd[cmd.index("-p") + 1] == str(probe_port)
+        return subprocess.CompletedProcess(cmd, 255, stdout="", stderr="connection refused")
+
+    args = ["status", "--outputs-dir", str(tmp_path), "--host", "localhost", *extra_args]
+    if explicit_run_id:
+        args.extend(["--run-id", manifest["run_id"]])
+    with mock.patch.object(runs.subprocess, "run", side_effect=unavailable):
+        rc = cli.main(args)
+
+    assert rc == (0 if allow_snapshot else 255)
+    rendered = capsys.readouterr().out
+    assert ("source: local snapshot" in rendered) is allow_snapshot
+    assert ("last event: remote_command_exit" in rendered) is allow_snapshot
+
+
+@pytest.mark.parametrize("events", ["", "not-json\n[]\n", '{"event":"old","run_id":"other"}\n'])
+def test_status_rejects_empty_or_unrelated_snapshot(tmp_path, events):
+    manifest = _manifest()
+    _write_manifest(tmp_path, manifest)
+    (tmp_path / ".runplz" / "events.ndjson").write_text(events)
+    assert (
+        runs._local_status_snapshot(
+            tmp_path, manifest["target"], manifest["remote_paths"]["meta"], None
+        )
+        is None
+    )
+
+
+def test_status_snapshot_can_read_legacy_events_without_heartbeat(tmp_path):
+    manifest = _manifest()
+    _write_manifest(tmp_path, manifest)
+    (tmp_path / ".runplz" / "events.ndjson").write_text('{"event":"remote_command_exit"}\n')
+    saved, sections = runs._local_status_snapshot(
+        tmp_path, manifest["target"], manifest["remote_paths"]["meta"], None
+    )
+    assert saved == manifest
+    assert sections["LAST_HEARTBEAT"] == ""
+
+
+def test_status_snapshot_rejects_inconsistent_manifest_run_id(tmp_path):
+    manifest = _manifest(run_id="different-run")
+    _write_manifest(tmp_path, manifest)
+    assert (
+        runs._local_status_snapshot(
+            tmp_path, manifest["target"], manifest["remote_paths"]["meta"], "requested-run"
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(

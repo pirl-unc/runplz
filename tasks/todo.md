@@ -2460,3 +2460,70 @@ so externally edited arrays/objects remain reportable rather than crashing set l
 
 Local verification: `./format.sh`, `./lint.sh`, and `./test.sh` pass; 1293 tests passed, 1 platform
 test skipped, and total coverage is 95.14%.
+
+## Lifecycle reliability follow-up (4.4.4)
+
+### Specification
+
+Keep lifecycle evidence conservative and durable across the shared SSH dispatch used by SSH,
+Brev, GCP, and AWS. No backend-specific orchestration rewrite or cloud resources are needed.
+
+- [x] Distinguish unknown Docker state from a confirmed stop, count only delivered signals, and
+      make CLI/cap/watchdog consumers reject unconfirmed kill summaries.
+- [x] Preserve cancellation during every cleanup stage without skipping later salvage/removal;
+      persist the signal locally even when the final transfer has already happened.
+- [x] Put real subprocess deadlines on event writes and failure salvage, plus an idle timeout on
+      ordinary downloads. Successful large transfers must not inherit a short total deadline.
+- [x] Fall back to matching local metadata when the bounded remote status probe fails; explicitly
+      label it as a snapshot and never use it for a different host/run override.
+- [x] Record start/done/failed/unconfirmed environment-setup outcomes in native/container modes.
+- [x] Tolerate non-string and invalid-calendar timestamps without hiding the rest of status.
+- [x] Add regression tests for each failure, file/link a tracking issue, and bump the version.
+- [x] Run format, lint, and the complete test suite; review the diff and prepare the PR.
+
+### Review
+
+Tracked by https://github.com/pirl-unc/runplz/issues/166. All six fixes share the existing SSH
+dispatch/CLI machinery; no per-provider orchestration fork was added. Stop evidence is tri-state,
+signal delivery is measured, cleanup defers operator signals until its bounded steps finish, and
+late cancellation is written to the surviving local stream. Status labels matching offline evidence
+as a snapshot. Native/container setup distinguishes a failure from transport uncertainty.
+
+Verification: `./format.sh`, `./lint.sh`, and `./test.sh` pass: 1368 passed, 1 platform test skipped,
+95.49% coverage. Regressions execute the kill shell under sh/bash, exercise actual signal handlers,
+verify timeout enforcement, and cover shared SSH/Brev/GCP/AWS cleanup paths. The full suite also
+exercises local loopback SSH and stub cloud CLIs; no paid cloud workloads were launched.
+
+PR #167 is open; merge and PyPI deployment were subsequently authorized by the user.
+
+### PR #167 review follow-up: match the snapshot's SSH endpoint
+
+The hostname and run path are insufficient when forwarded ports select different machines.
+Reuse the status probe's effective SSH options and compare its port with the locally recorded
+`ssh.json` port before accepting an offline snapshot. An unspecified port remains unspecified:
+SSH config may choose a nonstandard port, so do not equate it with an explicit port 22.
+Credential-only overrides must not invalidate an otherwise matching endpoint.
+
+- [x] Add CLI regressions for different, equal, inherited, and unspecified SSH ports.
+- [x] Require a matching recorded port before returning a successful offline status snapshot.
+- [x] Record the review lesson and tracking issue; keep the PR's existing 4.4.4 version bump.
+- [x] Run `./format.sh`, `./lint.sh`, and `./test.sh`; prepare the update for PR #167.
+
+Review results: tracked by https://github.com/pirl-unc/runplz/issues/168. The new CLI tests
+reproduced six unsafe fallback cases before the fix; all 16 port-matching cases now pass,
+including both manifest-selected and explicitly selected run IDs. A credential-only override
+still permits the same snapshot. Formatting and lint pass; the full suite passes with 1384 tests,
+1 platform test skipped, and 95.49% coverage. The PR update and CI results are tracked on GitHub.
+
+### Release plan: PR #167 / runplz 4.4.4
+
+Ship the reviewed lifecycle fixes and SSH-port follow-up without further implementation changes.
+The release must originate from the merged commit on clean main, using the repository's deploy
+script (isolated build tooling, lint/test gates, fresh distributions, PyPI upload, annotated tag).
+
+- [x] Confirm the working tree is clean, PR #167 targets main, and all implementation checks pass.
+- [ ] Merge the PR after its release-checklist update passes CI; fast-forward local main.
+- [ ] Run `./deploy.sh` from clean main and verify the published wheel/sdist and pushed v4.4.4 tag.
+- [ ] Record the release verification on the PR and inspect relevant open issues for next work.
+
+Release results will be recorded on the merged PR, keeping the released main worktree clean.
