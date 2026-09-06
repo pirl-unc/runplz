@@ -2494,8 +2494,7 @@ Verification: `./format.sh`, `./lint.sh`, and `./test.sh` pass: 1368 passed, 1 p
 verify timeout enforcement, and cover shared SSH/Brev/GCP/AWS cleanup paths. The full suite also
 exercises local loopback SSH and stub cloud CLIs; no paid cloud workloads were launched.
 
-PR #167 is open. This request ends at an open PR; no merge or deployment is authorized for
-this follow-up yet.
+PR #167 is open; merge and PyPI deployment were subsequently authorized by the user.
 
 ### PR #167 review follow-up: match the snapshot's SSH endpoint
 
@@ -2515,3 +2514,16 @@ reproduced six unsafe fallback cases before the fix; all 16 port-matching cases 
 including both manifest-selected and explicitly selected run IDs. A credential-only override
 still permits the same snapshot. Formatting and lint pass; the full suite passes with 1384 tests,
 1 platform test skipped, and 95.49% coverage. The PR update and CI results are tracked on GitHub.
+
+### Release plan: PR #167 / runplz 4.4.4
+
+Ship the reviewed lifecycle fixes and SSH-port follow-up without further implementation changes.
+The release must originate from the merged commit on clean main, using the repository's deploy
+script (isolated build tooling, lint/test gates, fresh distributions, PyPI upload, annotated tag).
+
+- [x] Confirm the working tree is clean, PR #167 targets main, and all implementation checks pass.
+- [ ] Merge the PR after its release-checklist update passes CI; fast-forward local main.
+- [ ] Run `./deploy.sh` from clean main and verify the published wheel/sdist and pushed v4.4.4 tag.
+- [ ] Record the release verification on the PR and inspect relevant open issues for next work.
+
+Release results will be recorded on the merged PR, keeping the released main worktree clean.
