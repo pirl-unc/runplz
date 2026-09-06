@@ -755,8 +755,9 @@ def test_rsync_down_runs_correct_cmd(tmp_path):
         ssh_common.rsync_down("my-box", tmp_path)
     cmd = recorded["c"]
     assert cmd[:2] == ["rsync", "-az"]
-    assert cmd[2].endswith(":runplz-out/")  # remote side
-    assert cmd[3] == f"{tmp_path}/"
+    assert f"--timeout={ssh_common._RSYNC_IDLE_TIMEOUT_S}" in cmd
+    assert cmd[-2].endswith(":runplz-out/")  # remote side
+    assert cmd[-1] == f"{tmp_path}/"
 
 
 def test_make_remote_run_context_uses_unique_runplz_runs_layout():

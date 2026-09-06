@@ -2460,3 +2460,39 @@ so externally edited arrays/objects remain reportable rather than crashing set l
 
 Local verification: `./format.sh`, `./lint.sh`, and `./test.sh` pass; 1293 tests passed, 1 platform
 test skipped, and total coverage is 95.14%.
+
+## Lifecycle reliability follow-up (4.4.4)
+
+### Specification
+
+Keep lifecycle evidence conservative and durable across the shared SSH dispatch used by SSH,
+Brev, GCP, and AWS. No backend-specific orchestration rewrite or cloud resources are needed.
+
+- [x] Distinguish unknown Docker state from a confirmed stop, count only delivered signals, and
+      make CLI/cap/watchdog consumers reject unconfirmed kill summaries.
+- [x] Preserve cancellation during every cleanup stage without skipping later salvage/removal;
+      persist the signal locally even when the final transfer has already happened.
+- [x] Put real subprocess deadlines on event writes and failure salvage, plus an idle timeout on
+      ordinary downloads. Successful large transfers must not inherit a short total deadline.
+- [x] Fall back to matching local metadata when the bounded remote status probe fails; explicitly
+      label it as a snapshot and never use it for a different host/run override.
+- [x] Record start/done/failed/unconfirmed environment-setup outcomes in native/container modes.
+- [x] Tolerate non-string and invalid-calendar timestamps without hiding the rest of status.
+- [x] Add regression tests for each failure, file/link a tracking issue, and bump the version.
+- [x] Run format, lint, and the complete test suite; review the diff and prepare the PR.
+
+### Review
+
+Tracked by https://github.com/pirl-unc/runplz/issues/166. All six fixes share the existing SSH
+dispatch/CLI machinery; no per-provider orchestration fork was added. Stop evidence is tri-state,
+signal delivery is measured, cleanup defers operator signals until its bounded steps finish, and
+late cancellation is written to the surviving local stream. Status labels matching offline evidence
+as a snapshot. Native/container setup distinguishes a failure from transport uncertainty.
+
+Verification: `./format.sh`, `./lint.sh`, and `./test.sh` pass: 1368 passed, 1 platform test skipped,
+95.49% coverage. Regressions execute the kill shell under sh/bash, exercise actual signal handlers,
+verify timeout enforcement, and cover shared SSH/Brev/GCP/AWS cleanup paths. The full suite also
+exercises local loopback SSH and stub cloud CLIs; no paid cloud workloads were launched.
+
+Next handoff: open the PR and check GitHub CI. This request ends at an open PR; no merge or
+deployment is authorized for this follow-up yet.

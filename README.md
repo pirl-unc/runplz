@@ -272,12 +272,29 @@ host registry, so a bare `runplz ps` skips it and says so; pass
 `--host` to include it, alongside the other backends or on its own as
 `runplz ps ssh --host <h>`.
 
+If SSH is unavailable, `status` falls back to saved local metadata for the same
+host and run after a 10-second probe timeout. It labels this as a **local snapshot**,
+not live status—useful after an ephemeral host has been deleted. Output-sync state
+is shown separately from the run outcome. Native/container environment setup also
+records its start and outcome; a transport failure means completion is unconfirmed.
+
+Downloads have a 60-second idle timeout. Failure salvage additionally has a
+60-second transfer budget shared across retries, and individual lifecycle-event
+writes time out after 10 seconds. A failed salvage remains an explicit local event;
+it does not replace the original run failure. During cleanup, cancellation is
+deferred until the remaining cleanup steps have been attempted.
+
 A scope flag that no listed backend can use is an error, not a no-op:
 `runplz ps local --region us-east-1` narrows the listing to `local` and then
 scopes AWS, which is not in it. That used to run and quietly ignore the
 region, leaving you to believe the listing was scoped when it was not.
 
 #### What `kill` actually stops
+
+`kill` reports success only after confirming no survivors. An unavailable Docker
+daemon or unreadable stop result is **unconfirmed**, not a stopped container, and
+returns a nonzero exit code. Lifecycle events distinguish delivered signals from
+failed attempts.
 
 A remote run is a tree, not a process: a bash supervisor, the bootstrap,
 the worker(s) it spawns, and any DataLoader children those fork. runplz

@@ -188,6 +188,11 @@ DETACHED_START_POLL_INTERVAL_S = 1
 DEFAULT_KILL_TIMEOUT_S = 10
 KILL_SETTLE_S = 5
 
+# Bound individual cleanup operations, not just the gap between retries.
+_EVENT_WRITE_TIMEOUT_S = 10
+_SALVAGE_TIMEOUT_S = 60
+_RSYNC_IDLE_TIMEOUT_S = 60
+
 # Directories that are noise on every upload and exclusions we apply on
 # top of DEFAULT_TRANSFER_EXCLUDES (which only covers secrets). The
 # default outputs dir name "out" is excluded here so the common case
@@ -726,7 +731,7 @@ def _record_remote_event(
         f"printf '%s\\n' {shlex.quote(line)} >> \"{remote_run.events_shell}\""
     )
     try:
-        ssh_exec(target, remote, ssh_opts=ssh_opts)
+        ssh_exec(target, remote, ssh_opts=ssh_opts, timeout_s=_EVENT_WRITE_TIMEOUT_S)
     except OrchestratorKilled:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -941,12 +946,18 @@ def retry_on_transport_failure(
 # --- low-level ssh / sh / rsync ------------------------------------------
 
 
-def run_local(cmd, *, stdin: Optional[bytes] = None):
+def run_local(cmd, *, stdin: Optional[bytes] = None, timeout_s: Optional[float] = None):
     print("+ " + " ".join(shlex.quote(c) for c in cmd), flush=True)
-    subprocess.run(cmd, check=True, input=stdin)
+    subprocess.run(cmd, check=True, input=stdin, timeout=timeout_s)
 
 
-def ssh_exec(target: str, remote_cmd: str, *, ssh_opts: Optional[SshOptions] = None):
+def ssh_exec(
+    target: str,
+    remote_cmd: str,
+    *,
+    ssh_opts: Optional[SshOptions] = None,
+    timeout_s: Optional[float] = None,
+):
     # Pass the whole pipeline as a SINGLE arg to ssh. If we pass
     # ["ssh", host, "bash", "-lc", cmd] instead, ssh space-joins the trailing
     # argv before sending to the remote shell, which then re-parses — turning
@@ -954,7 +965,11 @@ def ssh_exec(target: str, remote_cmd: str, *, ssh_opts: Optional[SshOptions] = N
     # (i.e. `set` runs with no args as the -c command, X runs in the outer
     # shell without errexit). Quoting with shlex.quote around the whole
     # command string avoids that.
-    run_local(["ssh", *ssh_cmd_opts(ssh_opts), target, f"bash -lc {shlex.quote(remote_cmd)}"])
+    cmd = ["ssh", *ssh_cmd_opts(ssh_opts), target, f"bash -lc {shlex.quote(remote_cmd)}"]
+    if timeout_s is None:
+        run_local(cmd)
+    else:
+        run_local(cmd, timeout_s=timeout_s)
 
 
 def ssh_capture(target: str, remote_cmd: str, *, ssh_opts: Optional[SshOptions] = None) -> str:
@@ -1233,14 +1248,26 @@ def rsync_down(
     *,
     remote_run: Optional[RemoteRunContext] = None,
     ssh_opts: Optional[SshOptions] = None,
+    timeout_s: Optional[float] = None,
 ):
     _record_remote_event(target, remote_run, "rsync_down_start", ssh_opts=ssh_opts)
-    cmd = ["rsync", "-az", *rsync_transport_flags(ssh_opts)]
+    cmd = ["rsync", "-az", f"--timeout={_RSYNC_IDLE_TIMEOUT_S}", *rsync_transport_flags(ssh_opts)]
     cmd.extend([_remote_out_rsync(target, remote_run), f"{local_out}/"])
+    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+
+    def transfer():
+        if deadline is None:
+            run_local(cmd)
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(cmd, timeout_s)
+            run_local(cmd, timeout_s=remaining)
+
     # rsync is a sync: repeating it converges on the same result.
     try:
         retry_on_transport_failure(
-            lambda: run_local(cmd),
+            transfer,
             label=f"rsync down from {target}",
             retriable_exits=RSYNC_TRANSPORT_EXITS,
             policy=SSH_RESULTS_POLICY,
@@ -1524,6 +1551,29 @@ def render_image_ops_script(image, *, remote_run: Optional[RemoteRunContext] = N
     return "; ".join(lines)
 
 
+@contextlib.contextmanager
+def _environment_setup_events(target, remote_run, ssh_opts):
+    """Report setup without mistaking transport loss for a failed installation."""
+    _record_remote_event(target, remote_run, "environment_setup_start", ssh_opts=ssh_opts)
+    try:
+        yield
+    except Exception as exc:
+        unconfirmed = isinstance(exc, subprocess.TimeoutExpired) or (
+            isinstance(exc, subprocess.CalledProcessError)
+            and is_ssh_transport_failure(exc.returncode)
+        )
+        _record_remote_event(
+            target,
+            remote_run,
+            "environment_setup_unconfirmed" if unconfirmed else "environment_setup_failed",
+            ssh_opts=ssh_opts,
+            error_type=type(exc).__name__,
+            exit_code=getattr(exc, "returncode", None),
+        )
+        raise
+    _record_remote_event(target, remote_run, "environment_setup_done", ssh_opts=ssh_opts)
+
+
 def run_container_mode(
     *,
     target,
@@ -1547,16 +1597,13 @@ def run_container_mode(
     runs through a reconnect-tolerant tail-and-poll loop that mirrors
     the docker-mode ``stream_and_wait`` pattern.
     """
-    ops_script = render_image_ops_script(function.image, remote_run=remote_run)
-    if ops_script:
-        # Container mode's equivalent of build_image: apt/pip layers applied
-        # inline. brev's container mode never reaches build_image, so without
-        # this the mode where the box *is* the user's image had no cover at
-        # all for a #84-shaped blip.
-        retry_on_transport_failure(
-            lambda: ssh_exec(target, ops_script, ssh_opts=ssh_opts),
-            label=f"apply image ops on {target}",
-        )
+    with _environment_setup_events(target, remote_run, ssh_opts):
+        ops_script = render_image_ops_script(function.image, remote_run=remote_run)
+        if ops_script:
+            retry_on_transport_failure(
+                lambda: ssh_exec(target, ops_script, ssh_opts=ssh_opts),
+                label=f"apply image ops on {target}",
+            )
 
     user_env_exports = " ".join(
         f"export {k}={shlex.quote(str(v))};" for k, v in function.env.items()
@@ -1628,10 +1675,11 @@ def run_native(
     )
     # A superset of ensure_remote_rsync's apt-get, which is retried — the
     # two adjacent calls should not behave differently for the same failure.
-    retry_on_transport_failure(
-        lambda: ssh_exec(target, setup, ssh_opts=ssh_opts),
-        label=f"prepare native environment on {target}",
-    )
+    with _environment_setup_events(target, remote_run, ssh_opts):
+        retry_on_transport_failure(
+            lambda: ssh_exec(target, setup, ssh_opts=ssh_opts),
+            label=f"prepare native environment on {target}",
+        )
 
     user_env_exports = " ".join(
         f"export {k}={shlex.quote(str(v))};" for k, v in function.env.items()
@@ -2002,14 +2050,17 @@ def _kill_event_shell(event: Optional[str], *, meta: str, run_id: str, events_fi
         return ""
     attempted_event = "kill_attempted_by_user" if event == "killed_by_user" else event
     return (
-        'if [ "$runplz_signalled" = "1" ]; then\n'
+        'if [ "$runplz_alive_before" != "0" ]; then\n'
+        "  runplz_signalled_json=false\n"
+        '  if [ "$runplz_signalled" = "1" ]; then runplz_signalled_json=true; fi\n'
         f'  runplz_event="{event}"\n'
-        f'  if [ "$runplz_alive_after" = "1" ]; then runplz_event="{attempted_event}"; fi\n'
+        f'  if [ "$runplz_alive_after" != "0" ] || [ "$runplz_signalled" != "1" ]; '
+        f'then runplz_event="{attempted_event}"; fi\n'
         f'  mkdir -p "{meta}" 2>/dev/null || true\n'
         '  printf \'{"ts":"%s","run_id":"%s","event":"%s",'
-        '"escalated":%s,"signalled":true,"alive_after":%s}\\n\' \\\n'
+        '"escalated":%s,"signalled":%s,"alive_after":%s}\\n\' \\\n'
         f'    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "{run_id}" "$runplz_event" \\\n'
-        '    "$runplz_escalated" "$runplz_alive_after" \\\n'
+        '    "$runplz_escalated" "$runplz_signalled_json" "$runplz_alive_after" \\\n'
         f'    >> "{events_file}" 2>/dev/null || true\n'
         "fi"
     )
@@ -2148,47 +2199,63 @@ runplz_pid_usable() {{
 }}
 
 runplz_container_running() {{
+  runplz_container_state=none
   [ -n "$runplz_container" ] || return 1
-  sudo docker inspect --format '{{{{.State.Running}}}}' "$runplz_container" 2>/dev/null \
-    | grep -qx true
+  runplz_container_state=unknown
+  if runplz_inspect=$(sudo docker inspect --format '{{{{.State.Running}}}}' \
+    "$runplz_container" 2>&1); then
+    case "$runplz_inspect" in
+      true) runplz_container_state=running; return 0 ;;
+      false) runplz_container_state=stopped; return 1 ;;
+    esac
+  elif printf '%s' "$runplz_inspect" | grep -qiE 'no such (object|container):'; then
+    runplz_container_state=absent
+    return 1
+  fi
+  return 2
 }}
 
 runplz_alive() {{
+  if runplz_container_running; then runplz_container_rc=0; else runplz_container_rc=$?; fi
   [ -n "$(runplz_run_pids)" ] && return 0
   if runplz_pid_usable; then
     case "$(runplz_pid_state)" in running) return 0 ;; esac
   fi
-  runplz_container_running
+  return "$runplz_container_rc"
 }}
 
 runplz_signal() {{
   for runplz_victim in $(runplz_run_pids); do
-    kill -"$1" "$runplz_victim" 2>/dev/null || true
+    if kill -"$1" "$runplz_victim" 2>/dev/null; then runplz_signalled=1; fi
   done
-  if runplz_pid_usable; then kill -"$1" "$runplz_pid" 2>/dev/null || true; fi
+  if runplz_pid_usable; then
+    if kill -"$1" "$runplz_pid" 2>/dev/null; then runplz_signalled=1; fi
+  fi
   if [ -n "$runplz_container" ]; then
-    sudo docker kill --signal="$1" "$runplz_container" >/dev/null 2>&1 || true
+    if sudo docker kill --signal="$1" "$runplz_container" >/dev/null 2>&1; then
+      runplz_signalled=1
+    fi
   fi
 }}
 
 runplz_wait_until_dead() {{
   runplz_waited=0
   while [ "$runplz_waited" -lt "$1" ]; do
-    runplz_alive || return 0
+    if runplz_alive; then :; elif [ "$?" = "1" ]; then return 0; fi
     sleep 1
     runplz_waited=$((runplz_waited + 1))
   done
-  runplz_alive && return 1
-  return 0
+  if runplz_alive; then return 1; elif [ "$?" = "1" ]; then return 0; fi
+  return 1
 }}
 
 runplz_initial="$(runplz_pid_state)"
-runplz_alive_before=0
+runplz_alive_before=null
 runplz_escalated=0
 runplz_signalled=0
-if runplz_alive; then
-  runplz_alive_before=1
-  runplz_signalled=1
+if runplz_alive; then runplz_alive_before=1
+elif [ "$?" = "1" ]; then runplz_alive_before=0; fi
+if [ "$runplz_alive_before" != "0" ]; then
   runplz_signal "{first_signal}"
   if ! runplz_wait_until_dead {timeout_s}; then
     if [ "{1 if escalate else 0}" = "1" ]; then
@@ -2200,12 +2267,10 @@ if runplz_alive; then
 fi
 
 runplz_final="$(runplz_pid_state)"
-runplz_alive_after=0
-if runplz_alive; then runplz_alive_after=1; fi
+runplz_alive_after=null
+if runplz_alive; then runplz_alive_after=1
+elif [ "$?" = "1" ]; then runplz_alive_after=0; fi
 runplz_survivors="$(runplz_run_pids | tr '\n' ' ' | sed 's/  *$//')"
-if runplz_container_running; then runplz_container_state=running; \
-elif [ -n "$runplz_container" ]; then runplz_container_state=stopped; \
-else runplz_container_state=none; fi
 
 {_kill_event_shell(event, meta=meta, run_id=run_id, events_file=events_file)}
 
@@ -3417,6 +3482,47 @@ class OrchestratorKilled(BaseException):
         self.signal_name = signal_name
 
 
+class _OrchestratorSignalHandler:
+    def __init__(self, label):
+        self.label = label
+
+    def exception(self, signum):
+        signame = signal.Signals(signum).name
+        return OrchestratorKilled(
+            f"runplz orchestrator killed by {signame}; cleaning up {self.label!r} before exit.",
+            signal_name=signame,
+        )
+
+    def __call__(self, signum, _frame):
+        exc = self.exception(signum)
+        print(f"+ {exc}", flush=True)
+        raise exc
+
+
+@contextlib.contextmanager
+def _defer_cleanup_signals():
+    """Finish bounded cleanup before propagating operator cancellation.
+
+    Only replace our own handlers, never an embedding application's handlers.
+    Repeated signals are retained but cannot interrupt salvage or container removal.
+    """
+    pending = []
+    previous = {}
+    try:
+        for sig in CLEANUP_SIGNALS:
+            handler = signal.getsignal(sig)
+            if isinstance(handler, _OrchestratorSignalHandler):
+                try:
+                    signal.signal(sig, lambda n, f, h=handler: pending.append(h.exception(n)))
+                    previous[sig] = handler
+                except (ValueError, OSError):
+                    pass
+        yield pending
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
 @contextlib.contextmanager
 def orchestrator_signal_cleanup(label: str):
     """Turn termination signals into an exception so a `finally` can run.
@@ -3432,21 +3538,10 @@ def orchestrator_signal_cleanup(label: str):
     """
     previous = {}
 
-    def _handler(signum, _frame):
-        signame = signal.Signals(signum).name
-        print(
-            f"+ runplz received {signame} — triggering cleanup for {label!r}",
-            flush=True,
-        )
-        raise OrchestratorKilled(
-            f"runplz orchestrator killed by {signame}; cleaning up {label!r} before exit.",
-            signal_name=signame,
-        )
-
     try:
         for sig in CLEANUP_SIGNALS:
             try:
-                previous[sig] = signal.signal(sig, _handler)
+                previous[sig] = signal.signal(sig, _OrchestratorSignalHandler(label))
             except (ValueError, OSError):
                 # Not the main thread, or unsupported on this platform.
                 pass
@@ -3544,6 +3639,7 @@ def dispatch_to_target(
     exit_code: Optional[int] = None
     failure_tail = ""
     synced = False
+    cancellation = None
     try:
         # Probe declared preconditions (issue #56) before bootstrap, so a
         # misprovisioned box fails fast instead of burning paid GPU minutes.
@@ -3624,47 +3720,51 @@ def dispatch_to_target(
         rsync_down(target, host_out, remote_run=remote_run, ssh_opts=ssh_opts)
         synced = True
     except OrchestratorKilled as exc:
-        # This must precede salvage: provisioned backends delete the host in
-        # their outer finally, so an event appended after rsync_down exists
-        # only on a box that is about to disappear. Status applies causal
-        # precedence in Python, so a cleanup-induced remote_command_exit may
-        # safely be appended later without hiding the operator signal.
-        _record_remote_event(
-            target,
-            remote_run,
-            "orchestrator_signalled",
-            ssh_opts=ssh_opts,
-            signal=exc.signal_name,
-        )
+        cancellation = exc
         raise
     finally:
-        # Grab the log tail before the container goes away — `docker rm`
-        # wipes it, and a provisioning caller is about to delete the box.
-        if exit_code is None or exit_code != 0:
-            failure_tail = fetch_failure_tail(
-                target=target,
-                container_name=container_name,
-                remote_run=remote_run,
-                ssh_opts=ssh_opts,
-            )
-        if not synced:
-            # Something is already unwinding — a runtime cap, a stream error,
-            # a box reclaimed mid-run. Whatever the job managed to write is
-            # often the only evidence of what went wrong, and `max_runtime_seconds`
-            # exists precisely to salvage a wedged run (#150). Everything inside
-            # this `try` happens after rsync_up proved the box reachable, so a
-            # sync here is worth attempting.
-            #
-            # Best-effort on purpose: an exception is on its way out and must
-            # not be replaced by an rsync error naming the wrong problem.
-            try:
-                rsync_down(target, host_out, remote_run=remote_run, ssh_opts=ssh_opts)
-            except Exception as exc:  # noqa: BLE001
-                print(
-                    f"+ warning: could not collect outputs after failure: "
-                    f"{type(exc).__name__}: {exc}",
-                    flush=True,
-                )
+        with _defer_cleanup_signals() as pending:
+            if cancellation is not None:
+                pending.append(cancellation)
+
+            @contextlib.contextmanager
+            def cleanup_step(label):
+                # Also protects callers/tests that raise the sentinel directly.
+                try:
+                    yield
+                except OrchestratorKilled as exc:
+                    pending.append(exc)
+                except Exception as exc:
+                    print(f"+ warning: {label}: {type(exc).__name__}: {exc}", flush=True)
+
+            if pending:
+                with cleanup_step("could not record cancellation"):
+                    _record_remote_event(
+                        target,
+                        remote_run,
+                        "orchestrator_signalled",
+                        ssh_opts=ssh_opts,
+                        signal=pending[0].signal_name,
+                    )
+            # Each step is independent: failure/cancellation in one must not
+            # skip later salvage or container removal before host teardown.
+            if exit_code is None or exit_code != 0:
+                with cleanup_step("could not fetch failure tail"):
+                    failure_tail = fetch_failure_tail(
+                        target=target,
+                        container_name=container_name,
+                        remote_run=remote_run,
+                        ssh_opts=ssh_opts,
+                    )
+            if not synced:
+                with cleanup_step("could not collect outputs after failure"):
+                    rsync_down(
+                        target,
+                        host_out,
+                        remote_run=remote_run,
+                        ssh_opts=ssh_opts,
+                        timeout_s=_SALVAGE_TIMEOUT_S,
+                    )
             if failure_tail:
                 print(
                     f"--- last {FAILURE_TAIL_LINES} lines of remote output ---\n"
@@ -3672,18 +3772,33 @@ def dispatch_to_target(
                     f"--- end remote output ---",
                     flush=True,
                 )
-        if container_name is not None:
-            try:
-                ssh_capture(
-                    target,
-                    f"sudo docker rm -f {container_name} >/dev/null 2>&1 || true",
-                    ssh_opts=ssh_opts,
+            if container_name is not None:
+                with cleanup_step(f"failed to remove container {container_name}"):
+                    ssh_capture(
+                        target,
+                        f"sudo docker rm -f {container_name} >/dev/null 2>&1 || true",
+                        ssh_opts=ssh_opts,
+                    )
+            if pending:
+                # A signal during cleanup may arrive AFTER the transfer.
+                # The local record must survive even failed/unavailable SSH.
+                if cancellation is None:
+                    with cleanup_step("could not record cancellation"):
+                        _record_remote_event(
+                            target,
+                            remote_run,
+                            "orchestrator_signalled",
+                            ssh_opts=ssh_opts,
+                            signal=pending[0].signal_name,
+                        )
+                _record_local_event(
+                    host_out,
+                    remote_run,
+                    "orchestrator_signalled",
+                    signal=pending[0].signal_name,
                 )
-            except Exception as exc:  # noqa: BLE001
-                print(
-                    f"+ warning: failed to remove container {container_name}: {exc}",
-                    flush=True,
-                )
+        if pending:
+            raise pending[0]
     result = DispatchResult(
         exit_code=exit_code,
         container_name=container_name,
