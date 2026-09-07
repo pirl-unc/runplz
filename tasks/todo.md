@@ -2578,7 +2578,7 @@ against the existing full suite.
 - [x] Implement configuration, detached entrypoint, receipt, status, collection.
 - [x] Add offline regression coverage, README workflow, and feature version bump to 4.5.0.
 - [x] Run `./format.sh`, `./lint.sh`, `./test.sh`; inspect full diff.
-- [ ] Push branch and open a PR closing #165; verify CI.
+- [x] Push branch and open [PR #169](https://github.com/pirl-unc/runplz/pull/169) closing #165.
 
 ### Review / handoff
 
@@ -2588,4 +2588,7 @@ its own record, never an older copy of the launch receipt. Atomic writes close
 files before replacement, and collection also protects case-insensitive metadata
 paths. The generated entrypoint and real bounded subprocess paths are tested
 offline. No paid Modal jobs launched.
+CI verification and final handoff are recorded on PR #169. A pre-existing omission
+in the billed-command test guard (Modal is not blocked) is tracked separately in
+[issue #170](https://github.com/pirl-unc/runplz/issues/170) and linked from the PR.
 This request is to open a PR; leave merge/deploy for explicit approval.
