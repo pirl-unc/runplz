@@ -2527,3 +2527,65 @@ script (isolated build tooling, lint/test gates, fresh distributions, PyPI uploa
 - [ ] Record the release verification on the PR and inspect relevant open issues for next work.
 
 Release results will be recorded on the merged PR, keeping the released main worktree clean.
+
+## 2026-09-07 PR Plan — Detached Modal launch and later collection (#165)
+
+Branch: `feat/modal-detach-collect`, based on clean main 4.4.4.
+
+### Spec
+
+The generated local entrypoint currently calls `runner.remote()`: adding Modal's
+`--detach` alone does not make launch return. Add `ModalConfig(detach=False)` and
+a Modal-only `--detach` / `--no-detach` CLI override. Detached execution uses
+`modal run --detach` **and** `runner.spawn()`, returning a saved receipt instead
+of waiting for training or downloading artifacts.
+
+Detached jobs require a named volume mounted at `/out`. Set `RUNPLZ_OUT` to an
+isolated `/out/runplz/<run-id>` directory; jobs must use that environment variable.
+Reserve `<outputs-dir>/.runplz/run.json` before launching, refuse to overwrite an
+existing receipt, and atomically record app/function/call IDs, volume ID/name,
+and the configured Modal environment (or workspace default). Save app identity
+before submission so an interrupted/ambiguous submission is inspectable and never
+automatically retried.
+Never store credentials. Volume ID checks prevent a changed environment/profile
+or a deleted/recreated volume from silently collecting another run's data.
+
+The remote wrapper records the bootstrap exit code in the run-specific volume
+and explicitly commits it, including ordinary job failures. This durable result
+survives Modal's seven-day function-result retention. Forced container termination
+may have no marker; a nonblocking FunctionCall lookup can still report timeout,
+pending, or expired/unknown without inventing success.
+
+`runplz status --outputs-dir DIR` routes Modal receipts to a bounded subprocess
+probe, leaving SSH status unchanged. It prints identifiers and native Modal log /
+stop commands. `runplz collect --outputs-dir DIR [--timeout SECONDS]` probes first,
+refuses to wait for pending jobs, and downloads only that run's volume subtree.
+Failed/expired jobs can salvage artifacts without claiming success. Downloads are
+bounded, per-file atomic, retryable, path-checked, and cannot overwrite the local
+receipt. No deployment or new submission occurs during status/collection.
+
+Keep provider APIs isolated from the parent process so SDK/network waits have a
+real wall-clock bound. No paid cloud runs in verification; execute generated
+entrypoints against faithful fake Modal objects, check APIs against installed
+Modal 1.1.4 plus official docs, and test submission, failure, persistence, scope,
+collection, and CLI behavior. Attached behavior and all other backends regress
+against the existing full suite.
+
+### Checklist
+
+- [x] Inspect issue, existing backend/tests, local SDK, and official Modal docs.
+- [x] Write spec and check in before implementation.
+- [x] Implement configuration, detached entrypoint, receipt, status, collection.
+- [x] Add offline regression coverage, README workflow, and feature version bump to 4.5.0.
+- [x] Run `./format.sh`, `./lint.sh`, `./test.sh`; inspect full diff.
+- [ ] Push branch and open a PR closing #165; verify CI.
+
+### Review / handoff
+
+Final full gate: format/lint passed; **1,497 passed, 1 skipped, 95.88% coverage**.
+Final review added a fast-job acknowledgment race regression: collection writes
+its own record, never an older copy of the launch receipt. Atomic writes close
+files before replacement, and collection also protects case-insensitive metadata
+paths. The generated entrypoint and real bounded subprocess paths are tested
+offline. No paid Modal jobs launched.
+This request is to open a PR; leave merge/deploy for explicit approval.

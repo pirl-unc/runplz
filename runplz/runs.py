@@ -107,6 +107,12 @@ def resolve_target_and_meta(
         meta = f"~/{REMOTE_RUNS_DIR}/{run_id_override}/out/{REMOTE_META_DIRNAME}"
         return (host_override, meta, {})
     manifest = read_manifest(outputs_dir)
+    if manifest.get("backend") == "modal" and not host_override:
+        raise RuntimeError(
+            "For Modal logs/cancellation, use `modal app logs <app-id>` / "
+            "`modal app stop <app-id>`. `runplz status` shows the saved app ID; "
+            "`runplz collect` downloads its outputs."
+        )
     target = host_override or manifest.get("target") or ""
     if not target:
         raise RuntimeError(f"manifest at {outputs_dir} has no target host; pass --host to override")
@@ -175,6 +181,11 @@ def status(
     ssh_overrides: Optional[dict] = None,
 ) -> int:
     """Print a one-screen summary of the most recent run's state."""
+    if not host_override and not run_id_override and not ssh_overrides:
+        if read_manifest(outputs_dir).get("backend") == "modal":
+            from runplz.backends import modal_runs
+
+            return modal_runs.status(outputs_dir)
     target, meta, manifest = resolve_target_and_meta(
         outputs_dir=outputs_dir,
         host_override=host_override,

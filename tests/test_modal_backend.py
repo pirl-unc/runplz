@@ -577,6 +577,8 @@ def test_a_volume_backed_run_keeps_outputs_off_the_function_return(tmp_path):
         image_construction="image = modal.Image.debian_slim()",
         volumes=fn.volumes,
         out_on_volume=modal_backend._outputs_are_volume_backed(fn.volumes),
+        detached_receipt=None,
+        run_id=None,
     )
     compile(src, "<generated>", "exec")
     assert "_OUT_ON_VOLUME = True" in src

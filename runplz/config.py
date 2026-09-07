@@ -203,15 +203,17 @@ class SshConfig:
 
 @dataclass(frozen=True)
 class ModalConfig:
-    """Modal has nothing to configure today.
+    """Modal launch policy. Auth and environment use the Modal CLI's configuration.
 
-    Modal reads auth from `~/.modal.toml` and schedules resources from
-    `@app.function(gpu=..., cpu=..., memory=...)`. This class exists as
-    a slot in `App(modal_config=...)` so we don't break the signature
-    when we add real fields. Until then, `ModalConfig()` is a no-op.
+    Detached jobs return after submission and require a volume mounted at /out.
+    Use `runplz collect` later to download their run-specific outputs.
     """
 
-    pass
+    detach: bool = False
+
+    def __post_init__(self):
+        if not isinstance(self.detach, bool):
+            raise ValueError("ModalConfig.detach must be a bool.")
 
 
 _VALID_CLOUD_ON_FINISH = ("delete", "stop", "leave")

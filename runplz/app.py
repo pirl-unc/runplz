@@ -238,6 +238,7 @@ class App:
         host: Optional[str] = None,
         outputs_dir: str = "out",
         build: bool = True,
+        detach: Optional[bool] = None,
         repo_root: Optional[Path] = None,
     ) -> "App":
         """Attach a backend to this App from pure Python, no CLI needed.
@@ -252,6 +253,8 @@ class App:
           build: local-only. `False` skips `docker build` and reuses the last
             tagged image. Rejected for non-local backends (Brev rebuilds on
             the remote; Modal manages its own layer cache).
+          detach: Modal-only override of ModalConfig.detach. Return after
+            submission; collect persistent outputs later with `runplz collect`.
           repo_root: skip the git lookup and use this. The CLI knows the
             script being run, which is more authoritative than the module a
             function happens to be defined in — and it saves a second
@@ -269,6 +272,11 @@ class App:
         and one-off runs where you already have `app` in scope.
         """
         spec = registry.get(backend)
+        if detach is not None:
+            if not isinstance(detach, bool):
+                raise ValueError("detach must be a bool or None.")
+            if not spec.accepts_detach:
+                raise ValueError("--detach / --no-detach only applies to the modal backend.")
         if spec.required_config_attr and getattr(self, spec.required_config_attr) is None:
             raise ValueError(
                 f"backend={backend!r} needs App(..., {spec.required_config_attr}=...). "
@@ -330,6 +338,8 @@ class App:
             self._repo_root_value = repo_root_for(Path(any_fn.module_file))
         self._backend = backend
         self._backend_kwargs = {"outputs_dir": outputs_dir}
+        if spec.accepts_detach and detach is not None:
+            self._backend_kwargs["detach"] = detach
         # Which selector each backend takes comes from the registry too, so
         # this stays right when a backend is added.
         if spec.accepts_instance:

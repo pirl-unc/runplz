@@ -67,6 +67,7 @@ class BackendSpec:
     # A backend that cannot must reject `volumes=` rather than drop it: a
     # silently ignored durability request is how outputs go missing.
     accepts_volumes: bool = False
+    accepts_detach: bool = False
 
 
 BACKENDS = {
@@ -91,6 +92,7 @@ BACKENDS = {
             module="runplz.backends.modal",
             listing=ListingSpec(),
             accepts_volumes=True,
+            accepts_detach=True,
         ),
         BackendSpec(
             name="ssh",
