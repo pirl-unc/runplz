@@ -95,3 +95,11 @@
 - Match offline evidence against the full recorded endpoint, not just its hostname: forwarded
   SSH ports can select different machines. Use the same effective options as the live probe, and
   test overrides that change endpoint identity separately from overrides that only change credentials.
+- Exercise provider result decoding, not only invented exception stubs: a provider-confirmed
+  terminal result can arrive as an SDK exception. Classify it at the result boundary so ordinary
+  authentication, connection, and lookup errors are still unknown, while terminated jobs can
+  salvage already-committed artifacts.
+- A worker's finally block cannot clean up after the parent kills that worker. Give temporary
+  downloads a parent-owned, per-attempt directory and test actual process termination after a
+  partial write. Atomic destination replacement protects old files, but does not by itself
+  prevent temporary-file leaks.

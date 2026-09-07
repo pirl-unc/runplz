@@ -920,16 +920,22 @@ another machine. `status` prints native `modal app logs <app-id>` and
 A pending job returns code **3** immediately without downloading or relaunching.
 Downloads have a separate 600-second limit; increase it for large outputs with
 `--timeout 3600`. Files are replaced atomically, and interrupted downloads can be
-retried with the same command. Local launch metadata is never overwritten by
-downloaded files. Successful jobs return **0**, failed jobs with salvaged outputs
-return **1**, and unknown outcomes or observation/download errors return **2**.
+retried with the same command. The parent owns a private staging directory for
+each attempt and removes incomplete files even when it kills the download worker
+on timeout; previously completed files remain intact. Local launch metadata is
+never overwritten by downloaded files. Successful jobs return **0**, failed jobs
+with salvaged outputs return **1**, and unknown outcomes or observation/download
+errors return **2**.
 
 The remote wrapper commits outputs and a completion record even for ordinary
 job failures. That record survives Modal's
 [seven-day result retention](https://modal.com/docs/guide/job-queue). Forced
 termination can prevent the final commit, so only previously committed outputs
-may be recoverable; without a completion record or retained call result, status
-reports unknown/expired and collection never claims the job succeeded.
+may be recoverable. A retained provider-reported termination is a failed job and
+allows collection of those outputs; authentication, connection, and lookup errors
+remain unknown and do not start a download. Without a completion record or retained
+call result, status reports unknown/expired and collection never claims the job
+succeeded.
 If submission itself is interrupted, keep the receipt and inspect the saved app
 before launching again: work may have been accepted before the client lost its
 acknowledgment. runplz never retries an ambiguous submission automatically.

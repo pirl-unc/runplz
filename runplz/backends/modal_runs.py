@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
@@ -28,8 +28,10 @@ def _receipt_path(outputs_dir):
 
 
 @contextmanager
-def _atomic_file(path, *, mode="wb"):
-    temporary = tempfile.NamedTemporaryFile(mode=mode, dir=path.parent, delete=False)
+def _atomic_file(path, *, mode="wb", staging_dir=None):
+    temporary = tempfile.NamedTemporaryFile(
+        mode=mode, dir=staging_dir if staging_dir is not None else path.parent, delete=False
+    )
     try:
         with temporary as f:
             yield f
@@ -183,12 +185,17 @@ def _probe(receipt):
         return {"state": "failed", "detail": "Modal function timeout"}
     except modal.exception.OutputExpiredError:
         return {"state": "expired", "detail": "Result expired; completion unknown"}
+    except modal.exception.RemoteError as exc:
+        # FunctionCall.get decodes provider-reported terminal failures (including
+        # GENERIC_STATUS_TERMINATED) as RemoteError. Keep this catch confined to
+        # result retrieval: ID/volume lookup and transport errors remain unknown.
+        return {"state": "failed", "detail": f"Modal remote failure: {exc}"}
     except TimeoutError:
         return {"state": "pending"}
     return _outcome(code)
 
 
-def _download(receipt, outputs_dir):
+def _download(receipt, outputs_dir, *, staging_dir):
     from modal.volume import FileEntryType
 
     volume = _volume(receipt)
@@ -215,7 +222,7 @@ def _download(receipt, outputs_dir):
             destination.mkdir(parents=True, exist_ok=True)
         elif entry.type == FileEntryType.FILE:
             destination.parent.mkdir(parents=True, exist_ok=True)
-            with _atomic_file(destination) as f:
+            with _atomic_file(destination, staging_dir=staging_dir) as f:
                 volume.read_file_into_fileobj(entry.path, f)
             count += 1
         else:
@@ -223,23 +230,33 @@ def _download(receipt, outputs_dir):
     return {"files": count}
 
 
-def _worker(operation, outputs_dir):
+def _worker(operation, outputs_dir, staging_dir=None):
     receipt = _read(outputs_dir)
     if operation == "probe":
         return _probe(receipt)
     if operation == "download":
-        return _download(receipt, outputs_dir)
+        if staging_dir is None:
+            raise ValueError("Download worker requires parent-owned staging.")
+        return _download(receipt, outputs_dir, staging_dir=staging_dir)
     raise ValueError("Unknown Modal worker operation.")
 
 
 def _bounded_worker(operation, outputs_dir, *, timeout):
     try:
-        result = subprocess.run(
-            [sys.executable, "-m", "runplz.backends.modal_runs", operation, str(outputs_dir)],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        with ExitStack() as cleanup:
+            cmd = [sys.executable, "-m", "runplz.backends.modal_runs", operation, str(outputs_dir)]
+            if operation == "download":
+                meta = _receipt_path(outputs_dir).parent
+                meta.mkdir(parents=True, exist_ok=True)
+                # Same filesystem as outputs for atomic publication, and inside
+                # reserved metadata so remote files cannot overwrite the staging
+                # area. The parent owns cleanup: subprocess.run kills AND waits
+                # for a timed-out worker before this context removes its partials.
+                staging = cleanup.enter_context(
+                    tempfile.TemporaryDirectory(dir=meta, prefix="download-")
+                )
+                cmd.append(staging)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(
             f"Modal {operation} unavailable ({exc}); retry without relaunching."
@@ -323,7 +340,8 @@ def collect(outputs_dir, *, timeout=600):
 
 if __name__ == "__main__":
     try:
-        print(json.dumps(_worker(sys.argv[1], Path(sys.argv[2]))))
+        staging = Path(sys.argv[3]) if len(sys.argv) > 3 else None
+        print(json.dumps(_worker(sys.argv[1], Path(sys.argv[2]), staging)))
     except Exception as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         sys.exit(2)

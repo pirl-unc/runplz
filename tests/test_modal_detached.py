@@ -4,11 +4,14 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import modal as modal_sdk
 import pytest
+from modal_proto import api_pb2
 
 from runplz import App, Image, ModalConfig, cli, runs
 from runplz.backends import modal as backend
@@ -17,12 +20,6 @@ from runplz.backends import modal_runs
 
 @pytest.fixture
 def sdk(monkeypatch):
-    class FunctionTimeoutError(Exception):
-        pass
-
-    class OutputExpiredError(Exception):
-        pass
-
     volume = mock.Mock(object_id="vo-original")
     volume.read_file.side_effect = FileNotFoundError
     volume.iterdir.return_value = []
@@ -31,9 +28,7 @@ def sdk(monkeypatch):
     fake = SimpleNamespace(
         Volume=mock.Mock(),
         FunctionCall=mock.Mock(),
-        exception=SimpleNamespace(
-            FunctionTimeoutError=FunctionTimeoutError, OutputExpiredError=OutputExpiredError
-        ),
+        exception=modal_sdk.exception,
         Image=mock.Mock(),
     )
     fake.Volume.from_name.return_value = volume
@@ -64,6 +59,12 @@ def receipt(tmp_path):
     )
     modal_runs._write(path, data)
     return path, data
+
+
+@pytest.fixture
+def staging(receipt):
+    with tempfile.TemporaryDirectory(dir=receipt[0].parent) as directory:
+        yield Path(directory)
 
 
 def _app(tmp_path, *, detach=True, volumes=None):
@@ -417,7 +418,7 @@ def _entry(data, suffix, kind=1):
     return SimpleNamespace(path=data["remote_path"].lstrip("/") + suffix, type=kind)
 
 
-def test_download_scopes_outputs_preserves_metadata_and_is_repeatable(receipt, sdk):
+def test_download_scopes_outputs_preserves_metadata_and_is_repeatable(receipt, sdk, staging):
     path, data = receipt
     sdk[1].iterdir.return_value = [
         _entry(data, "", 2),
@@ -428,41 +429,41 @@ def test_download_scopes_outputs_preserves_metadata_and_is_repeatable(receipt, s
     ]
     sdk[1].read_file_into_fileobj.side_effect = lambda remote, f: f.write(b"weights")
     for _ in range(2):
-        assert modal_runs._download(data, path.parent.parent) == {"files": 1}
+        assert modal_runs._download(data, path.parent.parent, staging_dir=staging) == {"files": 1}
     assert (path.parent.parent / "checkpoints/best.bin").read_bytes() == b"weights"
     assert json.loads(path.read_text()) == data
     sdk[1].iterdir.assert_called_with(data["remote_path"].lstrip("/"), recursive=True)
 
 
 @pytest.mark.parametrize("suffix, kind", [("/../escape", 1), ("/link", 3)])
-def test_unsafe_remote_files_rejected(receipt, sdk, suffix, kind):
+def test_unsafe_remote_files_rejected(receipt, sdk, staging, suffix, kind):
     sdk[1].iterdir.return_value = [_entry(receipt[1], suffix, kind)]
     with pytest.raises(ValueError):
-        modal_runs._download(receipt[1], receipt[0].parent.parent)
+        modal_runs._download(receipt[1], receipt[0].parent.parent, staging_dir=staging)
 
 
-def test_volume_cannot_return_another_runs_files(receipt, sdk):
+def test_volume_cannot_return_another_runs_files(receipt, sdk, staging):
     sdk[1].iterdir.return_value = [SimpleNamespace(path="runplz/other/file", type=1)]
     with pytest.raises(ValueError, match="escaped"):
-        modal_runs._download(receipt[1], receipt[0].parent.parent)
+        modal_runs._download(receipt[1], receipt[0].parent.parent, staging_dir=staging)
 
 
-def test_symlink_destination_cannot_escape_collection(receipt, sdk, tmp_path):
+def test_symlink_destination_cannot_escape_collection(receipt, sdk, staging, tmp_path):
     sdk[1].iterdir.return_value = [_entry(receipt[1], "/link/file")]
     outside = tmp_path / "outside"
     outside.mkdir()
     (tmp_path / "link").symlink_to(outside, target_is_directory=True)
     with pytest.raises(ValueError, match="symlink"):
-        modal_runs._download(receipt[1], tmp_path)
+        modal_runs._download(receipt[1], tmp_path, staging_dir=staging)
     assert not list(outside.iterdir())
 
 
-def test_failed_file_download_preserves_previous_complete_file(receipt, sdk, tmp_path):
+def test_failed_file_download_preserves_previous_complete_file(receipt, sdk, staging, tmp_path):
     sdk[1].iterdir.return_value = [_entry(receipt[1], "/weights")]
     sdk[1].read_file_into_fileobj.side_effect = RuntimeError("disconnected")
     (tmp_path / "weights").write_bytes(b"previous")
     with pytest.raises(RuntimeError, match="disconnected"):
-        modal_runs._download(receipt[1], tmp_path)
+        modal_runs._download(receipt[1], tmp_path, staging_dir=staging)
     assert (tmp_path / "weights").read_bytes() == b"previous"
     assert sorted(p.name for p in tmp_path.iterdir()) == [".runplz", "weights"]
 
@@ -616,10 +617,12 @@ def test_cli_collect(tmp_path, monkeypatch):
         cli.main(["collect", "--timeout", "0"])
 
 
-def test_worker_dispatch(receipt, sdk):
+def test_worker_dispatch(receipt, sdk, staging):
     out = receipt[0].parent.parent
     assert modal_runs._worker("probe", out)["state"] == "pending"
-    assert modal_runs._worker("download", out) == {"files": 0}
+    assert modal_runs._worker("download", out, staging) == {"files": 0}
+    with pytest.raises(ValueError, match="parent-owned staging"):
+        modal_runs._worker("download", out)
     with pytest.raises(ValueError, match="Unknown"):
         modal_runs._worker("oops", out)
 
@@ -696,3 +699,175 @@ def test_explicit_attached_override_keeps_blocking_backend_path(tmp_path, sdk, m
     assert len(commands) == 1
     extract.assert_called_once()
     assert not (tmp_path / "out/.runplz/run.json").exists()
+
+
+def test_provider_termination_allows_status_and_committed_artifact_salvage(
+    receipt, sdk, staging, monkeypatch, capsys
+):
+    # Exercise the installed SDK's actual GenericResult decoding, not a made-up
+    # exception. The only provider boundary is an offline gRPC response stub.
+    response = api_pb2.FunctionGetOutputsResponse(
+        outputs=[
+            api_pb2.FunctionGetOutputsItem(
+                result=api_pb2.GenericResult(
+                    status=api_pb2.GenericResult.GENERIC_STATUS_TERMINATED,
+                    exception="Function was terminated",
+                ),
+                data_format=api_pb2.DATA_FORMAT_PICKLE,
+            )
+        ],
+    )
+    rpc = mock.AsyncMock(return_value=response)
+    client = SimpleNamespace(stub=SimpleNamespace(FunctionGetOutputs=rpc))
+    call = modal_sdk.FunctionCall.from_id("fc-call", client=client)
+    sdk[0].FunctionCall.from_id.return_value = call
+    path, data = receipt
+    sdk[1].iterdir.return_value = [_entry(data, "/checkpoint")]
+    sdk[1].read_file_into_fileobj.side_effect = lambda remote, f: f.write(b"committed")
+    monkeypatch.setattr(
+        modal_runs,
+        "_bounded_worker",
+        lambda operation, outputs_dir, **kwargs: modal_runs._worker(
+            operation, outputs_dir, staging
+        ),
+    )
+    assert modal_runs.status(path.parent.parent) == 0
+    assert "state: failed" in capsys.readouterr().out
+    assert modal_runs.collect(path.parent.parent) == 1
+    assert (path.parent.parent / "checkpoint").read_bytes() == b"committed"
+    outcome = json.loads(path.with_name("modal-collection.json").read_text())["outcome"]
+    assert outcome["state"] == "failed"
+    assert "terminated" in outcome["detail"]
+    assert "exit_code" not in outcome  # the provider did not supply one
+    assert rpc.call_count == 2
+
+
+_DOWNLOAD_WORKER_WITH_FAKE_VOLUME = """
+import os
+import runpy
+import sys
+import time
+from types import SimpleNamespace
+
+sys.modules["modal.volume"] = SimpleNamespace(
+    FileEntryType=SimpleNamespace(FILE=1, DIRECTORY=2)
+)
+
+class Volume:
+    object_id = "vo-original"
+
+    def hydrate(self):
+        return self
+
+    def iterdir(self, root, **kwargs):
+        yield SimpleNamespace(path=root + "/first", type=1)
+        yield SimpleNamespace(path=root + "/weights", type=1)
+
+    def read_file_into_fileobj(self, remote, f):
+        if remote.endswith("/first"):
+            f.write(b"first file completed")
+            return
+        mode = os.environ["RUNPLZ_TEST_DOWNLOAD_MODE"]
+        if mode != "success":
+            f.write(b"partial download")
+            f.flush()
+            print("partial-written", flush=True)
+            if mode == "timeout":
+                time.sleep(30)
+            elif mode == "crash":
+                os._exit(7)
+        f.write(b"complete output")
+
+sys.modules["modal"] = SimpleNamespace(
+    Volume=SimpleNamespace(from_name=lambda name, **kwargs: Volume())
+)
+runpy.run_module("runplz.backends.modal_runs", run_name="__main__", alter_sys=True)
+"""
+
+
+@pytest.mark.parametrize("failure", ["timeout", "crash"])
+def test_parent_cleans_partial_downloads_after_worker_death_and_retry(
+    receipt, monkeypatch, failure
+):
+    path, data = receipt
+    out = path.parent.parent
+    weights = out / "weights"
+    weights.write_bytes(b"previous complete output")
+    first = out / "first"
+    first.write_bytes(b"old first file")
+    unrelated = path.parent / "download-unrelated"
+    unrelated.mkdir()
+    (unrelated / "user-file").write_bytes(b"keep me")
+    original_paths = set(out.rglob("*"))
+    real_run = subprocess.run
+    observed_failures = []
+
+    def run(cmd, **kwargs):
+        # Replace only the provider with a fake. Keep the real bounded
+        # subprocess, worker, file streaming, atomic writer, and parent cleanup.
+        assert cmd[1:4] == ["-m", "runplz.backends.modal_runs", "download"]
+        command = [cmd[0], "-c", _DOWNLOAD_WORKER_WITH_FAKE_VOLUME, *cmd[3:]]
+        try:
+            result = real_run(command, **kwargs)
+        except subprocess.TimeoutExpired as exc:
+            assert b"partial-written" in exc.stdout  # it really died mid-file
+            observed_failures.append(failure)
+            raise
+        if result.returncode:
+            assert "partial-written" in result.stdout
+            observed_failures.append(failure)
+        return result
+
+    monkeypatch.setattr(modal_runs.subprocess, "run", run)
+    monkeypatch.setenv("RUNPLZ_TEST_DOWNLOAD_MODE", failure)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="retry without relaunching"):
+            modal_runs._bounded_worker("download", out, timeout=2)
+        assert weights.read_bytes() == b"previous complete output"
+        assert first.read_bytes() == b"first file completed"
+        assert set(out.rglob("*")) == original_paths
+        assert json.loads(path.read_text()) == data
+    assert observed_failures == [failure, failure]
+    monkeypatch.setenv("RUNPLZ_TEST_DOWNLOAD_MODE", "success")
+    assert modal_runs._bounded_worker("download", out, timeout=10) == {"files": 2}
+    assert weights.read_bytes() == b"complete output"
+    assert set(out.rglob("*")) == original_paths
+    assert (unrelated / "user-file").read_bytes() == b"keep me"
+
+
+@pytest.mark.parametrize("boundary", ["volume_lookup", "volume_read", "call_lookup"])
+def test_remote_errors_outside_result_lookup_remain_observation_errors(receipt, sdk, boundary):
+    operation = {
+        "volume_lookup": sdk[1].hydrate,
+        "volume_read": sdk[1].read_file,
+        "call_lookup": sdk[0].FunctionCall.from_id,
+    }[boundary]
+    operation.side_effect = modal_sdk.exception.RemoteError("observation failed")
+    with pytest.raises(modal_sdk.exception.RemoteError, match="observation failed"):
+        modal_runs._probe(receipt[1])
+    sdk[2].get.assert_not_called()
+
+
+@pytest.mark.parametrize("error", ["AuthError", "ConnectionError", "InternalFailure"])
+def test_nonterminal_sdk_errors_remain_observation_errors(receipt, sdk, error):
+    exception = getattr(modal_sdk.exception, error)
+    sdk[2].get.side_effect = exception("observation failed")
+    with pytest.raises(exception, match="observation failed"):
+        modal_runs._probe(receipt[1])
+
+
+def test_worker_refuses_download_without_parent_owned_staging(receipt):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "runplz.backends.modal_runs",
+            "download",
+            str(receipt[0].parent.parent),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 2
+    assert "requires parent-owned staging" in result.stderr

@@ -2592,3 +2592,37 @@ CI verification and final handoff are recorded on PR #169. A pre-existing omissi
 in the billed-command test guard (Modal is not blocked) is tracked separately in
 [issue #170](https://github.com/pirl-unc/runplz/issues/170) and linked from the PR.
 This request is to open a PR; leave merge/deploy for explicit approval.
+
+### PR #169 review fixes — terminated-job salvage and worker-timeout cleanup
+
+Keep the existing feature branch and the PR's 4.5.0 version bump. Fix both review
+findings without expanding the launch/configuration surface.
+
+- [x] Confirm the SDK result path and the current temporary-file ownership.
+- [x] Classify `modal.exception.RemoteError` only from `FunctionCall.get` as a
+      provider-reported failed result. Leave volume lookup, authentication,
+      connection failures, retriable internal failures, and ID lookup failures
+      as observation errors. Preserve pending and expired semantics.
+- [x] Give the parent one private staging directory per download attempt under
+      local `.runplz`. Pass it to the worker and create incomplete files there;
+      publish each finished file with atomic replacement. Remove that exact
+      directory after the worker exits or is killed, including timeout/error
+      paths. Do not scan/delete unrelated files or another attempt's staging.
+- [x] Add regression coverage using actual SDK termination decoding and a real
+      child process killed midway through the real download implementation.
+      Verify repeated timeouts, retry success, previous good files, and unrelated
+      data. Keep all provider calls offline.
+- [x] Update documentation and lessons; run format, lint, full tests, and diff review.
+
+Publication and CI verification are recorded on PR #169. Merging/deployment remain
+outside this review-fix request.
+
+Tracked in [issue #171](https://github.com/pirl-unc/runplz/issues/171). Baseline
+regressions failed at the real SDK's `GENERIC_STATUS_TERMINATED` decoder and left
+partial files after both timeout and abrupt worker exit. After the fixes, all
+118 detached lifecycle tests pass, including repeated failed attempts followed
+by success, already-completed files, and unrelated staging/data preservation.
+Final gates: `./format.sh` and `./lint.sh` pass; `./test.sh` reports **1,507 passed,
+1 skipped, 95.91% overall coverage**, with 100% line/branch coverage for
+`modal_runs.py`. The subprocess regression runs the real worker CLI and downloader
+with only the Modal provider replaced by a fake. No paid cloud calls were made.
