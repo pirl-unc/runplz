@@ -103,3 +103,6 @@
   downloads a parent-owned, per-attempt directory and test actual process termination after a
   partial write. Atomic destination replacement protects old files, but does not by itself
   prevent temporary-file leaks.
+- Test SDK integrations against both the minimum supported and currently resolved versions.
+  A stub that works with an eager loader may fail when a newer SDK hydrates lazily. Model the
+  real client/lookup protocol and keep hydration errors outside terminal-result classification.

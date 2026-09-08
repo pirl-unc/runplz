@@ -718,8 +718,17 @@ def test_provider_termination_allows_status_and_committed_artifact_salvage(
         ],
     )
     rpc = mock.AsyncMock(return_value=response)
-    client = SimpleNamespace(stub=SimpleNamespace(FunctionGetOutputs=rpc))
+    client = SimpleNamespace(
+        _snapshotted=False,
+        stub=SimpleNamespace(
+            FunctionGetOutputs=rpc,
+            FunctionCallFromId=mock.AsyncMock(
+                return_value=api_pb2.FunctionCallFromIdResponse(num_inputs=1)
+            ),
+        ),
+    )
     call = modal_sdk.FunctionCall.from_id("fc-call", client=client)
+    call.hydrate(client=client)
     sdk[0].FunctionCall.from_id.return_value = call
     path, data = receipt
     sdk[1].iterdir.return_value = [_entry(data, "/checkpoint")]
@@ -835,12 +844,15 @@ def test_parent_cleans_partial_downloads_after_worker_death_and_retry(
     assert (unrelated / "user-file").read_bytes() == b"keep me"
 
 
-@pytest.mark.parametrize("boundary", ["volume_lookup", "volume_read", "call_lookup"])
+@pytest.mark.parametrize(
+    "boundary", ["volume_lookup", "volume_read", "call_lookup", "call_hydrate"]
+)
 def test_remote_errors_outside_result_lookup_remain_observation_errors(receipt, sdk, boundary):
     operation = {
         "volume_lookup": sdk[1].hydrate,
         "volume_read": sdk[1].read_file,
         "call_lookup": sdk[0].FunctionCall.from_id,
+        "call_hydrate": sdk[2].hydrate,
     }[boundary]
     operation.side_effect = modal_sdk.exception.RemoteError("observation failed")
     with pytest.raises(modal_sdk.exception.RemoteError, match="observation failed"):

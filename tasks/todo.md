@@ -2626,3 +2626,15 @@ Final gates: `./format.sh` and `./lint.sh` pass; `./test.sh` reports **1,507 pas
 1 skipped, 95.91% overall coverage**, with 100% line/branch coverage for
 `modal_runs.py`. The subprocess regression runs the real worker CLI and downloader
 with only the Modal provider replaced by a fake. No paid cloud calls were made.
+
+CI follow-up: CI installs Modal 1.5.5 rather than local 1.1.4. Its FunctionCall
+hydration path exposed an incomplete fake client in the SDK integration test.
+Re-plan: exercise both SDK versions in isolated environments, model the actual
+ID lookup response, and hydrate the call explicitly outside result handling so
+lazy SDK lookup errors cannot be mistaken for terminal workload failures.
+The 119 detached lifecycle tests now pass with both Modal 1.1.4 and isolated
+Modal 1.5.5. The fake models snapshot state and the real FunctionCallFromId RPC
+response; an explicit hydration-error regression guards the observation boundary.
+Final follow-up gates: `./format.sh`, `./lint.sh`, and `./test.sh` pass with
+**1,508 passed, 1 skipped, 95.91% coverage**. `modal_runs.py` retains 100%
+line/branch coverage; `git diff --check` is clean.

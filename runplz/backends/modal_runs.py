@@ -179,6 +179,7 @@ def _probe(receipt):
     if "call_id" not in receipt:
         return {"state": "unconfirmed"}
     call = modal.FunctionCall.from_id(receipt["call_id"])
+    call.hydrate()  # keep lazy client/ID lookup failures outside result handling
     try:
         code = call.get(timeout=0)
     except modal.exception.FunctionTimeoutError:
