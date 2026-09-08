@@ -2638,3 +2638,16 @@ response; an explicit hydration-error regression guards the observation boundary
 Final follow-up gates: `./format.sh`, `./lint.sh`, and `./test.sh` pass with
 **1,508 passed, 1 skipped, 95.91% coverage**. `modal_runs.py` retains 100%
 line/branch coverage; `git diff --check` is clean.
+
+### PR #169 merge and deployment
+
+- [x] Confirm the reviewed PR head is mergeable, its required checks are green,
+      the worktree is clean, and the release version is already bumped to 4.5.0.
+- [x] Run `./format.sh`, `./lint.sh`, and `./test.sh` on the exact release head
+      (1,494 passed, 15 optional-environment skips; 95.91% coverage).
+- [x] Push this release checklist and require green CI on the final PR head.
+- [ ] Merge PR #169, switch to a clean `main`, and fast-forward from origin.
+- [ ] Run `./deploy.sh` from clean `main`; verify the pushed version tag and the
+      published PyPI version.
+- [ ] Review open issues for the next foundational block of work and record the
+      release outcome in the PR.
