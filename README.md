@@ -355,6 +355,7 @@ internal that can move in a patch release.
 | `runplz.backends.provisioning` | Retry policy, GPU shape tables, instance naming, and teardown shared by the cloud drivers. |
 | `runplz.backends.local`, `runplz.backends.ssh`, `runplz.backends.brev`, `runplz.backends.modal`, `runplz.backends.gcp`, `runplz.backends.aws` | The backend drivers. Each exports `run` and — where the backend declares a `ListingSpec` — `list_jobs`, returning `JobRecord`s. The contract `registry.load()` calls. Normally reached through the CLI or `App.bind()`, not imported directly. |
 | `runplz.backends.docker` | Container labels and `docker ps` parsing, shared by the local and ssh backends. |
+| `runplz.backends.modal_runs` | Detached Modal receipts (`prepare_run`, `record_launch`), bounded `status`, and later artifact `collect`. |
 | `runplz.selector` | `pick_machine` / `pick_machines` — cost-tolerance shape selection with an availability tiebreak. |
 | `runplz.excludes` | `DEFAULT_TRANSFER_EXCLUDES`, the secret-shaped patterns kept off every host -> remote transfer. |
 | `runplz.logcapture` | Tees the driver's stdout/stderr to a log file (what `--log-file` drives). |
@@ -575,16 +576,18 @@ teardown.
 
 ### ModalConfig
 
-`ModalConfig()` is a no-op today. Modal reads auth from `~/.modal.toml`
-and schedules resources from `@app.function(gpu=..., cpu=..., memory=...)`;
-we don't expose Modal-specific knobs. The class exists as a slot in
-`App(modal_config=...)` so the signature doesn't break when fields are added.
+`ModalConfig(detach=False)` keeps the default attached behavior: wait for
+completion, then download outputs. Set `detach=True` to return after submission
+and collect persistent outputs later. `runplz modal --detach` / `--no-detach`
+and `app.bind("modal", detach=True/False)` override the config for that binding.
+These overrides are rejected on other backends. Modal still reads credentials
+and environment from its own CLI configuration; resources remain on the function.
 
 ### Why not one unified config?
 
 Surveyed the fields — there is no genuine overlap today. Brev has real
-provisioning knobs (mode, instance type, docker-or-native); Modal has
-nothing we expose. A shared base class would be empty. If/when a
+provisioning knobs (mode, instance type, docker-or-native); Modal has a
+detached submission policy. A shared base class would be empty. If/when a
 genuinely cross-backend concept shows up (e.g. per-App secrets, a shared
 retry policy), we'll factor it into a `BaseConfig` then. Until then, the
 split is the honest API.
@@ -865,6 +868,77 @@ disappears with the box, and you would find out hours later.
 Brev / ssh don't have a direct volume equivalent — for durable output
 on those backends, write to a mounted network drive the box already
 has, or push to S3 at the end of the function.
+
+### Detached Modal jobs: launch now, collect later
+
+For a long job that must outlive its initiating terminal:
+
+```python
+import os
+from pathlib import Path
+from runplz import App, Image, ModalConfig
+
+app = App("report", modal_config=ModalConfig(detach=True))
+image = Image.from_registry("python:3.12-slim").pip_install("runplz>=4.5,<5").pip_install_local_dir(".")
+
+@app.function(image=image, volumes={"/out": "report-outputs"})
+def report():
+    # Always use RUNPLZ_OUT, not a hardcoded /out path, for detached jobs.
+    Path(os.environ["RUNPLZ_OUT"], "result.txt").write_text("finished\n")
+```
+
+```bash
+runplz modal jobs/report.py --outputs-dir out/report-001
+# Or add --detach to a script whose ModalConfig uses the attached default.
+runplz status --outputs-dir out/report-001
+runplz collect --outputs-dir out/report-001
+```
+
+Launch still waits for image preparation and submission, but never for the job
+result or an artifact download. The generated entrypoint uses both
+[`modal run --detach`](https://modal.com/docs/cli/latest/run) and
+[`Function.spawn()`](https://modal.com/docs/guide/function-invocation-methods).
+Adding only the CLI flag would still wait at `Function.remote()`.
+
+Detached runs require a named volume mounted exactly at `/out`, with no nested
+mounts under it. Each invocation sets `RUNPLZ_OUT=/out/runplz/<run-id>` and
+collection fetches only that subtree. Files written directly to `/out` or other
+volume mounts are **not** part of that run's collection. Use a separate local
+`--outputs-dir` for each launch: an existing run receipt is never overwritten.
+Remote outputs are retained after collection; delete them with Modal when no
+longer needed. No volume is automatically deleted.
+
+The receipt at `<outputs-dir>/.runplz/run.json` saves the app, function, and call
+IDs plus the volume's identity and configured Modal environment (or workspace
+default). No credentials are stored. Use the original Modal credentials;
+collection refuses a different or recreated volume, even with the same name.
+Copying the receipt and using the same credentials permits collection from
+another machine. `status` prints native `modal app logs <app-id>` and
+`modal app stop <app-id>` commands; `runplz tail` / `kill` remain SSH-backend verbs.
+
+`collect` first makes a nonblocking status check with a 20-second network limit.
+A pending job returns code **3** immediately without downloading or relaunching.
+Downloads have a separate 600-second limit; increase it for large outputs with
+`--timeout 3600`. Files are replaced atomically, and interrupted downloads can be
+retried with the same command. The parent owns a private staging directory for
+each attempt and removes incomplete files even when it kills the download worker
+on timeout; previously completed files remain intact. Local launch metadata is
+never overwritten by downloaded files. Successful jobs return **0**, failed jobs
+with salvaged outputs return **1**, and unknown outcomes or observation/download
+errors return **2**.
+
+The remote wrapper commits outputs and a completion record even for ordinary
+job failures. That record survives Modal's
+[seven-day result retention](https://modal.com/docs/guide/job-queue). Forced
+termination can prevent the final commit, so only previously committed outputs
+may be recoverable. A retained provider-reported termination is a failed job and
+allows collection of those outputs; authentication, connection, and lookup errors
+remain unknown and do not start a download. Without a completion record or retained
+call result, status reports unknown/expired and collection never claims the job
+succeeded.
+If submission itself is interrupted, keep the receipt and inspect the saved app
+before launching again: work may have been accepted before the client lost its
+acknowledgment. runplz never retries an ambiguous submission automatically.
 
 ## Caveats
 

@@ -2527,3 +2527,127 @@ script (isolated build tooling, lint/test gates, fresh distributions, PyPI uploa
 - [ ] Record the release verification on the PR and inspect relevant open issues for next work.
 
 Release results will be recorded on the merged PR, keeping the released main worktree clean.
+
+## 2026-09-07 PR Plan — Detached Modal launch and later collection (#165)
+
+Branch: `feat/modal-detach-collect`, based on clean main 4.4.4.
+
+### Spec
+
+The generated local entrypoint currently calls `runner.remote()`: adding Modal's
+`--detach` alone does not make launch return. Add `ModalConfig(detach=False)` and
+a Modal-only `--detach` / `--no-detach` CLI override. Detached execution uses
+`modal run --detach` **and** `runner.spawn()`, returning a saved receipt instead
+of waiting for training or downloading artifacts.
+
+Detached jobs require a named volume mounted at `/out`. Set `RUNPLZ_OUT` to an
+isolated `/out/runplz/<run-id>` directory; jobs must use that environment variable.
+Reserve `<outputs-dir>/.runplz/run.json` before launching, refuse to overwrite an
+existing receipt, and atomically record app/function/call IDs, volume ID/name,
+and the configured Modal environment (or workspace default). Save app identity
+before submission so an interrupted/ambiguous submission is inspectable and never
+automatically retried.
+Never store credentials. Volume ID checks prevent a changed environment/profile
+or a deleted/recreated volume from silently collecting another run's data.
+
+The remote wrapper records the bootstrap exit code in the run-specific volume
+and explicitly commits it, including ordinary job failures. This durable result
+survives Modal's seven-day function-result retention. Forced container termination
+may have no marker; a nonblocking FunctionCall lookup can still report timeout,
+pending, or expired/unknown without inventing success.
+
+`runplz status --outputs-dir DIR` routes Modal receipts to a bounded subprocess
+probe, leaving SSH status unchanged. It prints identifiers and native Modal log /
+stop commands. `runplz collect --outputs-dir DIR [--timeout SECONDS]` probes first,
+refuses to wait for pending jobs, and downloads only that run's volume subtree.
+Failed/expired jobs can salvage artifacts without claiming success. Downloads are
+bounded, per-file atomic, retryable, path-checked, and cannot overwrite the local
+receipt. No deployment or new submission occurs during status/collection.
+
+Keep provider APIs isolated from the parent process so SDK/network waits have a
+real wall-clock bound. No paid cloud runs in verification; execute generated
+entrypoints against faithful fake Modal objects, check APIs against installed
+Modal 1.1.4 plus official docs, and test submission, failure, persistence, scope,
+collection, and CLI behavior. Attached behavior and all other backends regress
+against the existing full suite.
+
+### Checklist
+
+- [x] Inspect issue, existing backend/tests, local SDK, and official Modal docs.
+- [x] Write spec and check in before implementation.
+- [x] Implement configuration, detached entrypoint, receipt, status, collection.
+- [x] Add offline regression coverage, README workflow, and feature version bump to 4.5.0.
+- [x] Run `./format.sh`, `./lint.sh`, `./test.sh`; inspect full diff.
+- [x] Push branch and open [PR #169](https://github.com/pirl-unc/runplz/pull/169) closing #165.
+
+### Review / handoff
+
+Final full gate: format/lint passed; **1,497 passed, 1 skipped, 95.88% coverage**.
+Final review added a fast-job acknowledgment race regression: collection writes
+its own record, never an older copy of the launch receipt. Atomic writes close
+files before replacement, and collection also protects case-insensitive metadata
+paths. The generated entrypoint and real bounded subprocess paths are tested
+offline. No paid Modal jobs launched.
+CI verification and final handoff are recorded on PR #169. A pre-existing omission
+in the billed-command test guard (Modal is not blocked) is tracked separately in
+[issue #170](https://github.com/pirl-unc/runplz/issues/170) and linked from the PR.
+This request is to open a PR; leave merge/deploy for explicit approval.
+
+### PR #169 review fixes — terminated-job salvage and worker-timeout cleanup
+
+Keep the existing feature branch and the PR's 4.5.0 version bump. Fix both review
+findings without expanding the launch/configuration surface.
+
+- [x] Confirm the SDK result path and the current temporary-file ownership.
+- [x] Classify `modal.exception.RemoteError` only from `FunctionCall.get` as a
+      provider-reported failed result. Leave volume lookup, authentication,
+      connection failures, retriable internal failures, and ID lookup failures
+      as observation errors. Preserve pending and expired semantics.
+- [x] Give the parent one private staging directory per download attempt under
+      local `.runplz`. Pass it to the worker and create incomplete files there;
+      publish each finished file with atomic replacement. Remove that exact
+      directory after the worker exits or is killed, including timeout/error
+      paths. Do not scan/delete unrelated files or another attempt's staging.
+- [x] Add regression coverage using actual SDK termination decoding and a real
+      child process killed midway through the real download implementation.
+      Verify repeated timeouts, retry success, previous good files, and unrelated
+      data. Keep all provider calls offline.
+- [x] Update documentation and lessons; run format, lint, full tests, and diff review.
+
+Publication and CI verification are recorded on PR #169. Merging/deployment remain
+outside this review-fix request.
+
+Tracked in [issue #171](https://github.com/pirl-unc/runplz/issues/171). Baseline
+regressions failed at the real SDK's `GENERIC_STATUS_TERMINATED` decoder and left
+partial files after both timeout and abrupt worker exit. After the fixes, all
+118 detached lifecycle tests pass, including repeated failed attempts followed
+by success, already-completed files, and unrelated staging/data preservation.
+Final gates: `./format.sh` and `./lint.sh` pass; `./test.sh` reports **1,507 passed,
+1 skipped, 95.91% overall coverage**, with 100% line/branch coverage for
+`modal_runs.py`. The subprocess regression runs the real worker CLI and downloader
+with only the Modal provider replaced by a fake. No paid cloud calls were made.
+
+CI follow-up: CI installs Modal 1.5.5 rather than local 1.1.4. Its FunctionCall
+hydration path exposed an incomplete fake client in the SDK integration test.
+Re-plan: exercise both SDK versions in isolated environments, model the actual
+ID lookup response, and hydrate the call explicitly outside result handling so
+lazy SDK lookup errors cannot be mistaken for terminal workload failures.
+The 119 detached lifecycle tests now pass with both Modal 1.1.4 and isolated
+Modal 1.5.5. The fake models snapshot state and the real FunctionCallFromId RPC
+response; an explicit hydration-error regression guards the observation boundary.
+Final follow-up gates: `./format.sh`, `./lint.sh`, and `./test.sh` pass with
+**1,508 passed, 1 skipped, 95.91% coverage**. `modal_runs.py` retains 100%
+line/branch coverage; `git diff --check` is clean.
+
+### PR #169 merge and deployment
+
+- [x] Confirm the reviewed PR head is mergeable, its required checks are green,
+      the worktree is clean, and the release version is already bumped to 4.5.0.
+- [x] Run `./format.sh`, `./lint.sh`, and `./test.sh` on the exact release head
+      (1,494 passed, 15 optional-environment skips; 95.91% coverage).
+- [x] Push this release checklist and require green CI on the final PR head.
+- [ ] Merge PR #169, switch to a clean `main`, and fast-forward from origin.
+- [ ] Run `./deploy.sh` from clean `main`; verify the pushed version tag and the
+      published PyPI version.
+- [ ] Review open issues for the next foundational block of work and record the
+      release outcome in the PR.

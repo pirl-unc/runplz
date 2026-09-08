@@ -42,6 +42,7 @@ import io
 import json
 import os
 import re
+import shlex
 import subprocess
 import tarfile
 import tempfile
@@ -54,8 +55,10 @@ _ENTRYPOINT_TEMPLATE = '''\
 """Generated Modal entrypoint for runplz. Do not edit."""
 
 import io
+import json
 import os
 import subprocess
+import sys
 import tarfile
 
 import modal
@@ -74,6 +77,8 @@ _VOLUMES = {volumes!r}
 # return -- that return is capped at ~256 MB, which is the whole reason a
 # volume was asked for.
 _OUT_ON_VOLUME = {out_on_volume!r}
+_DETACHED_RECEIPT = {detached_receipt!r}
+_RUN_ID = {run_id!r}
 
 
 {image_construction}
@@ -94,7 +99,28 @@ volumes = {{
 @app.function(
     image=image, gpu=_GPU, cpu=_CPU, memory=_MEMORY, timeout=_TIMEOUT, volumes=volumes
 )
-def runner() -> bytes:
+def runner():
+    if _DETACHED_RECEIPT:
+        out = _CONTAINER_ENV["RUNPLZ_OUT"]
+        os.makedirs(out, exist_ok=True)
+        code = None
+        try:
+            code = subprocess.run(["python", "-m", "runplz._bootstrap"]).returncode
+            meta = os.path.join(out, ".runplz")
+            os.makedirs(meta, exist_ok=True)
+            with open(os.path.join(meta, "modal-result.json"), "w") as f:
+                json.dump({{"run_id": _RUN_ID, "exit_code": code}}, f)
+        finally:
+            # Ordinary failures must preserve partial outputs too. Do not
+            # replace a bootstrap/metadata error with a secondary commit error.
+            unwinding = sys.exc_info()[0] is not None
+            try:
+                volumes["/out"].commit()
+            except Exception:
+                if not unwinding:
+                    raise
+                print("[runner] volume commit also failed", file=sys.stderr)
+        return code
     os.makedirs("/out", exist_ok=True)
     subprocess.run(
         ["python", "-m", "runplz._bootstrap"],
@@ -112,6 +138,10 @@ def runner() -> bytes:
 
 @app.local_entrypoint()
 def main():
+    if _DETACHED_RECEIPT:
+        from runplz.backends.modal_runs import record_launch
+        record_launch(_DETACHED_RECEIPT, app, runner, volumes["/out"])
+        return
     blob = runner.remote()
     with open(_OUT_BLOB, "wb") as f:
         f.write(blob)
@@ -265,7 +295,7 @@ def _split_modal_app_name(name: str) -> tuple[str, str]:
     return ("-".join(parts[:-1]), parts[-1])
 
 
-def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
+def run(app, function, args, kwargs, *, outputs_dir: str = "out", detach=None):
     try:
         import modal  # noqa: F401
     except ImportError as exc:
@@ -290,10 +320,6 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
 
     image_src = _render_modal_image(function.image, repo=repo)
     image_src += "\nimage = image.env(_CONTAINER_ENV)"
-
-    blob_path = tempfile.NamedTemporaryFile(
-        suffix=".tar.gz", prefix="runplz-modal-", delete=False
-    ).name
 
     # Modal's @app.function accepts memory in MB; our API uses GB. Convert.
     modal_memory = int(function.min_memory * 1024) if function.min_memory is not None else None
@@ -323,6 +349,31 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
 
     volumes = dict(getattr(function, "volumes", {}) or {})
     out_on_volume = _outputs_are_volume_backed(volumes)
+    detached = app.modal_config.detach if detach is None else detach
+    if not isinstance(detached, bool):
+        raise ValueError("detach must be a bool or None.")
+    receipt_path = None
+    run_id = None
+    if detached:
+        if not out_on_volume or any(path.startswith("/out/") for path in volumes):
+            raise ValueError(
+                "Detached Modal runs require volumes={'/out': 'volume-name'} "
+                "with no nested /out mounts; outputs must persist for later collection."
+            )
+        if "RUNPLZ_OUT" in function.env:
+            raise ValueError("Detached Modal runs set RUNPLZ_OUT to their own run-specific path.")
+        from runplz.backends.modal_runs import prepare_run
+
+        receipt_path, receipt = prepare_run(host_out, app.name, function.name, volumes["/out"])
+        run_id = receipt["run_id"]
+        container_env["RUNPLZ_OUT"] = "/out" + receipt["remote_path"]
+
+    blob_path = ""
+    if not detached:
+        with tempfile.NamedTemporaryFile(
+            suffix=".tar.gz", prefix="runplz-modal-", delete=False
+        ) as blob:
+            blob_path = blob.name
 
     entrypoint_src = _ENTRYPOINT_TEMPLATE.format(
         app_name=f"{APP_PREFIX}{app.name}-{function.name}",
@@ -335,6 +386,8 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
         image_construction=image_src,
         volumes=volumes,
         out_on_volume=out_on_volume,
+        detached_receipt=str(receipt_path) if receipt_path else None,
+        run_id=run_id,
     )
 
     entry_file = tempfile.NamedTemporaryFile(
@@ -343,29 +396,45 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
     entry_file.write(entrypoint_src)
     entry_file.close()
 
-    print(f"+ modal run {entry_file.name}::main", flush=True)
+    cmd = ["modal", "run", *(["--detach"] if detached else []), f"{entry_file.name}::main"]
+    print("+ " + " ".join(cmd), flush=True)
     try:
-        subprocess.run(
-            ["modal", "run", f"{entry_file.name}::main"],
-            check=True,
-        )
-    finally:
         try:
-            os.unlink(entry_file.name)
-        except OSError:
-            pass
-
-    if out_on_volume:
-        # The results never entered the return value, so there is no blob to
-        # size-check or unpack -- they are in the volume, and come back here.
-        _download_volume(volumes[CONTAINER_OUT], host_out)
-    else:
-        _check_output_blob_size(blob_path)
-        _extract_tar(blob_path, host_out)
-    try:
-        os.unlink(blob_path)
-    except OSError:
-        pass
+            subprocess.run(cmd, check=True)
+        except BaseException:
+            if detached:
+                print(
+                    f"Modal launch interrupted or failed; receipt retained at {receipt_path}. "
+                    "Submission may have succeeded: inspect status before launching again.",
+                    flush=True,
+                )
+            raise
+        if detached:
+            receipt = json.loads(receipt_path.read_text())
+            if not receipt.get("call_id"):
+                raise RuntimeError(
+                    f"Modal returned without a submission receipt at {receipt_path}; "
+                    "submission is unconfirmed. Inspect the app before retrying."
+                )
+            print(
+                f"Modal run submitted: {receipt['call_id']} (app {receipt['app_id']}).\n"
+                f"Receipt: {receipt_path}\n"
+                f"Collect later: runplz collect --outputs-dir {shlex.quote(str(host_out))}",
+                flush=True,
+            )
+            return receipt
+        if out_on_volume:
+            _download_volume(volumes[CONTAINER_OUT], host_out)
+        else:
+            _check_output_blob_size(blob_path)
+            _extract_tar(blob_path, host_out)
+    finally:
+        for path in (entry_file.name, blob_path):
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
     print(f"Modal run complete. Outputs in {host_out}", flush=True)
 
 

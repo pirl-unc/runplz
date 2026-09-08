@@ -60,6 +60,8 @@ def main(argv=None):
         return _tail_main(argv_list[1:])
     if argv_list and argv_list[0] == "status":
         return _status_main(argv_list[1:])
+    if argv_list and argv_list[0] == "collect":
+        return _collect_main(argv_list[1:])
     if argv_list and argv_list[0] in ("kill", "cancel"):
         return _kill_main(argv_list[1:], prog=argv_list[0])
 
@@ -87,6 +89,12 @@ def main(argv=None):
     )
     p.add_argument(
         "--no-build", action="store_true", help="[local] Skip docker build (reuse tagged image)."
+    )
+    p.add_argument(
+        "--detach",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="[modal] Return after submission; use runplz collect for persistent outputs.",
     )
     p.add_argument(
         "--log-file",
@@ -127,6 +135,7 @@ def main(argv=None):
             host=args.host,
             outputs_dir=args.outputs_dir,
             build=not args.no_build,
+            detach=args.detach,
             # The CLI knows the script being run, which beats the module a
             # function happens to be defined in — and hands bind() the answer
             # rather than making it shell out to git a second time.
@@ -596,6 +605,26 @@ def _status_main(argv):
         print(str(exc), file=sys.stderr)
         return 1
     except (RuntimeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+
+def _collect_main(argv):
+    from runplz.backends import modal_runs
+
+    p = argparse.ArgumentParser(
+        prog="runplz collect", description="Collect outputs of a saved detached Modal run."
+    )
+    p.add_argument("--outputs-dir", default="out", help="Directory containing the launch receipt.")
+    p.add_argument(
+        "--timeout", type=int, default=600, help="Download time limit in seconds (default: 600)."
+    )
+    args = p.parse_args(argv)
+    if args.timeout <= 0:
+        p.error("--timeout must be positive")
+    try:
+        return modal_runs.collect(Path(args.outputs_dir).resolve(), timeout=args.timeout)
+    except (OSError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
