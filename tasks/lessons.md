@@ -106,3 +106,7 @@
 - Test SDK integrations against both the minimum supported and currently resolved versions.
   A stub that works with an eager loader may fail when a newer SDK hydrates lazily. Model the
   real client/lookup protocol and keep hydration errors outside terminal-result classification.
+- A CLI denylist does not protect an SDK-backed provider. Guard every execution boundary the
+  project exposes, including synchronous and `.aio` descriptors, while leaving read-only APIs
+  usable. The live marker must delegate to the captured original, and ordinary mocks must be
+  able to replace the guard without reaching provider infrastructure.

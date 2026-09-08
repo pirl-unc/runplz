@@ -1,7 +1,7 @@
 """Test-wide safeguards.
 
-Issue #35: the runplz test suite must never invoke the real `brev`,
-`gcloud`, `aws`, `ssh`, or `rsync` CLIs. A plain `pytest` spinning up
+Issues #35 and #170: the runplz test suite must never invoke a real provider
+CLI or a Modal SDK execution method. A plain `pytest` spinning up
 a paid GPU box because one test forgot to mock a path is an
 unacceptable footgun — especially when `pytest -n auto` multiplies
 the blast radius and a killed test runner leaves orphan boxes
@@ -10,7 +10,8 @@ running.
 This file installs an autouse fixture that replaces each backend
 module's `subprocess` reference with a wrapper whose `.run` raises on
 any of the banned CLIs. Tests that genuinely need live infra must opt
-in via `@pytest.mark.live_brev` / `live_gcp` / `live_aws` / `live_ssh`.
+in via `@pytest.mark.live_brev` / `live_gcp` / `live_aws` / `live_ssh` /
+`live_modal`.
 Tests that already patch `subprocess.run` themselves are unaffected —
 their patch overrides ours.
 """
@@ -20,6 +21,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from inspect import getattr_static
 from pathlib import Path
 
 import pytest
@@ -57,6 +59,16 @@ _BILLED_COMMANDS = {
     "aws": "live_aws",
     "ssh": "live_ssh",
     "rsync": "live_ssh",
+    "modal": "live_modal",
+}
+
+# Public Modal methods that submit functions or change deployed app state. The
+# read-only lifecycle APIs in modal_runs (FunctionCall.from_id, Volume reads,
+# and hydration) deliberately remain available to offline tests.
+_MODAL_SDK_LAUNCH_METHODS = {
+    "Function": ("remote", "remote_gen", "spawn", "map", "starmap", "for_each"),
+    "App": ("run", "deploy"),
+    "Sandbox": ("create",),
 }
 
 
@@ -164,6 +176,42 @@ class _GuardedSubprocessModule:
         return getattr(subprocess, name)
 
 
+class _GuardedModalMethod:
+    """Descriptor that blocks both sync and ``.aio`` Modal execution calls."""
+
+    def __init__(self, request, original, operation):
+        self._request = request
+        self._original = original
+        self._operation = operation
+
+    def _check(self):
+        if self._request.node.get_closest_marker("live_modal"):
+            return
+        raise RuntimeError(
+            f"test {self._request.node.nodeid} tried to call Modal SDK "
+            f"`{self._operation}` for real — mock it, or mark the test "
+            "`@pytest.mark.live_modal` if hitting live infra is intentional."
+        )
+
+    def __get__(self, instance, owner):
+        descriptor_get = getattr(self._original, "__get__", None)
+        bound = descriptor_get(instance, owner) if descriptor_get else self._original
+
+        def guarded(*args, **kwargs):
+            self._check()
+            return bound(*args, **kwargs)
+
+        aio = getattr(bound, "aio", None)
+        if aio is not None:
+
+            def guarded_aio(*args, **kwargs):
+                self._check()
+                return aio(*args, **kwargs)
+
+            guarded.aio = guarded_aio
+        return guarded
+
+
 # Every module that calls subprocess.run needs its `subprocess`
 # reference wrapped for the duration of each test.
 _MODULES_TO_GUARD = (
@@ -185,8 +233,8 @@ _MODULES_TO_GUARD = (
 
 
 @pytest.fixture(autouse=True)
-def _block_real_brev_cli(request, monkeypatch):
-    """Swap each backend module's `subprocess` for a guarded wrapper."""
+def _block_real_provider_calls(request, monkeypatch):
+    """Guard provider CLIs and Modal SDK methods that can launch paid work."""
     guarded = _make_guarded_run(request)
     wrapper = _GuardedSubprocessModule(guarded)
     for mod_path in _MODULES_TO_GUARD:
@@ -196,6 +244,26 @@ def _block_real_brev_cli(request, monkeypatch):
             continue
         if hasattr(mod, "subprocess"):
             monkeypatch.setattr(mod, "subprocess", wrapper, raising=False)
+
+    try:
+        import modal
+    except ImportError:
+        return
+    for owner_name, method_names in _MODAL_SDK_LAUNCH_METHODS.items():
+        owner = getattr(modal, owner_name, None)
+        if owner is None:
+            continue
+        for method_name in method_names:
+            try:
+                original = getattr_static(owner, method_name)
+            except AttributeError:
+                continue
+            operation = f"{owner_name}.{method_name}"
+            monkeypatch.setattr(
+                owner,
+                method_name,
+                _GuardedModalMethod(request, original, operation),
+            )
 
 
 @pytest.fixture(autouse=True)

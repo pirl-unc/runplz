@@ -21,6 +21,13 @@ tier must be specific enough that the guard cannot stand in for the failure
 under test -- a remote exit code, a 255 transport failure, a message only the
 real code path produces.
 
+The same default-deny rule covers Modal through `live_modal`. It blocks real
+`modal` CLI commands and SDK methods that submit functions, deploy apps, or
+create sandboxes, including their asynchronous `.aio` forms. Read-only receipt,
+FunctionCall, and Volume observation stays available without the marker. A
+test-installed CLI in `sandbox_bin` or an explicit method mock remains safe and
+is allowed.
+
 Tests that need a local/container SSH service are marked as environmental
 integration tests. An unavailable service produces an explicit `SKIPPED`
 result with the reason; it is never counted as a passing integration assertion.

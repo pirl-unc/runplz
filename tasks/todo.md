@@ -2646,8 +2646,44 @@ line/branch coverage; `git diff --check` is clean.
 - [x] Run `./format.sh`, `./lint.sh`, and `./test.sh` on the exact release head
       (1,494 passed, 15 optional-environment skips; 95.91% coverage).
 - [x] Push this release checklist and require green CI on the final PR head.
-- [ ] Merge PR #169, switch to a clean `main`, and fast-forward from origin.
-- [ ] Run `./deploy.sh` from clean `main`; verify the pushed version tag and the
+- [x] Merge PR #169, switch to a clean `main`, and fast-forward from origin.
+- [x] Run `./deploy.sh` from clean `main`; verify the pushed version tag and the
       published PyPI version.
-- [ ] Review open issues for the next foundational block of work and record the
+- [x] Review open issues for the next foundational block of work and record the
       release outcome in the PR.
+
+### Issue #170 — block accidental live Modal launches in tests
+
+Keep the safeguard test-only: production behavior and ordinary Modal imports,
+receipt probes, volume reads, and artifact collection must remain unchanged.
+
+- [x] Start from clean 4.5.0 `main`, create a feature branch, read issue #170,
+      and inspect the existing CLI guard plus Modal 1.x execution surfaces.
+- [x] Add `modal` to the billed-command map with an explicit `live_modal`
+      marker. Block real CLI invocations regardless of argument form while
+      continuing to allow test-installed `sandbox_bin` executables and direct
+      test mocks.
+- [x] Guard the Modal SDK methods that submit or deploy work (`Function`
+      remote/spawn/map variants, `App` run/deploy, and `Sandbox.create`),
+      including `.aio` calls.
+      Apply the wrapper only when the real SDK is importable, preserve each
+      original descriptor for marked live tests, and leave read-only SDK APIs
+      untouched.
+- [x] Add regressions for blocked CLI run/deploy, marker opt-in, mocked and
+      sandboxed commands, blocked synchronous/asynchronous SDK submissions,
+      marked SDK delegation, and allowed read-only SDK operations.
+- [x] Update test-fidelity documentation and bump 4.5.0 to 4.5.1.
+- [x] Run focused tests against the minimum and current supported Modal SDK,
+      then `./format.sh`, `./lint.sh`, `./test.sh`, and inspect the final diff.
+- [x] Prepare the branch and PR handoff closing #170. Publication and final CI
+      verification are recorded on the PR rather than requiring a bookkeeping
+      commit after every check run.
+
+#### Review
+
+The guard tests pass under both Modal 1.1.0 and 1.5.5 (36 each). The local
+focused provider suite passes (195 tests), and final gates report **1,534 passed,
+1 skipped, 95.91% coverage**. Formatting, lint, and `git diff --check` pass.
+No live Modal API or paid command was invoked. The wider Modal 1.1.0 lifecycle
+suite exposed a pre-existing fake-protocol compatibility gap, filed separately
+as [issue #172](https://github.com/pirl-unc/runplz/issues/172).
