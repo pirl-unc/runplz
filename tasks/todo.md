@@ -2687,3 +2687,35 @@ focused provider suite passes (195 tests), and final gates report **1,534 passed
 No live Modal API or paid command was invoked. The wider Modal 1.1.0 lifecycle
 suite exposed a pre-existing fake-protocol compatibility gap, filed separately
 as [issue #172](https://github.com/pirl-unc/runplz/issues/172).
+
+### PR #173 review follow-up — close remaining Modal launch paths
+
+- [x] Reconfirm the PR is open/clean and inspect the four omitted Function
+      descriptors on the installed supported SDK.
+- [x] Replace the opaque first-token helper with explicit argv normalization in
+      the guarded call site. Recognize both direct `modal ...` and supported
+      `python -m modal ...` invocations without changing unrelated commands.
+- [x] Add Function `spawn_map`, `experimental_spawn_map`, `keep_warm`, and
+      `update_autoscaler` to the SDK guard; cover sync and `.aio` access.
+- [x] Add regressions for list/tuple/string direct commands, absolute executable
+      paths, current-interpreter module execution, and a non-Modal `python -m`
+      command that must remain allowed.
+- [x] Re-run guard tests with Modal 1.1.0 and 1.5.5, then format, lint, the full
+      suite, and diff review. Push and final CI are recorded on the PR.
+
+#### Review
+
+Removed `_first_token`; the guarded call site now visibly normalizes argv and
+classifies direct Modal commands versus `python -m modal`. Direct fakes retain
+their path-based exemption, while a fake executable cannot exempt the Python
+module path. All four reviewed Function methods are guarded when exposed by the
+installed SDK, including `.aio`.
+
+Local guard tests: **51 passed** with Modal 1.1.4. Isolated endpoints each report
+**49 passed, 2 version-specific skips**: Modal 1.1.0 lacks
+`experimental_spawn_map`, while 1.5.5 lacks the removed `keep_warm`. The final
+single-worker full gate reports **1,535 passed, 15 environment skips, 95.91%
+coverage**; format, lint, and `git diff --check` pass. An initial eight-worker
+run under five concurrent sibling suites produced three scheduler-related
+subprocess timeouts; the exact regressions passed serially and the infrastructure
+flake is tracked separately in [issue #174](https://github.com/pirl-unc/runplz/issues/174).

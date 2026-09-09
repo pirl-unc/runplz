@@ -110,3 +110,7 @@
   project exposes, including synchronous and `.aio` descriptors, while leaving read-only APIs
   usable. The live marker must delegate to the captured original, and ordinary mocks must be
   able to replace the guard without reaching provider infrastructure.
+- A command guard must classify the execution target, not merely hide `argv[0]` behind an opaque
+  first-token helper. Normalize argv at the guarded call site and recognize supported module
+  execution (`python -m provider`) explicitly. When guarding an SDK, inventory all public methods
+  that can submit work or provision capacity; common-looking methods are not necessarily funnels.

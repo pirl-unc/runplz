@@ -19,8 +19,10 @@ their patch overrides ours.
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
+import sys
 from inspect import getattr_static
 from pathlib import Path
 
@@ -66,7 +68,18 @@ _BILLED_COMMANDS = {
 # read-only lifecycle APIs in modal_runs (FunctionCall.from_id, Volume reads,
 # and hydration) deliberately remain available to offline tests.
 _MODAL_SDK_LAUNCH_METHODS = {
-    "Function": ("remote", "remote_gen", "spawn", "map", "starmap", "for_each"),
+    "Function": (
+        "remote",
+        "remote_gen",
+        "spawn",
+        "map",
+        "starmap",
+        "for_each",
+        "spawn_map",
+        "experimental_spawn_map",
+        "keep_warm",
+        "update_autoscaler",
+    ),
     "App": ("run", "deploy"),
     "Sandbox": ("create",),
 }
@@ -88,15 +101,6 @@ def pytest_configure(config):
             f"{marker}: test is allowed to shell out to the real CLI. "
             f"Do not add without explicit need.",
         )
-
-
-def _first_token(cmd) -> str:
-    if isinstance(cmd, (list, tuple)):
-        return os.path.basename(str(cmd[0])) if cmd else ""
-    if isinstance(cmd, str):
-        head = cmd.strip().split(None, 1)
-        return os.path.basename(head[0]) if head else ""
-    return ""
 
 
 # Directories holding stub executables a test installed itself. A billed
@@ -126,13 +130,36 @@ def _resolves_into_sandbox(prog: str) -> bool:
 
 def _make_guarded_run(request):
     def guarded(cmd, *args, **kwargs):
-        prog = _first_token(cmd)
-        required = _BILLED_COMMANDS.get(prog)
+        if isinstance(cmd, str):
+            try:
+                command_args = shlex.split(cmd)
+            except ValueError:
+                command_args = []
+        elif isinstance(cmd, (list, tuple)):
+            command_args = [str(value) for value in cmd]
+        else:
+            command_args = []
+
+        executable = os.path.basename(command_args[0]) if command_args else ""
+        billed_command = executable
+        executable_is_python = executable.lower().startswith("python") or (
+            bool(command_args)
+            and os.path.realpath(command_args[0]) == os.path.realpath(sys.executable)
+        )
+        runs_modal_module = (
+            executable_is_python and len(command_args) >= 3 and command_args[1:3] == ["-m", "modal"]
+        )
+        if runs_modal_module:
+            billed_command = "modal"
+
+        required = _BILLED_COMMANDS.get(billed_command)
         if required and not request.node.get_closest_marker(required):
-            if _resolves_into_sandbox(prog):
+            # A sandboxed executable makes a direct CLI call safe. It cannot
+            # make `python -m modal` safe: that imports the installed SDK.
+            if not runs_modal_module and _resolves_into_sandbox(billed_command):
                 return subprocess.run(cmd, *args, **kwargs)
             raise RuntimeError(
-                f"test {request.node.nodeid} tried to run `{prog}` for "
+                f"test {request.node.nodeid} tried to run `{billed_command}` for "
                 f"real — mock it, or mark the test `@pytest.mark.{required}` "
                 f"if hitting live infra is intentional. cmd: {cmd!r}"
             )

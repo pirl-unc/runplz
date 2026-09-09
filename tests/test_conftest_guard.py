@@ -3,6 +3,8 @@
 Issues #35 and #170.
 """
 
+import shlex
+import sys
 from inspect import getattr_static
 from unittest import mock
 
@@ -68,7 +70,11 @@ def test_guard_blocks_real_aws_via_cloud_helper():
     "cmd",
     [
         ["modal", "run", "job.py::main"],
-        "modal deploy service.py",
+        ("modal", "deploy", "service.py"),
+        "modal run job.py::main",
+        ["/usr/local/bin/modal", "deploy", "service.py"],
+        [sys.executable, "-m", "modal", "run", "job.py::main"],
+        f"{shlex.quote(sys.executable)} -m modal deploy service.py",
     ],
 )
 def test_guard_blocks_real_modal_cli_launches(cmd):
@@ -93,6 +99,23 @@ def test_guard_allows_sandboxed_modal_cli(sandbox_bin):
     assert result.returncode == 0
 
 
+def test_sandboxed_executable_does_not_exempt_python_modal_module(sandbox_bin):
+    executable = sandbox_bin / "modal"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+        modal_backend.subprocess.run([sys.executable, "-m", "modal", "run", "job.py::main"])
+
+
+def test_guard_allows_non_modal_python_module():
+    result = modal_backend.subprocess.run(
+        [sys.executable, "-m", "this"], capture_output=True, text=True
+    )
+
+    assert result.returncode == 0
+
+
 @pytest.mark.parametrize("use_aio", [False, True], ids=["sync", "aio"])
 @pytest.mark.parametrize(
     ("owner_name", "method_name"),
@@ -103,6 +126,10 @@ def test_guard_allows_sandboxed_modal_cli(sandbox_bin):
         ("Function", "map"),
         ("Function", "starmap"),
         ("Function", "for_each"),
+        ("Function", "spawn_map"),
+        ("Function", "experimental_spawn_map"),
+        ("Function", "keep_warm"),
+        ("Function", "update_autoscaler"),
         ("App", "run"),
         ("App", "deploy"),
         ("Sandbox", "create"),
@@ -115,6 +142,8 @@ def test_guard_blocks_real_modal_sdk_launches(owner_name, method_name, use_aio):
         target = modal_sdk.App("runplz-guard-test")
     else:
         target = modal_sdk.Sandbox
+    if not hasattr(target, method_name):
+        pytest.skip(f"installed Modal does not expose {owner_name}.{method_name}")
     method = getattr(target, method_name)
     call = method.aio if use_aio else method
 
@@ -196,13 +225,18 @@ def test_guard_allows_real_brev_when_opted_in():
 
 
 @pytest.mark.live_modal
-def test_guard_allows_harmless_modal_cli_when_opted_in():
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        ["modal", "--version"],
+        [sys.executable, "-m", "modal", "--version"],
+    ],
+)
+def test_guard_allows_harmless_modal_cli_when_opted_in(cmd):
     # Version reporting is local-only but still proves the marker reaches the
     # real executable rather than the guard.
     try:
-        result = modal_backend.subprocess.run(
-            ["modal", "--version"], capture_output=True, text=True
-        )
+        result = modal_backend.subprocess.run(cmd, capture_output=True, text=True)
         assert result.returncode == 0
     except FileNotFoundError:
         pass
