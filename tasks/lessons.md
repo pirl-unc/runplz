@@ -118,3 +118,8 @@
   enumerating public methods. If the policy can require an explicit marker for live reads as well
   as writes, intercept every real RPC and let offline fake clients bypass that boundary naturally;
   public API inventories are incomplete by construction and age badly as an SDK evolves.
+- A subprocess safety guard must follow execution semantics, not the visual shape of `args`.
+  `shell=True` delegates to a language, `env -S` delegates to another tokenizer, `executable=`
+  replaces the launched program, and `env` assignments are not shell identifiers. Fail closed on
+  opaque layers; normalize explicit replacements and wrapper operands before granting any marker
+  or sandbox exemption.

@@ -97,12 +97,14 @@ def _skip_environment(reason: str) -> None:
     pytest.skip(f"{_ENVIRONMENT_SKIP_PREFIX} {reason}")
 
 
-def _resolves_into_sandbox(executable: str) -> bool:
+def _resolves_into_sandbox(executable: str, search_path: str | None) -> bool:
     if not _SANDBOX_BINS:
         return False
     # subprocess executes paths containing a directory exactly as supplied;
     # only bare command names are resolved through PATH.
-    found = executable if os.path.dirname(executable) else shutil.which(executable)
+    found = (
+        executable if os.path.dirname(executable) else shutil.which(executable, path=search_path)
+    )
     if not found:
         return False
     found = Path(found).resolve()
@@ -111,57 +113,84 @@ def _resolves_into_sandbox(executable: str) -> bool:
 
 def _make_guarded_run(request):
     def guarded(cmd, *args, **kwargs):
+        # A shell can expand variables and execute arbitrarily many commands;
+        # tokenizing its source would not tell us what it will launch. Tests
+        # must use explicit argv or mock this boundary instead.
+        if kwargs.get("shell"):
+            raise RuntimeError(
+                f"test {request.node.nodeid} tried to use subprocess.run(shell=True), "
+                "which the provider safety guard cannot inspect — pass explicit argv or mock "
+                f"subprocess.run. cmd: {cmd!r}"
+            )
+
         if isinstance(cmd, str):
-            try:
-                command_args = shlex.split(cmd)
-            except ValueError:
-                command_args = []
+            # POSIX treats a shell-free string as one executable path, while
+            # Windows parses it as a command line. Honor an exact billed path
+            # first, then conservatively inspect the command-line form too.
+            if os.path.basename(cmd) in _BILLED_COMMANDS:
+                command_args = [cmd]
+            else:
+                try:
+                    command_args = shlex.split(cmd)
+                except ValueError:
+                    command_args = []
+        elif isinstance(cmd, (bytes, os.PathLike)):
+            command_args = [os.fsdecode(cmd)]
         elif isinstance(cmd, (list, tuple)):
-            command_args = [str(value) for value in cmd]
+            command_args = [
+                os.fsdecode(value) if isinstance(value, (bytes, os.PathLike)) else str(value)
+                for value in cmd
+            ]
         else:
             command_args = []
 
-        # `env` is the one common executable wrapper: peel off its options and
-        # NAME=VALUE assignments so the program it launches remains visible.
+        # `executable=` replaces argv[0] at exec time. Apply that replacement
+        # before inspecting wrappers or granting a sandbox exemption.
+        executable_override = kwargs.get("executable")
+        if executable_override is not None:
+            replacement = os.fsdecode(executable_override)
+            command_args = [replacement, *command_args[1:]] if command_args else [replacement]
+
+        try:
+            sandbox_search_path = os.pathsep.join(os.get_exec_path(kwargs.get("env")))
+            sandbox_resolution_is_reliable = True
+        except (TypeError, ValueError):
+            # Some platform-specific environment mappings cannot be normalized
+            # here. They may still alter PATH, so fail closed on exemptions.
+            sandbox_search_path = None
+            sandbox_resolution_is_reliable = False
+
+        # `env` is the common executable wrapper. Peel repeated wrappers using
+        # env's operand rules so the program each one launches remains visible.
         effective_args = command_args
-        if command_args and os.path.basename(command_args[0]) == "env":
+        while effective_args and os.path.basename(effective_args[0]) == "env":
             command_index = 1
-            while command_index < len(command_args):
-                value = command_args[command_index]
-                if value == "--":
-                    command_index += 1
-                    break
-                if value in {
-                    "-u",
-                    "--unset",
-                    "-C",
-                    "--chdir",
-                    "-S",
-                    "--split-string",
-                    "-P",
-                    "-a",
-                    "--argv0",
-                }:
-                    command_index += 2
-                    continue
-                if value.startswith(("--unset=", "--chdir=", "--split-string=", "--argv0=")):
+            options_allowed = True
+            while command_index < len(effective_args):
+                value = effective_args[command_index]
+                if options_allowed and value == "--":
+                    options_allowed = False
                     command_index += 1
                     continue
-                if value.startswith("-"):
-                    command_index += 1
-                    continue
-                name, separator, _ = value.partition("=")
-                is_assignment = (
-                    bool(separator)
-                    and bool(name)
-                    and not name[0].isdigit()
-                    and name.replace("_", "a").isalnum()
-                )
-                if is_assignment:
+                # env options can change tokenization (-S), the working
+                # directory (-C), or command lookup (-i/-P). Reject the whole
+                # option-bearing form instead of maintaining another platform-
+                # specific command-line parser here.
+                if options_allowed and value.startswith("-"):
+                    raise RuntimeError(
+                        f"test {request.node.nodeid} tried to use env options, which the provider "
+                        "safety guard cannot inspect reliably — pass the command as explicit argv "
+                        f"or mock subprocess.run. cmd: {cmd!r}"
+                    )
+                # env itself accepts names outside shell-identifier syntax;
+                # every operand containing '=' is an assignment, not a command.
+                if "=" in value:
+                    if value.partition("=")[0] == "PATH":
+                        sandbox_resolution_is_reliable = False
                     command_index += 1
                     continue
                 break
-            effective_args = command_args[command_index:]
+            effective_args = effective_args[command_index:]
 
         effective_executable = effective_args[0] if effective_args else ""
         executable_name = os.path.basename(effective_executable)
@@ -200,7 +229,14 @@ def _make_guarded_run(request):
         if required and not request.node.get_closest_marker(required):
             # A sandboxed executable makes a direct CLI call safe. It cannot
             # make `python -m modal` safe: that imports the installed SDK.
-            if not runs_modal_module and _resolves_into_sandbox(effective_executable):
+            sandbox_path_is_safe = sandbox_resolution_is_reliable or os.path.isabs(
+                effective_executable
+            )
+            if (
+                not runs_modal_module
+                and sandbox_path_is_safe
+                and _resolves_into_sandbox(effective_executable, sandbox_search_path)
+            ):
                 return subprocess.run(cmd, *args, **kwargs)
             raise RuntimeError(
                 f"test {request.node.nodeid} tried to run `{billed_command}` for "

@@ -2768,3 +2768,44 @@ RPC can occur without credentials. Re-plan: supply unmistakably fake test
 credentials and reset Modal's cached environment client for those tests, prove
 both sync and async calls then fail at the intended channel boundary, rerun the
 three supported SDK endpoints and all gates, and require green matrix CI.
+
+### PR #173 subprocess execution-boundary hardening
+
+The guard must classify what the OS will execute, not just the apparent first
+argument. Keep the policy conservative wherever another interpreter would make
+that unknowable.
+
+- [x] Reject `shell=True` and every option-bearing `env` form before delegation;
+      options can change tokenization, working directory, or PATH resolution,
+      while tests can express safe calls as explicit argv or direct mocks.
+- [x] Apply `subprocess.run(executable=...)` to the effective argv before
+      classifying direct commands, Python modules, or sandbox eligibility.
+- [x] Peel repeated option-free `env` wrappers using `env` operand semantics:
+      `--` ends option parsing and every operand containing `=` is an assignment.
+- [x] Add safe adversarial regressions for shell chains, both split-string
+      spellings, executable overrides, dotted assignments, repeated wrappers,
+      and sandbox behavior without ever making a live provider call.
+- [x] Update fidelity/lessons, run Modal 1.1.0/1.5.5 focused tests, then format,
+      lint, the full suite, and diff review. Publication and final CI are
+      recorded on PR #173 rather than in a bookkeeping commit.
+
+#### Review
+
+The subprocess guard now rejects every `shell=True` or option-bearing `env`
+call before execution. This intentionally avoids pretending that `shlex` can
+evaluate a shell language or that a small option table can reproduce GNU/BSD
+`env`. Repeated option-free `env` wrappers remain supported; `--` ends option
+parsing and every operand containing `=` is treated as an assignment.
+
+Classification applies `executable=` first and accepts string, byte, path-like,
+list, and tuple command forms. Sandbox lookup uses the `env=` PATH that the
+child will receive and fails closed after a wrapper changes PATH; only the
+actually invoked executable can earn the exemption. The adversarial tests use
+disposable fake binaries and marker files, so every negative assertion remains
+safe even if regressed.
+
+All **50 guard tests** pass on Modal 1.1.0, 1.1.4, and 1.5.5 without skips; the
+focused Modal suite reports **211 passed**. Final gates: `./format.sh` and
+`./lint.sh` pass, `git diff --check` is clean, and `./test.sh` reports **1,548
+passed, 1 environment skip, 95.91% coverage**. No live provider command or
+Modal RPC ran.

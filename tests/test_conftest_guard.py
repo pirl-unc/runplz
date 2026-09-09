@@ -74,7 +74,6 @@ def test_guard_blocks_real_aws_via_cloud_helper():
         [sys.executable, "-mmodal", "run", "job.py::main"],
         ["env", "modal", "run", "job.py::main"],
         ["env", "RUNPLZ_GUARD_TEST=1", "modal", "run", "job.py::main"],
-        ["env", "-u", "RUNPLZ_GUARD_TEST", "modal", "run", "job.py::main"],
         ["env", sys.executable, "-u", "-m", "modal", "run", "job.py::main"],
         f"{shlex.quote(sys.executable)} -m modal deploy service.py",
     ],
@@ -82,6 +81,145 @@ def test_guard_blocks_real_aws_via_cloud_helper():
 def test_guard_blocks_real_modal_cli_launches(cmd):
     with pytest.raises(RuntimeError, match="tried to run `modal`"):
         modal_backend.subprocess.run(cmd, check=True)
+
+
+def test_guard_rejects_shell_commands_before_execution(sandbox_bin):
+    marker = sandbox_bin.parent / "shell-command-ran"
+    executable = sandbox_bin / "modal"
+    executable.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\n")
+    executable.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="shell=True"):
+        modal_backend.subprocess.run(
+            "cd /tmp && modal run job.py::main",
+            shell=True,
+            check=True,
+        )
+
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "env_args",
+    [
+        ["-S", "modal run job.py::main"],
+        ["--split-string", "modal run job.py::main"],
+        ["--split-string=modal run job.py::main"],
+        ["-u", "RUNPLZ_GUARD_TEST", "modal", "run", "job.py::main"],
+        ["--future-option", "modal", "run", "job.py::main"],
+    ],
+)
+def test_guard_rejects_env_options_before_execution(sandbox_bin, env_args):
+    marker = sandbox_bin.parent / "env-option-ran"
+    executable = sandbox_bin / "modal"
+    executable.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\n")
+    executable.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="env options"):
+        modal_backend.subprocess.run(["env", *env_args], check=True)
+
+    assert not marker.exists()
+
+
+def test_guard_uses_executable_override_as_the_launched_program(tmp_path):
+    explicitly_invoked = tmp_path / "modal"
+    explicitly_invoked.write_text("#!/bin/sh\nexit 0\n")
+    explicitly_invoked.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+        modal_backend.subprocess.run(
+            ["harmless-argv-zero", "run", "job.py::main"],
+            executable=explicitly_invoked,
+        )
+
+
+def test_guard_classifies_pathlike_and_space_containing_executables(tmp_path):
+    outside_bin = tmp_path / "outside bin"
+    outside_bin.mkdir()
+    explicitly_invoked = outside_bin / "modal"
+    explicitly_invoked.write_text("#!/bin/sh\nexit 0\n")
+    explicitly_invoked.chmod(0o755)
+
+    for command in (explicitly_invoked, str(explicitly_invoked)):
+        with pytest.raises(RuntimeError, match="tried to run `modal`"):
+            modal_backend.subprocess.run(command)
+
+
+def test_guard_allows_sandboxed_executable_override(sandbox_bin):
+    executable = sandbox_bin / "modal"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+
+    result = modal_backend.subprocess.run(
+        ["harmless-argv-zero", "run", "fake.py::main"],
+        executable=executable,
+    )
+
+    assert result.returncode == 0
+
+
+@pytest.mark.parametrize("separator", [[], ["--"]], ids=["plain", "after-double-dash"])
+def test_guard_treats_every_env_name_value_operand_as_an_assignment(tmp_path, separator):
+    explicitly_invoked = tmp_path / "modal"
+    explicitly_invoked.write_text("#!/bin/sh\nexit 0\n")
+    explicitly_invoked.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+        modal_backend.subprocess.run(
+            ["env", *separator, "A.B=x", str(explicitly_invoked), "run", "job.py::main"]
+        )
+
+
+def test_guard_peels_repeated_env_wrappers(tmp_path):
+    explicitly_invoked = tmp_path / "modal"
+    explicitly_invoked.write_text("#!/bin/sh\nexit 0\n")
+    explicitly_invoked.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+        modal_backend.subprocess.run(
+            [
+                "env",
+                "OUTER=value",
+                "env",
+                "INNER=value",
+                str(explicitly_invoked),
+                "run",
+                "job.py::main",
+            ]
+        )
+
+
+def test_subprocess_env_path_controls_sandbox_resolution(sandbox_bin):
+    sandboxed = sandbox_bin / "modal"
+    sandboxed.write_text("#!/bin/sh\nexit 0\n")
+    sandboxed.chmod(0o755)
+
+    outside_bin = sandbox_bin.parent / "outside-path"
+    outside_bin.mkdir()
+    outside = outside_bin / "modal"
+    outside.write_text("#!/bin/sh\nexit 0\n")
+    outside.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+        modal_backend.subprocess.run(
+            ["modal", "run", "job.py::main"],
+            env={"PATH": str(outside_bin)},
+        )
+
+
+def test_env_path_assignment_cannot_reuse_outer_sandbox_resolution(sandbox_bin):
+    sandboxed = sandbox_bin / "modal"
+    sandboxed.write_text("#!/bin/sh\nexit 0\n")
+    sandboxed.chmod(0o755)
+
+    outside_bin = sandbox_bin.parent / "outside-env-path"
+    outside_bin.mkdir()
+    outside = outside_bin / "modal"
+    outside.write_text("#!/bin/sh\nexit 0\n")
+    outside.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+        modal_backend.subprocess.run(["env", f"PATH={outside_bin}", "modal", "run", "job.py::main"])
 
 
 def test_guard_allows_explicit_modal_cli_mock():
