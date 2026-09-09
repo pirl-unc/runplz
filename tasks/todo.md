@@ -3002,9 +3002,10 @@ stays continuously exercised. Bump the patch version to 4.5.5.
 - [x] Reproduce #172 with Modal 1.1.0 and inspect old/current SDK lookup paths.
 - [x] Adapt the fake lookup response and add minimum-SDK CI coverage.
 - [x] Fix newly filed #175: use sparse files for three stat-only size fixtures.
-- [ ] Bump version; run ./format.sh, ./lint.sh, and ./test.sh.
+- [x] Bump version; run ./format.sh, ./lint.sh, and ./test.sh.
 - [x] Verify the detached lifecycle and provider guards on minimum/current SDKs.
-- [ ] Review the final diff, open a PR linked to #172, and wait for CI.
+- [x] Review the final diff and open PR #176 linked to #172 and #175.
+- [ ] Confirm all six CI jobs on the final PR commit.
 - [ ] Merge, deploy 4.5.5 from clean main, and verify PyPI and release tag.
 - [ ] Recheck the remaining issue queue and record the next work item.
 
@@ -3042,8 +3043,9 @@ Verification before PR:
   focused run passed 319 tests, including the provider guards, before #175's
   disk-allocation failure; all three size fixtures now pass.
 - ./format.sh and ./lint.sh pass; git diff --check is clean.
-- Full ./test.sh is still running after host disk availability recovered.
-  Confirm its exit code and final summary, then all six CI jobs before merge.
+- TEST_SH_MAX=1 ./test.sh -q -rs: **1,602 passed, 1 skipped, 95.91%
+  coverage**, exit 0 in 159.88 seconds after host disk availability recovered.
+  The single skip is the existing unavailable cloud catalogue shape case.
 - Three #174 worker tests pass independently in 6.26 seconds. The first full
   attempt reproduced #174 under host contention. A subsequent serial attempt
   exhausted disk during child coverage/pytest directory creation; swap was
