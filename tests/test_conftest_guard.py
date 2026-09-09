@@ -16,6 +16,15 @@ from runplz.backends import brev, provisioning, ssh_common
 from runplz.backends import modal as modal_backend
 
 
+@pytest.fixture
+def fake_modal_credentials(monkeypatch):
+    """Let public SDK calls reach the guarded channel without local credentials."""
+    monkeypatch.setenv("MODAL_TOKEN_ID", "ak-runplz-test")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "as-runplz-test")
+    monkeypatch.setattr(_Client, "_client_from_env", None)
+    monkeypatch.setattr(_Client, "_client_from_env_lock", None)
+
+
 def test_guard_blocks_real_brev_ls():
     with pytest.raises(RuntimeError, match="tried to run `brev`"):
         brev.subprocess.run(["brev", "ls", "--json"], capture_output=True, text=True)
@@ -129,7 +138,7 @@ def test_guard_allows_non_modal_python_module():
 
 
 @pytest.mark.parametrize("use_aio", [False, True], ids=["sync", "aio"])
-def test_guard_blocks_modal_function_at_control_plane(use_aio):
+def test_guard_blocks_modal_function_at_control_plane(use_aio, fake_modal_credentials):
     function = modal_sdk.Function.from_name("runplz-guard-test", "job")
     call = function.spawn.aio if use_aio else function.spawn
 
@@ -141,7 +150,7 @@ def test_guard_blocks_modal_function_at_control_plane(use_aio):
 
 
 @pytest.mark.parametrize("use_aio", [False, True], ids=["sync", "aio"])
-def test_guard_blocks_modal_class_autoscaler_at_control_plane(use_aio):
+def test_guard_blocks_modal_class_autoscaler_at_control_plane(use_aio, fake_modal_credentials):
     model = modal_sdk.Cls.from_name("runplz-guard-test", "Model")
     instance = model()
     call = instance.update_autoscaler.aio if use_aio else instance.update_autoscaler

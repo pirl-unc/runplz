@@ -2760,3 +2760,11 @@ invoked outside binary. All **37 guard tests** pass on Modal 1.1.0, 1.1.4, and
 1.5.5 without skips; the focused Modal suite reports **198 passed**. Final gates:
 `./format.sh` and `./lint.sh` pass, and `./test.sh` reports **1,535 passed, 1
 environment skip, 95.91% coverage**. No live Modal RPC or paid command ran.
+
+CI follow-up: the representative public SDK tests inherited local Modal
+credentials, while credential-free CI rejected `from_env` before client setup
+could reach `_get_channel`. This is a test-fixture gap, not a guard bypass: no
+RPC can occur without credentials. Re-plan: supply unmistakably fake test
+credentials and reset Modal's cached environment client for those tests, prove
+both sync and async calls then fail at the intended channel boundary, rerun the
+three supported SDK endpoints and all gates, and require green matrix CI.
