@@ -359,7 +359,9 @@ def test_check_output_blob_size_warns_near_cap(tmp_path, capsys):
     """Issue #19: a tar approaching Modal's 256MB return-value cap should
     emit a loud warning so users switch to Volumes before they hit it."""
     blob = tmp_path / "out.tar.gz"
-    blob.write_bytes(b"x" * (210 * 1024 * 1024))
+    # Sparse files preserve real stat() checks without allocating the payload (#175).
+    with blob.open("wb") as f:
+        f.truncate(210 * 1024 * 1024)
     modal_backend._check_output_blob_size(str(blob))
 
     out = capsys.readouterr().out
@@ -372,7 +374,8 @@ def test_check_output_blob_size_raises_over_cap(tmp_path):
     """At or above 256MB we raise instead of unpacking — the tar may already
     be truncated and extracting it silently would lose data."""
     blob = tmp_path / "out.tar.gz"
-    blob.write_bytes(b"x" * (260 * 1024 * 1024))
+    with blob.open("wb") as f:
+        f.truncate(260 * 1024 * 1024)
     with pytest.raises(RuntimeError) as ei:
         modal_backend._check_output_blob_size(str(blob))
 
@@ -384,7 +387,8 @@ def test_check_output_blob_size_raises_over_cap(tmp_path):
 
 def test_check_output_blob_size_silent_under_warn_threshold(tmp_path, capsys):
     blob = tmp_path / "out.tar.gz"
-    blob.write_bytes(b"x" * (10 * 1024 * 1024))
+    with blob.open("wb") as f:
+        f.truncate(10 * 1024 * 1024)
     modal_backend._check_output_blob_size(str(blob))
     assert capsys.readouterr().out == ""
 

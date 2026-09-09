@@ -726,15 +726,13 @@ def test_provider_termination_allows_status_and_committed_artifact_salvage(
         ],
     )
     rpc = mock.AsyncMock(return_value=response)
-    client = SimpleNamespace(
-        _snapshotted=False,
-        stub=SimpleNamespace(
-            FunctionGetOutputs=rpc,
-            FunctionCallFromId=mock.AsyncMock(
-                return_value=api_pb2.FunctionCallFromIdResponse(num_inputs=1)
-            ),
-        ),
-    )
+    stub = SimpleNamespace(FunctionGetOutputs=rpc)
+    # Modal 1.1.0 hydrates from the ID directly; later SDKs use a lookup RPC.
+    # Supply that RPC's real response only when the installed protocol has it.
+    lookup_response = getattr(api_pb2, "FunctionCallFromIdResponse", None)
+    if lookup_response is not None:
+        stub.FunctionCallFromId = mock.AsyncMock(return_value=lookup_response(num_inputs=1))
+    client = SimpleNamespace(_snapshotted=False, stub=stub)
     call = modal_sdk.FunctionCall.from_id("fc-call", client=client)
     call.hydrate(client=client)
     sdk[0].FunctionCall.from_id.return_value = call

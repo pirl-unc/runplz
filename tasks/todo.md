@@ -2969,3 +2969,87 @@ and no list to keep in sync. 38 isolated probes confirm every finding from all
 three rounds closed with no regression. Full suite **1,602 passed, 1 skip,
 95.91% coverage**. No live provider command or Modal RPC ran — the review
 agent's own probe did, which is recorded separately.
+
+
+## Minimum Modal SDK test compatibility (issue #172, 4.5.5)
+
+### Spec and scope
+
+The declared runtime range is modal>=1.1,<2. The detached termination
+regression currently constructs FunctionCallFromIdResponse unconditionally,
+but Modal 1.1.0 predates that lookup RPC. Adapt only the offline fake to the
+installed SDK's real protocol, preserving actual GenericResult decoding,
+status reporting, committed-artifact salvage, and the provider safety guard.
+Keep the supported dependency range and production runtime behavior intact.
+Add a full-suite CI entry on Python 3.10 with modal==1.1.0 alongside the
+existing latest-supported SDK jobs, so the oldest advertised combination
+stays continuously exercised. Bump the patch version to 4.5.5.
+
+### Issue triage
+
+- Foundational compatibility: runplz #172 closes a known minimum-SDK gap in
+  the detached lifecycle release gate; selected for this change.
+- Shared test-resource reliability: runplz #174 and hitlist #440 involve host
+  contention and optimistic worker sizing; independent follow-up.
+- Downstream release integration: mhcflurry #379 (editable provenance) and
+  #398 (archive project root) belong to that repository and do not require
+  new runplz runtime behavior. #398 already identifies its integration PR.
+
+### Plan
+
+- [x] Merge #173 and deploy 4.5.4 from clean main; verify PyPI hashes and tag.
+- [x] Read relevant cross-repository issues, select #172, create feature branch.
+- [x] Reproduce #172 with Modal 1.1.0 and inspect old/current SDK lookup paths.
+- [x] Adapt the fake lookup response and add minimum-SDK CI coverage.
+- [x] Fix newly filed #175: use sparse files for three stat-only size fixtures.
+- [x] Bump version; run ./format.sh, ./lint.sh, and ./test.sh.
+- [x] Verify the detached lifecycle and provider guards on minimum/current SDKs.
+- [x] Review the final diff and open PR #176 linked to #172 and #175.
+- [ ] Confirm all six CI jobs on the final PR commit.
+- [ ] Merge, deploy 4.5.5 from clean main, and verify PyPI and release tag.
+- [ ] Recheck the remaining issue queue and record the next work item.
+
+### Replan: disk exhaustion during minimum-SDK verification
+
+The original #172 regression is fixed. The focused minimum-SDK run passed
+319 tests but failed while writing a 260 MiB size-check fixture (ENOSPC).
+Filed #175 and removed only this run's completed temporary test directory.
+The three stat-only tests allocate 480 MiB despite never reading the payload.
+Use sparse files at the same logical sizes, preserving real filesystem size
+checks and all behavioral assertions. Include this small validation
+prerequisite in the PR, linked to #175; production behavior stays intact.
+
+### Verification adjustment: existing #174 reproduced
+
+The first full run with four workers took 1,108 seconds and hit the exact
+three real-worker startup timeouts already tracked in #174 (1,585 passed,
+15 skipped). No SDK protocol or sparse-size assertion failed. Verify those
+three tests alone, then run the full script with TEST_SH_MAX=1. Keep #174
+open and linked from the PR; do not change production timeout bounds to
+accommodate scheduler delays.
+
+### Review
+
+The fake now follows the installed SDK's protocol without replacing the real
+termination decoder. SDK 1.1.0 has no lookup RPC and needs no lookup response;
+newer SDKs receive their actual protobuf response. A new full-suite CI matrix
+entry pins Modal 1.1.0 on Python 3.10; existing Python versions continue to
+resolve the newest compatible SDK. Sparse size fixtures retain real stat()
+behavior and identical assertions with zero allocated payload blocks on APFS.
+
+Verification before PR:
+- Original #172 failure reproduced on Modal 1.1.0, then corrected.
+- Four changed regression tests pass on Modal 1.1.0. The earlier 320-test
+  focused run passed 319 tests, including the provider guards, before #175's
+  disk-allocation failure; all three size fixtures now pass.
+- ./format.sh and ./lint.sh pass; git diff --check is clean.
+- TEST_SH_MAX=1 ./test.sh -q -rs: **1,602 passed, 1 skipped, 95.91%
+  coverage**, exit 0 in 159.88 seconds after host disk availability recovered.
+  The single skip is the existing unavailable cloud catalogue shape case.
+- Three #174 worker tests pass independently in 6.26 seconds. The first full
+  attempt reproduced #174 under host contention. A subsequent serial attempt
+  exhausted disk during child coverage/pytest directory creation; swap was
+  fully used. No production bounds or safety guards were relaxed.
+
+Runtime changes are limited to the required version bump to 4.5.5. Release
+steps remain pending until the PR merges and deploy.sh uploads and tags it.

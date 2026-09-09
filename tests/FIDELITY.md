@@ -69,6 +69,12 @@ that real child and can show it stays offline use the `real_child_processes`
 fixture, with a comment saying why.
 
 Offline fake clients and explicit mocks remain usable without the marker.
+The detached termination regression decodes a real `GenericResult` through the
+installed Modal SDK. Its fake client supplies the lookup RPC only when that
+SDK's protocol defines it: Modal 1.1.0 hydrates directly from the call ID,
+while newer releases look it up first. CI runs the full suite with Modal
+1.1.0 on Python 3.10 and the latest compatible SDK on each supported Python.
+
 `mock.patch("<module>.subprocess.run")` takes the boundary over for the whole
 process — `subprocess` is one module — so patch the function that issues the
 call; for a provider CLI that is `provisioning.run_with_retries`'s

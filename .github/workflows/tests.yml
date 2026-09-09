@@ -31,6 +31,12 @@ jobs:
       fail-fast: true
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
+        modal: ["modal>=1.1,<2"]
+        include:
+          # Exercise the oldest supported Python/SDK pair as well as the
+          # latest compatible SDK; protocol fakes must work with both (#172).
+          - python-version: "3.10"
+            modal: "modal==1.1.0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -40,7 +46,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,modal]"
+          pip install -e ".[dev]" "${{ matrix.modal }}"
       - name: Run tests
         # --e2e-remote=local turns "no sshd on this runner" from a silent skip
         # of every live-ssh test into a hard failure. ubuntu-latest ships one,
