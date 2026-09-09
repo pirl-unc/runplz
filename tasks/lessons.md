@@ -123,3 +123,24 @@
   replaces the launched program, and `env` assignments are not shell identifiers. Fail closed on
   opaque layers; normalize explicit replacements and wrapper operands before granting any marker
   or sandbox exemption.
+- A safety guard's parser must fail in the *allowing* direction never. Identifying "the
+  program" in an argv required modelling `env`'s operand rules and CPython's flag arity,
+  and each gap in those tables (`-um`, `modal.cli.entry_point`, `uv run modal`) silently
+  permitted a billed launch. Scanning every token for a billed name is shorter, needs no
+  table per wrapper, and its failure mode is a false block that a test fixes by mocking.
+  Where an allowlist is unavoidable, prefer one whose entries can only *narrow* blocking
+  and justify each ("`which` never execs its operand").
+- Read subprocess options the way the child receives them, not the way you expect them to
+  be written. `run(*popenargs, **kwargs)` forwards positionals to `Popen`, so `shell=` and
+  `executable=` read from `kwargs` alone are invisible when passed positionally. Bind
+  against `inspect.signature(subprocess.Popen)` instead of hand-maintaining an index table.
+- An in-process patch does not survive `fork`+`exec`. Guarding an SDK at its channel
+  boundary protects only this interpreter; a module that shells out to `python -m itself`
+  needs the *spawn* refused as well. And check the whole class: assert the invariant that
+  every module importing `subprocess` is registered, rather than adding the one that was
+  missed.
+- When a review reports a bypass, reproduce it before trusting the repro. One of five
+  "confirmed" cases was already blocked, for an incidental reason — the hole was real but
+  the given command did not demonstrate it. Load the old code in isolation with execution
+  stubbed and diff old-vs-new classification; never establish a control by running the
+  bypass for real, because that is exactly the billed launch under test.

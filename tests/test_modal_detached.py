@@ -638,8 +638,16 @@ def test_real_worker_process_rejects_invalid_receipt_without_network(tmp_path):
     assert "Cannot read Modal launch receipt" in result.stderr
 
 
-def test_real_worker_process_reports_prepared_receipt_without_network(tmp_path):
+def test_real_worker_process_reports_prepared_receipt_without_network(tmp_path, monkeypatch):
     modal_runs.prepare_run(tmp_path, "demo", "job", "outputs")
+    # The worker child builds a real Modal client, so the guard requires a
+    # marker for it. This case is offline by construction — a `prepared`
+    # receipt has no call id, so the worker answers from disk and never
+    # constructs a client — which is exactly what this test exists to prove.
+    # Reach for the real subprocess explicitly rather than claiming live
+    # access with `live_modal`, so a future worker test that has *not* thought
+    # about the network still meets the guard.
+    monkeypatch.setattr(modal_runs.subprocess, "run", subprocess.run)
     assert modal_runs._bounded_worker("probe", tmp_path, timeout=10) == {"state": "unconfirmed"}
 
 

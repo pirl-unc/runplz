@@ -8,21 +8,29 @@ the blast radius and a killed test runner leaves orphan boxes
 running.
 
 This file installs an autouse fixture that replaces each backend
-module's `subprocess` reference with a wrapper whose `.run` raises on
-any of the banned CLIs. Tests that genuinely need live infra must opt
-in via `@pytest.mark.live_brev` / `live_gcp` / `live_aws` / `live_ssh` /
-`live_modal`.
+module's `subprocess` reference with a wrapper whose process-starting
+calls raise on any of the banned CLIs. Tests that genuinely need live
+infra must opt in via `@pytest.mark.live_brev` / `live_gcp` / `live_aws` /
+`live_ssh` / `live_modal`.
 Tests that already patch `subprocess.run` themselves are unaffected —
 their patch overrides ours.
+
+Classification is deliberately conservative: the guard does not try to work
+out which token is *the* program, because every wrapper it has not heard of
+(`uv run modal`, `timeout 600 modal`, `nohup modal`) hides that answer, and
+each gap in such an analysis silently *allows* a billed launch. It asks the
+cheaper question instead — does this command mention anything billed? —
+and fails closed on anything it cannot read.
 """
 
 from __future__ import annotations
 
+import inspect
 import os
+import re
 import shlex
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -63,6 +71,29 @@ _BILLED_COMMANDS = {
     "modal": "live_modal",
 }
 
+# Python modules whose execution reaches a billed provider. `modal` and every
+# `modal.*` submodule are matched by package root; this table names the modules
+# outside a provider's own package that do the same thing. The Modal worker
+# spawns itself as a child interpreter that builds a real Modal client, and
+# that child is a fresh process which never sees the in-process SDK guard.
+_BILLED_MODULES = {"runplz.backends.modal_runs": "modal"}
+
+# Programs that look a name up without executing it, so their operands are not
+# launches. Listing one here can only *narrow* what the guard blocks and each
+# entry is justified by "never execs its operand" — the opposite direction
+# from a wrapper or interpreter-flag table, where every missing entry lets a
+# billed launch through. `_require_brev_cli` runs `which brev` as a
+# precondition check that cannot spend money.
+_NON_EXECUTING_PROGRAMS = {"which", "whereis"}
+
+# `-m module`, `-mmodule`, and clustered short options (`-um`, `-Bm`). CPython
+# treats the first `m` in a cluster as `-m` and the rest of the token as the
+# module name; the non-greedy prefix reproduces exactly that.
+_MODULE_FLAG = re.compile(r"^-[A-Za-z]*?m(.*)$")
+
+# Accepted by `run`/`call`/`check_output` but not by `Popen`.
+_RUN_ONLY_KWARGS = frozenset({"input", "capture_output", "timeout", "check"})
+
 
 def pytest_configure(config):
     # Refuse to run with the retired env var still exported. Ignoring it
@@ -97,153 +128,188 @@ def _skip_environment(reason: str) -> None:
     pytest.skip(f"{_ENVIRONMENT_SKIP_PREFIX} {reason}")
 
 
-def _resolves_into_sandbox(executable: str, search_path: str | None) -> bool:
+def _resolves_into_sandbox(program, search_path, cwd):
+    """Whether `program` is a stub a test installed, not the real CLI."""
     if not _SANDBOX_BINS:
         return False
-    # subprocess executes paths containing a directory exactly as supplied;
-    # only bare command names are resolved through PATH.
-    found = (
-        executable if os.path.dirname(executable) else shutil.which(executable, path=search_path)
-    )
-    if not found:
-        return False
-    found = Path(found).resolve()
-    return any(sandbox in found.parents for sandbox in _SANDBOX_BINS)
-
-
-def _make_guarded_run(request):
-    def guarded(cmd, *args, **kwargs):
-        # A shell can expand variables and execute arbitrarily many commands;
-        # tokenizing its source would not tell us what it will launch. Tests
-        # must use explicit argv or mock this boundary instead.
-        if kwargs.get("shell"):
-            raise RuntimeError(
-                f"test {request.node.nodeid} tried to use subprocess.run(shell=True), "
-                "which the provider safety guard cannot inspect — pass explicit argv or mock "
-                f"subprocess.run. cmd: {cmd!r}"
-            )
-
-        if isinstance(cmd, str):
-            # POSIX treats a shell-free string as one executable path, while
-            # Windows parses it as a command line. Honor an exact billed path
-            # first, then conservatively inspect the command-line form too.
-            if os.path.basename(cmd) in _BILLED_COMMANDS:
-                command_args = [cmd]
-            else:
-                try:
-                    command_args = shlex.split(cmd)
-                except ValueError:
-                    command_args = []
-        elif isinstance(cmd, (bytes, os.PathLike)):
-            command_args = [os.fsdecode(cmd)]
-        elif isinstance(cmd, (list, tuple)):
-            command_args = [
-                os.fsdecode(value) if isinstance(value, (bytes, os.PathLike)) else str(value)
-                for value in cmd
-            ]
+    if os.path.dirname(program):
+        # subprocess executes a path-bearing program exactly as supplied,
+        # relative to the *child's* working directory — which `cwd=` moves and
+        # ours does not. Only bare names are looked up on PATH.
+        if cwd is None:
+            found = Path(program)
+        elif isinstance(cwd, int):
+            # subprocess also accepts cwd as a directory file descriptor, which
+            # names a directory we cannot resolve a relative path against.
+            return False
         else:
-            command_args = []
+            found = Path(os.fsdecode(cwd)) / program
+        # `shutil.which` makes this check for bare names, so a path must too:
+        # otherwise a sandbox directory whose stub was never written earns the
+        # exemption and the guard reports a confusing FileNotFoundError.
+        if not (found.is_file() and os.access(found, os.X_OK)):
+            return False
+    else:
+        located = shutil.which(program, path=search_path)
+        if not located:
+            return False
+        found = Path(located)
+    return any(sandbox in found.resolve().parents for sandbox in _SANDBOX_BINS)
 
-        # `executable=` replaces argv[0] at exec time. Apply that replacement
-        # before inspecting wrappers or granting a sandbox exemption.
-        executable_override = kwargs.get("executable")
-        if executable_override is not None:
-            replacement = os.fsdecode(executable_override)
-            command_args = [replacement, *command_args[1:]] if command_args else [replacement]
 
+def _popen_arguments(cmd, args, kwargs):
+    """The options the child will actually get, or None if unreadable.
+
+    `run(*popenargs, **kwargs)` forwards positional arguments straight to
+    `Popen`, so `shell`, `executable`, `env` and `cwd` can each arrive
+    positionally. Binding against Popen's own signature finds them wherever
+    they were passed and stays correct as that signature changes, where
+    reading `kwargs` alone missed every positional spelling.
+    """
+    popen_kwargs = {k: v for k, v in kwargs.items() if k not in _RUN_ONLY_KWARGS}
+    try:
+        bound = inspect.signature(subprocess.Popen).bind_partial(cmd, *args, **popen_kwargs)
+    except TypeError:
+        return None
+    return bound.arguments
+
+
+def _command_tokens(cmd):
+    """Every string the command is built from, or None if it cannot be read."""
+    if isinstance(cmd, (bytes, os.PathLike)):
+        return [os.fsdecode(cmd)]
+    if isinstance(cmd, str):
+        # POSIX runs a shell-free string as one executable path; Windows parses
+        # it as a command line. Read it both ways rather than picking one.
         try:
-            sandbox_search_path = os.pathsep.join(os.get_exec_path(kwargs.get("env")))
-            sandbox_resolution_is_reliable = True
-        except (TypeError, ValueError):
-            # Some platform-specific environment mappings cannot be normalized
-            # here. They may still alter PATH, so fail closed on exemptions.
-            sandbox_search_path = None
-            sandbox_resolution_is_reliable = False
+            return [cmd, *shlex.split(cmd)]
+        except ValueError:
+            return None
+    if isinstance(cmd, (list, tuple)):
+        return [os.fsdecode(v) if isinstance(v, (bytes, os.PathLike)) else str(v) for v in cmd]
+    return None
 
-        # `env` is the common executable wrapper. Peel repeated wrappers using
-        # env's operand rules so the program each one launches remains visible.
-        effective_args = command_args
-        while effective_args and os.path.basename(effective_args[0]) == "env":
-            command_index = 1
-            options_allowed = True
-            while command_index < len(effective_args):
-                value = effective_args[command_index]
-                if options_allowed and value == "--":
-                    options_allowed = False
-                    command_index += 1
-                    continue
-                # env options can change tokenization (-S), the working
-                # directory (-C), or command lookup (-i/-P). Reject the whole
-                # option-bearing form instead of maintaining another platform-
-                # specific command-line parser here.
-                if options_allowed and value.startswith("-"):
-                    raise RuntimeError(
-                        f"test {request.node.nodeid} tried to use env options, which the provider "
-                        "safety guard cannot inspect reliably — pass the command as explicit argv "
-                        f"or mock subprocess.run. cmd: {cmd!r}"
-                    )
-                # env itself accepts names outside shell-identifier syntax;
-                # every operand containing '=' is an assignment, not a command.
-                if "=" in value:
-                    if value.partition("=")[0] == "PATH":
-                        sandbox_resolution_is_reliable = False
-                    command_index += 1
-                    continue
-                break
-            effective_args = effective_args[command_index:]
 
-        effective_executable = effective_args[0] if effective_args else ""
-        executable_name = os.path.basename(effective_executable)
-        billed_command = executable_name
-        executable_is_python = executable_name.lower().startswith("python") or (
-            bool(effective_args)
-            and os.path.realpath(effective_executable) == os.path.realpath(sys.executable)
+def _billed_targets(tokens):
+    """Every billed name the command mentions, as (name, token, exemptible)."""
+    targets = []
+    expect_module = False
+    for token in tokens:
+        module = token if expect_module else None
+        expect_module = False
+        flag = _MODULE_FLAG.match(token)
+        if flag:
+            attached = flag.group(1)
+            module = attached or module
+            expect_module = not attached
+        if module is not None:
+            name = _BILLED_MODULES.get(module) or module.partition(".")[0]
+            if name in _BILLED_COMMANDS:
+                # A stub on PATH cannot make `python -m modal` safe: the child
+                # imports the installed SDK whatever PATH holds. Never exempt.
+                targets.append((name, token, False))
+                continue
+        if os.path.basename(token) in _BILLED_COMMANDS:
+            targets.append((os.path.basename(token), token, True))
+    return targets
+
+
+def _reject_billed_commands(request, api, cmd, args, kwargs):
+    """Raise unless every billed name in this command is allowed to run."""
+    arguments = _popen_arguments(cmd, args, kwargs)
+    if arguments is None:
+        raise RuntimeError(
+            f"test {request.node.nodeid} called subprocess.{api} with arguments the provider "
+            f"safety guard could not match against subprocess.Popen — pass explicit argv or "
+            f"mock subprocess.{api}. cmd: {cmd!r}"
         )
-        modal_module = False
-        if executable_is_python:
-            argument_index = 1
-            while argument_index < len(effective_args):
-                value = effective_args[argument_index]
-                if value == "-m":
-                    modal_module = (
-                        argument_index + 1 < len(effective_args)
-                        and effective_args[argument_index + 1] == "modal"
-                    )
-                    break
-                if value.startswith("-m") and len(value) > 2:
-                    modal_module = value[2:] == "modal"
-                    break
-                if value in {"-c", "-", "--"} or not value.startswith("-"):
-                    break
-                # These interpreter options consume the following argument;
-                # joined forms such as `-Xdev` naturally consume only this one.
-                if value in {"-W", "-X", "--check-hash-based-pycs"}:
-                    argument_index += 2
-                else:
-                    argument_index += 1
-        runs_modal_module = executable_is_python and modal_module
-        if runs_modal_module:
-            billed_command = "modal"
 
-        required = _BILLED_COMMANDS.get(billed_command)
-        if required and not request.node.get_closest_marker(required):
-            # A sandboxed executable makes a direct CLI call safe. It cannot
-            # make `python -m modal` safe: that imports the installed SDK.
-            sandbox_path_is_safe = sandbox_resolution_is_reliable or os.path.isabs(
-                effective_executable
-            )
-            if (
-                not runs_modal_module
-                and sandbox_path_is_safe
-                and _resolves_into_sandbox(effective_executable, sandbox_search_path)
-            ):
-                return subprocess.run(cmd, *args, **kwargs)
-            raise RuntimeError(
-                f"test {request.node.nodeid} tried to run `{billed_command}` for "
-                f"real — mock it, or mark the test `@pytest.mark.{required}` "
-                f"if hitting live infra is intentional. cmd: {cmd!r}"
-            )
-        return subprocess.run(cmd, *args, **kwargs)
+    # A shell can expand variables and execute arbitrarily many commands;
+    # tokenizing its source would not tell us what it will launch. Tests
+    # must use explicit argv or mock this boundary instead.
+    if arguments.get("shell"):
+        raise RuntimeError(
+            f"test {request.node.nodeid} tried to use subprocess.{api}(shell=True), "
+            "which the provider safety guard cannot inspect — pass explicit argv or mock "
+            f"subprocess.{api}. cmd: {cmd!r}"
+        )
+
+    tokens = _command_tokens(cmd)
+    if tokens is None:
+        raise RuntimeError(
+            f"test {request.node.nodeid} passed a command the provider safety guard cannot "
+            f"tokenize — pass explicit argv or mock subprocess.{api}. cmd: {cmd!r}"
+        )
+
+    # On POSIX `executable=` replaces the program that is executed while
+    # argv[0] stays whatever cmd[0] was, so it is an extra target to classify
+    # rather than a substitute for the one already there.
+    executable = arguments.get("executable")
+    if executable is not None:
+        tokens = [*tokens, os.fsdecode(executable)]
+    launched = os.fsdecode(executable) if executable is not None else (tokens[0] if tokens else "")
+
+    if os.path.basename(launched) in _NON_EXECUTING_PROGRAMS:
+        tokens = [launched]
+
+    # env's own options can change tokenization (-S), the working directory
+    # (-C), or command lookup (-i/-P/-u). We refuse the whole option-bearing
+    # form rather than reimplementing another platform's operand parser, but
+    # a billed name we *can* see is the more useful error, so the refusal is
+    # deferred until after the scan. Meanwhile no exemption may rest on our
+    # own PATH: `env -u PATH modal` looks up `modal` somewhere else entirely.
+    uses_env_options = os.path.basename(launched) == "env" and any(
+        token.startswith("-") for token in tokens[1:]
+    )
+
+    try:
+        search_path = os.pathsep.join(os.get_exec_path(arguments.get("env")))
+        resolution_is_reliable = True
+    except (TypeError, ValueError):
+        # Some platform-specific environment mappings cannot be normalized
+        # here. They may still alter PATH, so fail closed on exemptions.
+        search_path = None
+        resolution_is_reliable = False
+    if uses_env_options or any(token.startswith("PATH=") for token in tokens):
+        # An `env PATH=...` assignment changes lookup for the child alone, so
+        # our own resolution says nothing about what it will find.
+        resolution_is_reliable = False
+
+    for name, token, exemptible in _billed_targets(tokens):
+        marker = _BILLED_COMMANDS[name]
+        if request.node.get_closest_marker(marker):
+            continue
+        # A path carrying a directory is resolved without PATH, so an
+        # unreliable PATH cannot mislead us about which file it names.
+        path_independent = bool(os.path.dirname(token))
+        if (
+            exemptible
+            and (resolution_is_reliable or path_independent)
+            and _resolves_into_sandbox(token, search_path, arguments.get("cwd"))
+        ):
+            continue
+        raise RuntimeError(
+            f"test {request.node.nodeid} tried to run `{name}` for "
+            f"real — mock it, or mark the test `@pytest.mark.{marker}` "
+            f"if hitting live infra is intentional. cmd: {cmd!r}"
+        )
+
+    if uses_env_options:
+        # Nothing billed was visible, which is not the same as safe: `env -S`
+        # re-tokenizes its argument into a command we never got to read.
+        raise RuntimeError(
+            f"test {request.node.nodeid} tried to use env options, which the provider "
+            f"safety guard cannot inspect reliably — pass the command as explicit argv "
+            f"or mock subprocess.{api}. cmd: {cmd!r}"
+        )
+
+
+def _make_guarded(request, api):
+    def guarded(cmd, *args, **kwargs):
+        _reject_billed_commands(request, api, cmd, args, kwargs)
+        # Looked up at call time so a test's own patch of the real module is
+        # still what runs.
+        return getattr(subprocess, api)(cmd, *args, **kwargs)
 
     return guarded
 
@@ -267,17 +333,23 @@ def sandbox_bin(tmp_path, monkeypatch):
         _SANDBOX_BINS.discard(bin_dir)
 
 
+# Every documented way `subprocess` starts a process. Guarding `run` alone left
+# the other four as unguarded routes to the same binaries.
+_PROCESS_STARTING_APIS = ("run", "Popen", "call", "check_call", "check_output")
+
+
 class _GuardedSubprocessModule:
     """Thin wrapper over the real `subprocess` module.
 
-    Delegates every attribute to the real module except `run`, which is
-    replaced with a guard that refuses billed CLIs. This lets code keep
+    Delegates every attribute to the real module except the calls that start a
+    process, each of which refuses billed CLIs first. This lets code keep
     using `subprocess.CalledProcessError`, `subprocess.TimeoutExpired`,
     `subprocess.DEVNULL`, etc. without us having to enumerate them.
     """
 
-    def __init__(self, guarded_run):
-        self.run = guarded_run
+    def __init__(self, request):
+        for api in _PROCESS_STARTING_APIS:
+            setattr(self, api, _make_guarded(request, api))
 
     def __getattr__(self, name):
         return getattr(subprocess, name)
@@ -292,6 +364,9 @@ _MODULES_TO_GUARD = (
     "runplz.backends.ssh_common",
     "runplz.backends.ssh",
     "runplz.backends.modal",
+    # The Modal worker shells out to a *child interpreter* that builds a real
+    # Modal client, so the in-process SDK guard cannot see it (#170 follow-up).
+    "runplz.backends.modal_runs",
     "runplz.backends.local",
     # aws/gcp were missing until 3.25.0, so `list_jobs` reached the real
     # `aws` / `gcloud` binaries whenever a test drove `runplz ps` on a machine
@@ -306,8 +381,7 @@ _MODULES_TO_GUARD = (
 @pytest.fixture(autouse=True)
 def _block_real_provider_calls(request, monkeypatch):
     """Guard provider CLIs and every call to Modal's real control plane."""
-    guarded = _make_guarded_run(request)
-    wrapper = _GuardedSubprocessModule(guarded)
+    wrapper = _GuardedSubprocessModule(request)
     for mod_path in _MODULES_TO_GUARD:
         try:
             mod = __import__(mod_path, fromlist=["subprocess"])
@@ -318,8 +392,16 @@ def _block_real_provider_calls(request, monkeypatch):
 
     try:
         from modal.client import _Client
-    except ImportError:
-        return
+    except ImportError as exc:
+        # `modal` is a hard runtime dependency (pyproject.toml), so this is not
+        # "Modal is not installed" — it is the SDK having moved or renamed
+        # `_Client`, the one case where continuing would leave every test in
+        # the suite running with no control-plane guard at all.
+        raise RuntimeError(
+            "the Modal control-plane guard could not find `modal.client._Client`; "
+            "point tests/conftest.py at the SDK's current channel boundary rather "
+            "than running unguarded."
+        ) from exc
 
     original_get_channel = _Client._get_channel
 

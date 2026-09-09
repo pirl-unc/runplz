@@ -2809,3 +2809,61 @@ focused Modal suite reports **211 passed**. Final gates: `./format.sh` and
 `./lint.sh` pass, `git diff --check` is clean, and `./test.sh` reports **1,548
 passed, 1 environment skip, 95.91% coverage**. No live provider command or
 Modal RPC ran.
+
+---
+
+## Guard hardening after code review (4.5.2)
+
+A `/code-review` pass on the branch found 12 defects in the guard, 5 of them
+confirmed empirically. Root cause of most: the classifier tried to identify
+*the* program by hand-rolling two partial parsers (a GNU/BSD `env` operand
+parser and a CPython interpreter-flag table). Every spelling those tables did
+not know about was a silent **allow** — the wrong error direction for a guard.
+
+- [x] Replace program-identification with a default-deny scan over every argv
+      token. Kills `uv run modal`, `timeout 600 modal`, `nohup`, `sudo`,
+      `stdbuf`, `xargs` and any future wrapper with one rule, and deletes the
+      `env` peeling loop entirely.
+- [x] Recognize `-m`-family module targets, including clusters (`-um`, `-Bm`)
+      and submodules (`modal.cli.entry_point`), via CPython's own rule that
+      the first `m` in a cluster ends the options.
+- [x] Read `shell`/`executable`/`env`/`cwd` by binding against `Popen`'s
+      signature, so they are seen when passed positionally.
+- [x] Fail closed on an untokenizable string command instead of delegating.
+- [x] Guard `Popen`, `call`, `check_call`, `check_output` as well as `run`.
+- [x] Resolve sandbox paths against the child's `cwd=`, and restore the
+      existence/executability check the path branch had dropped.
+- [x] Add `runplz.backends.modal_runs` to `_MODULES_TO_GUARD` and treat its
+      worker child as a Modal launch; assert the *invariant* that every
+      `runplz` module importing `subprocess` is guarded.
+- [x] Make a missing `modal.client._Client` a loud failure, not a silent
+      `return` that disables the whole SDK guard.
+- [x] Regression test per finding, plus FIDELITY.md and the version bump.
+
+#### Review
+
+The guard now asks "does this command mention anything billed?" instead of
+"what is the program?". Three constraints kept the change from over-blocking,
+all verified against the suite: the sandbox exemption is evaluated **per
+matched token** (so `env modal run fake.py` against a stub still runs), the
+marker is consulted **per billed name** (so a `live_ssh` test may run
+`rsync -e 'ssh ...'`), and matching is **strict basename equality** (so
+`gcloud compute config-ssh`, `aws ssm --name /aws/service/…` and
+`rsync --exclude=.ssh` are untouched).
+
+`env` options are still refused, but the refusal now runs *after* the scan so a
+visible billed name gives the better error, and the option also forces sandbox
+resolution to be treated as unreliable — `env -u PATH modal` must not be able
+to buy an exemption from a stub on *our* PATH.
+
+Control check: the old classifier was loaded in isolation with execution
+stubbed out, and **14 of 15** new cases reached the real `subprocess` under it
+— so these are genuine regression tests, not tests of behaviour that already
+worked. The 15th (`"modal run job.py"` with a positional `shell=True`) was
+already blocked incidentally because the split's first token was `modal`; the
+test now uses `"cd /tmp && modal run …"`, which the old guard did let through.
+Nothing was executed to establish this.
+
+**75 guard tests** pass. Full suite: **1,548 passed, 1 environment skip** —
+identical to the pre-change baseline, so the default-deny scan cost no
+existing coverage. No live provider command or Modal RPC ran.
