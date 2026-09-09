@@ -13,6 +13,7 @@ managed SSH config (`brev refresh` populates ~/.brev/ssh_config, which
 import dataclasses
 import json
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -267,7 +268,7 @@ def run(
 
 
 def _require_brev_cli():
-    if subprocess.run(["which", "brev"], capture_output=True).returncode != 0:
+    if shutil.which("brev") is None:
         raise RuntimeError(
             "`brev` CLI not found. Install via `brew install brev` (macOS) "
             "or the script at https://developer.nvidia.com/brev, then run "

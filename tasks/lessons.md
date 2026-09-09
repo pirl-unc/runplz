@@ -106,3 +106,79 @@
 - Test SDK integrations against both the minimum supported and currently resolved versions.
   A stub that works with an eager loader may fail when a newer SDK hydrates lazily. Model the
   real client/lookup protocol and keep hydration errors outside terminal-result classification.
+- A CLI denylist does not protect an SDK-backed provider. Guard every execution boundary the
+  project exposes, including synchronous and `.aio` descriptors, while leaving read-only APIs
+  usable. The live marker must delegate to the captured original, and ordinary mocks must be
+  able to replace the guard without reaching provider infrastructure.
+- A command guard must classify the execution target, not merely hide `argv[0]` behind an opaque
+  first-token helper. Normalize argv at the guarded call site and recognize supported module
+  execution (`python -m provider`) explicitly. When guarding an SDK, inventory all public methods
+  that can submit work or provision capacity; common-looking methods are not necessarily funnels.
+- For a default-deny SDK safety guard, prefer the narrow transport/control-plane choke point over
+  enumerating public methods. If the policy can require an explicit marker for live reads as well
+  as writes, intercept every real RPC and let offline fake clients bypass that boundary naturally;
+  public API inventories are incomplete by construction and age badly as an SDK evolves.
+- A subprocess safety guard must follow execution semantics, not the visual shape of `args`.
+  `shell=True` delegates to a language, `env -S` delegates to another tokenizer, `executable=`
+  replaces the launched program, and `env` assignments are not shell identifiers. Fail closed on
+  opaque layers; normalize explicit replacements and wrapper operands before granting any marker
+  or sandbox exemption.
+- A safety guard's parser must fail in the *allowing* direction never. Identifying "the
+  program" in an argv required modelling `env`'s operand rules and CPython's flag arity,
+  and each gap in those tables (`-um`, `modal.cli.entry_point`, `uv run modal`) silently
+  permitted a billed launch. Scanning every token for a billed name is shorter, needs no
+  table per wrapper, and its failure mode is a false block that a test fixes by mocking.
+  Where an allowlist is unavoidable, prefer one whose entries can only *narrow* blocking
+  and justify each ("`which` never execs its operand").
+- Read subprocess options the way the child receives them, not the way you expect them to
+  be written. `run(*popenargs, **kwargs)` forwards positionals to `Popen`, so `shell=` and
+  `executable=` read from `kwargs` alone are invisible when passed positionally. Bind
+  against `inspect.signature(subprocess.Popen)` instead of hand-maintaining an index table.
+- An in-process patch does not survive `fork`+`exec`. Guarding an SDK at its channel
+  boundary protects only this interpreter; a module that shells out to `python -m itself`
+  needs the *spawn* refused as well. And check the whole class: assert the invariant that
+  every module importing `subprocess` is registered, rather than adding the one that was
+  missed.
+- When a review reports a bypass, reproduce it before trusting the repro. One of five
+  "confirmed" cases was already blocked, for an incidental reason — the hole was real but
+  the given command did not demonstrate it. Load the old code in isolation with execution
+  stubbed and diff old-vs-new classification; never establish a control by running the
+  bypass for real, because that is exactly the billed launch under test.
+- When a guard needs a special case for one wrapper, that is the signal the altitude is
+  wrong, not that the case needs writing. Modelling `env` by name cost two bypasses (a
+  string-form `env -S` the name check never saw, and marked tests refused because an
+  *inner* program's flag looked like env's). Reading every word of every argument covers
+  `env`, `sh -c`, `--opt=value` and the next wrapper with no name to miss, and deleted four
+  state variables on the way.
+- Exempt only what you can actually see being launched. "This token resolves into the test
+  sandbox" is not a safety property when the token is an argument to an unclassified
+  wrapper -- `env -u PATH modal` resolves `modal` from a PATH the guard does not control.
+  Narrowing the exemption to the program position removed the entire question of whether
+  our PATH reading was still valid.
+- A shared mutable test double is a coupling nobody declares. One `_GuardedSubprocessModule`
+  instance handed to every module meant patching *any* module's `subprocess.run` silently
+  unguarded all of them -- and 51 tests had come to depend on it, patching
+  `brev.subprocess.run` for a call that `provisioning` issues. Give each seam its own
+  double; the tests that break are the ones that were passing for the wrong reason.
+- Fixing a review finding can introduce a worse one. The one-line passthrough added to keep
+  an offline worker test running turned off the guard for every backend at once. Re-review
+  the fix, not just the bug -- and prefer the narrowest escape hatch the harness already
+  offers over a new one.
+- Hook the seam the process actually has, not the names code happens to use. Guarding
+  `<module>.subprocess.run` needed a list of modules, a proxy, a list of APIs, a convention
+  test to police imports, and still missed `getoutput`, asyncio and test helpers. One
+  `Popen.__init__` hook sees every spawn, and `getoutput` arrives as the `shell=True` it is.
+  The same principle as guarding the SDK at `_get_channel` rather than enumerating methods.
+- Measure blast radius before an architectural change, with an observe-only version of it.
+  A logging hook run under the old guard named the 8 spawns a process-wide hook would newly
+  refuse, and why, before any test went red — so the redesign was a decision, not a surprise.
+- A project's own name is data in its own argv. Billing bare `runplz` anywhere refused
+  `git config user.name "runplz test"` and `--labels=runplz=1`; a name that is also a
+  launch can only be billed in the position where it launches.
+- A `.py` word is a file, not a module name; resolve it against the child's cwd and the
+  package directory, never the package's parent — the parent is the repo root, and
+  `modal.py` in it is not the Modal SDK.
+- A review verifier that reproduces a fail-open by *removing* the guard has reproduced the
+  incident. Reproduce a guard bypass by classification with execution stubbed, never by
+  running the suite unguarded; the second one executed real `brev create` and
+  `aws ec2 run-instances` on a developer laptop.

@@ -627,7 +627,11 @@ def test_worker_dispatch(receipt, sdk, staging):
         modal_runs._worker("oops", out)
 
 
-def test_real_worker_process_rejects_invalid_receipt_without_network(tmp_path):
+def test_real_worker_process_rejects_invalid_receipt_without_network(
+    tmp_path, real_child_processes
+):
+    # Offline by construction: the worker rejects an unreadable receipt before
+    # any Modal client exists, which is the property under test.
     result = subprocess.run(
         [sys.executable, "-m", "runplz.backends.modal_runs", "probe", str(tmp_path)],
         capture_output=True,
@@ -638,7 +642,11 @@ def test_real_worker_process_rejects_invalid_receipt_without_network(tmp_path):
     assert "Cannot read Modal launch receipt" in result.stderr
 
 
-def test_real_worker_process_reports_prepared_receipt_without_network(tmp_path):
+def test_real_worker_process_reports_prepared_receipt_without_network(
+    tmp_path, real_child_processes
+):
+    # Offline by construction: a `prepared` receipt has no call id, so the
+    # worker answers from disk and never constructs a client.
     modal_runs.prepare_run(tmp_path, "demo", "job", "outputs")
     assert modal_runs._bounded_worker("probe", tmp_path, timeout=10) == {"state": "unconfirmed"}
 
@@ -868,7 +876,9 @@ def test_nonterminal_sdk_errors_remain_observation_errors(receipt, sdk, error):
         modal_runs._probe(receipt[1])
 
 
-def test_worker_refuses_download_without_parent_owned_staging(receipt):
+def test_worker_refuses_download_without_parent_owned_staging(receipt, real_child_processes):
+    # Offline by construction: the missing staging argument is rejected before
+    # the worker touches the volume.
     result = subprocess.run(
         [
             sys.executable,

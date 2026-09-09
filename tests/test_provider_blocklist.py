@@ -124,7 +124,7 @@ def test_user_pinned_instance_type_bypasses_blocklist():
         num_gpus=1,
     )
     img = Image.from_registry("ubuntu:22.04")
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         with mock.patch("runplz.backends.brev._verify_post_action_state"):
             with mock.patch("time.sleep", lambda _s: None):
                 brev._create_instance("pinned-oci", cfg=cfg, image=img, function=fn)

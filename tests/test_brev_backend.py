@@ -146,7 +146,7 @@ def test_render_ops_script_non_editable_local_dir(tmp_path):
 
 def test_instance_exists_true_when_name_present():
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends.provisioning.subprocess.run",
         return_value=mock.Mock(returncode=0, stdout=json.dumps([{"name": "foo"}])),
     ):
         assert brev._instance_exists("foo") is True
@@ -154,7 +154,7 @@ def test_instance_exists_true_when_name_present():
 
 def test_instance_exists_false_when_missing():
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends.provisioning.subprocess.run",
         return_value=mock.Mock(returncode=0, stdout="[]"),
     ):
         assert brev._instance_exists("bar") is False
@@ -162,7 +162,7 @@ def test_instance_exists_false_when_missing():
 
 def test_instance_exists_handles_non_list_json():
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends.provisioning.subprocess.run",
         return_value=mock.Mock(returncode=0, stdout=json.dumps({"instances": [{"name": "x"}]})),
     ):
         assert brev._instance_exists("x") is True
@@ -172,7 +172,7 @@ def test_instance_exists_raises_on_cli_failure():
     # Silently returning False here would let the caller auto-create a
     # duplicate billed box. See brev._instance_exists docstring.
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends.provisioning.subprocess.run",
         return_value=mock.Mock(returncode=1, stdout="", stderr="auth expired"),
     ):
         with pytest.raises(RuntimeError, match="brev ls"):
@@ -181,7 +181,7 @@ def test_instance_exists_raises_on_cli_failure():
 
 def test_instance_exists_raises_on_invalid_json():
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends.provisioning.subprocess.run",
         return_value=mock.Mock(returncode=0, stdout="not-json", stderr=""),
     ):
         with pytest.raises(RuntimeError, match="unparseable JSON"):
@@ -190,7 +190,7 @@ def test_instance_exists_raises_on_invalid_json():
 
 def test_instance_exists_raises_on_unexpected_shape():
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends.provisioning.subprocess.run",
         return_value=mock.Mock(returncode=0, stdout='"a-bare-string"', stderr=""),
     ):
         with pytest.raises(RuntimeError, match="unexpected shape"):
@@ -200,7 +200,7 @@ def test_instance_exists_raises_on_unexpected_shape():
 def test_instance_exists_false_when_json_null():
     # brev ls --json can return `null` when the org has zero instances.
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends.provisioning.subprocess.run",
         return_value=mock.Mock(returncode=0, stdout="null"),
     ):
         assert brev._instance_exists("x") is False
@@ -208,7 +208,7 @@ def test_instance_exists_false_when_json_null():
 
 def test_instance_exists_handles_dict_with_null_instances():
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends.provisioning.subprocess.run",
         return_value=mock.Mock(returncode=0, stdout='{"instances": null}'),
     ):
         assert brev._instance_exists("x") is False
@@ -293,19 +293,13 @@ def test_wait_until_ssh_reachable_invokes_refresh_callback_periodically(monkeypa
 
 
 def test_require_brev_cli_raises_when_missing():
-    with mock.patch(
-        "runplz.backends.brev.subprocess.run",
-        return_value=mock.Mock(returncode=1),
-    ):
+    with mock.patch("runplz.backends.brev.shutil.which", return_value=None):
         with pytest.raises(RuntimeError, match="brev` CLI not found"):
             brev._require_brev_cli()
 
 
 def test_require_brev_cli_silent_when_present():
-    with mock.patch(
-        "runplz.backends.brev.subprocess.run",
-        return_value=mock.Mock(returncode=0),
-    ):
+    with mock.patch("runplz.backends.brev.shutil.which", return_value="/usr/local/bin/brev"):
         brev._require_brev_cli()  # no raise
 
 
@@ -333,7 +327,7 @@ def test_skip_onboarding_tolerates_os_error(monkeypatch):
 
 def test_pick_instance_type_handles_non_list_json():
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends.provisioning.subprocess.run",
         return_value=mock.Mock(returncode=0, stdout=json.dumps({"type": "x"})),
     ):
         # `isinstance(results, list)` is False → returns None.
@@ -353,7 +347,7 @@ def test_pick_instance_type_handles_non_list_json():
 
 def test_pick_instance_type_returns_none_on_non_zero_rc():
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends.provisioning.subprocess.run",
         return_value=mock.Mock(returncode=1, stdout=""),
     ):
         assert (
@@ -372,7 +366,7 @@ def test_pick_instance_type_returns_none_on_non_zero_rc():
 
 def test_pick_instance_type_parses_Type_capital_key():
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends.provisioning.subprocess.run",
         return_value=mock.Mock(returncode=0, stdout=json.dumps([{"Type": "alt-key"}])),
     ):
         result = brev._pick_instance_type(
@@ -1316,7 +1310,7 @@ def test_run_container_mode_nonzero_exit_includes_remote_log_tail(tmp_path):
     ):
         with mock.patch("runplz.backends.ssh_common.ssh_capture", fake_ssh_capture):
             with mock.patch(
-                "runplz.backends.brev.subprocess.run",
+                "runplz.backends.provisioning.subprocess.run",
                 return_value=mock.Mock(returncode=0, stdout="", stderr=""),
             ):
                 with pytest.raises(RuntimeError) as ei:
@@ -1332,7 +1326,7 @@ def test_run_container_mode_nonzero_exit_includes_remote_log_tail(tmp_path):
 
 def test_instance_status_returns_none_when_instance_not_listed():
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends.provisioning.subprocess.run",
         return_value=mock.Mock(
             returncode=0, stdout=json.dumps([{"name": "other-box", "status": "RUNNING"}])
         ),
@@ -1342,7 +1336,7 @@ def test_instance_status_returns_none_when_instance_not_listed():
 
 def test_instance_status_returns_status_field():
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends.provisioning.subprocess.run",
         return_value=mock.Mock(
             returncode=0, stdout=json.dumps([{"name": "my-box", "status": "STOPPED"}])
         ),
@@ -1353,7 +1347,7 @@ def test_instance_status_returns_status_field():
 def test_instance_status_tolerates_alternate_field_names():
     # Brev has used "state" and "power_state" in past schema versions.
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends.provisioning.subprocess.run",
         return_value=mock.Mock(
             returncode=0, stdout=json.dumps([{"name": "my-box", "power_state": "paused"}])
         ),
@@ -1372,7 +1366,7 @@ def test_start_instance_if_stopped_issues_brev_start():
             )
         return mock.Mock(returncode=0, stdout="", stderr="")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         brev._start_instance_if_stopped("my-box")
 
     start_calls = [c for c in calls if c[:2] == ["brev", "start"]]
@@ -1386,7 +1380,7 @@ def test_start_instance_if_stopped_noop_when_running():
         calls.append(list(cmd))
         return mock.Mock(returncode=0, stdout=json.dumps([{"name": "my-box", "status": "RUNNING"}]))
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         brev._start_instance_if_stopped("my-box")
 
     # Only the ls probe; never a `brev start`.
@@ -1401,7 +1395,7 @@ def test_start_instance_if_stopped_silent_when_status_unknown():
         calls.append(list(cmd))
         return mock.Mock(returncode=0, stdout=json.dumps([{"name": "my-box"}]))
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         brev._start_instance_if_stopped("my-box")
     assert all(c[:2] != ["brev", "start"] for c in calls)
 
@@ -1734,7 +1728,7 @@ def test_refresh_ssh_retries_on_rpc_context_deadline_exceeded():
             )
         return mock.Mock(returncode=0, stdout="", stderr="")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         with mock.patch("time.sleep", lambda _s: None):
             brev._refresh_ssh()  # must not raise
     assert len(attempts) == 2
@@ -1746,7 +1740,7 @@ def test_refresh_ssh_gives_up_after_all_attempts_fail():
     def fake_run(cmd, *a, **kw):
         return mock.Mock(returncode=1, stdout="", stderr="rpc error: eof")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         with mock.patch("time.sleep", lambda _s: None):
             with pytest.raises(RuntimeError, match="failed after"):
                 brev._refresh_ssh()
@@ -1763,7 +1757,7 @@ def test_refresh_ssh_does_not_retry_non_transient_errors():
             returncode=1, stdout="", stderr="you are not authenticated — run `brev login`"
         )
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         with mock.patch("time.sleep", lambda _s: None):
             with pytest.raises(RuntimeError, match="failed after"):
                 brev._refresh_ssh()
@@ -1783,7 +1777,7 @@ def test_brev_capture_retries_on_http_500():
             return mock.Mock(returncode=1, stdout="", stderr="HTTP 500 Internal Server Error")
         return mock.Mock(returncode=0, stdout="", stderr="")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         with mock.patch("time.sleep", lambda _s: None):
             r = brev._brev_capture(["brev", "ls", "--json"], label="brev ls")
     assert r.returncode == 0
@@ -1799,7 +1793,7 @@ def test_brev_capture_retries_on_unexpected_eof():
             return mock.Mock(returncode=1, stdout="", stderr="unexpected EOF")
         return mock.Mock(returncode=0, stdout="ok", stderr="")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         with mock.patch("time.sleep", lambda _s: None):
             r = brev._brev_capture(["brev", "ls"], label="t")
     assert r.returncode == 0
@@ -1816,7 +1810,7 @@ def test_brev_capture_retries_on_timeout():
             raise subprocess.TimeoutExpired(cmd=cmd, timeout=1)
         return mock.Mock(returncode=0, stdout="", stderr="")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         with mock.patch("time.sleep", lambda _s: None):
             r = brev._brev_capture(["brev", "refresh"], label="brev refresh")
     assert r.returncode == 0
@@ -1832,7 +1826,7 @@ def test_brev_capture_returns_final_failure_on_non_transient():
         attempts.append(list(cmd))
         return mock.Mock(returncode=1, stdout="", stderr="CREATE_FAILED: shadeform not_found")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         with mock.patch("time.sleep", lambda _s: None):
             r = brev._brev_capture(["brev", "create", "x"], label="brev create")
     assert r.returncode == 1
@@ -1854,7 +1848,7 @@ def test_instance_exists_retries_context_deadline_exceeded():
             )
         return mock.Mock(returncode=0, stdout='[{"name": "my-box"}]', stderr="")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         with mock.patch("time.sleep", lambda _s: None):
             assert brev._instance_exists("my-box") is True
     assert len(attempts) == 2
@@ -1888,7 +1882,7 @@ def test_create_instance_retries_http_500():
         num_gpus=1,
     )
     img = Image.from_registry("ubuntu:22.04")
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         with mock.patch("time.sleep", lambda _s: None):
             brev._create_instance("my-new-box", cfg=cfg, image=img, function=fn)
 
@@ -1929,7 +1923,7 @@ def test_create_instance_already_exists_treated_as_success():
         num_gpus=1,
     )
     img = Image.from_registry("ubuntu:22.04")
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         with mock.patch("time.sleep", lambda _s: None):
             # Must not raise — "already exists" + confirmed-by-ls == success.
             brev._create_instance("idempotent-box", cfg=cfg, image=img, function=fn)
@@ -1957,7 +1951,7 @@ def test_create_instance_already_exists_but_not_listed_raises():
         num_gpus=1,
     )
     img = Image.from_registry("ubuntu:22.04")
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         with mock.patch("time.sleep", lambda _s: None):
             with pytest.raises(RuntimeError, match="brev create"):
                 brev._create_instance("ghost", cfg=cfg, image=img, function=fn)
@@ -1977,7 +1971,7 @@ def test_brev_capture_bails_early_on_missing_cloudcredid():
             stderr="cloudCredId or workspaceGroupId must be specified on request",
         )
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         with mock.patch("time.sleep", lambda _s: None):
             r = brev._brev_capture(["brev", "create", "x"], label="brev create")
     assert r.returncode == 1
@@ -1997,7 +1991,7 @@ def test_brev_capture_bails_early_on_quota_exceeded():
             stderr="ERROR: quota exceeded for region us-west-2",
         )
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         with mock.patch("time.sleep", lambda _s: None):
             brev._brev_capture(["brev", "create", "x"], label="brev create")
     assert len(attempts) == 1
@@ -2014,7 +2008,7 @@ def test_brev_capture_still_retries_genuine_transient():
             return mock.Mock(returncode=1, stdout="", stderr="HTTP 500")
         return mock.Mock(returncode=0, stdout="ok", stderr="")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         with mock.patch("time.sleep", lambda _s: None):
             r = brev._brev_capture(["brev", "ls"], label="brev ls")
     assert r.returncode == 0
@@ -2048,7 +2042,7 @@ def test_create_instance_reframes_cloudcredid_error():
         num_gpus=1,
     )
     img = Image.from_registry("ubuntu:22.04")
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         with mock.patch("time.sleep", lambda _s: None):
             with pytest.raises(RuntimeError) as ei:
                 brev._create_instance("release-exact", cfg=cfg, image=img, function=fn)
@@ -2076,7 +2070,7 @@ def test_check_terminal_state_raises_for_failure_status():
     provisioning died at the provider layer), we must bail early from
     the SSH-reachable poll instead of burning the full 30-min budget."""
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends.provisioning.subprocess.run",
         return_value=mock.Mock(
             returncode=0,
             stdout=json.dumps([{"name": "doomed", "status": "FAILURE"}]),
@@ -2089,7 +2083,7 @@ def test_check_terminal_state_raises_for_failure_status():
 
 def test_check_terminal_state_noop_on_running_status():
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends.provisioning.subprocess.run",
         return_value=mock.Mock(
             returncode=0,
             stdout=json.dumps([{"name": "doomed", "status": "STARTING"}]),
@@ -2101,7 +2095,7 @@ def test_check_terminal_state_noop_on_running_status():
 
 def test_check_terminal_state_raises_for_deploying_failed():
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends.provisioning.subprocess.run",
         return_value=mock.Mock(
             returncode=0,
             stdout=json.dumps([{"name": "h100", "status": "DEPLOYING_FAILED"}]),
@@ -2168,7 +2162,7 @@ def test_apply_on_finish_retries_transient_then_succeeds(capsys):
             )
         return mock.Mock(returncode=0, stdout="", stderr="")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         with mock.patch("time.sleep", lambda _s: None):
             brev._apply_on_finish(instance="box", cfg=cfg)
 
@@ -2693,7 +2687,7 @@ def test_on_finish_default_stop_calls_brev_stop(tmp_path):
         return mock.Mock(returncode=0, stdout="", stderr="")
 
     with _full_run_patches():
-        with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+        with mock.patch("runplz.backends.provisioning.subprocess.run", fake_sub):
             brev.run(app, fn, [], {}, instance="box")
 
     stop_calls = [c for c in captured["calls"] if c[:2] == ["brev", "stop"]]
@@ -2712,7 +2706,7 @@ def test_on_finish_delete_calls_brev_delete(tmp_path):
         return mock.Mock(returncode=0, stdout="", stderr="")
 
     with _full_run_patches():
-        with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+        with mock.patch("runplz.backends.provisioning.subprocess.run", fake_sub):
             brev.run(app, fn, [], {}, instance="box")
 
     delete_calls = [c for c in captured["calls"] if c[:2] == ["brev", "delete"]]
@@ -2731,7 +2725,7 @@ def test_on_finish_leave_never_touches_box(tmp_path):
         return mock.Mock(returncode=0, stdout="", stderr="")
 
     with _full_run_patches():
-        with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+        with mock.patch("runplz.backends.provisioning.subprocess.run", fake_sub):
             brev.run(app, fn, [], {}, instance="box")
 
     for c in captured["calls"]:
@@ -2754,7 +2748,7 @@ def test_on_finish_fires_even_when_remote_run_fails(tmp_path):
 
     # Simulate non-zero exit from the remote container.
     with _full_run_patches(stream_and_wait=mock.Mock(return_value=137)):
-        with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+        with mock.patch("runplz.backends.provisioning.subprocess.run", fake_sub):
             with pytest.raises(RuntimeError, match="status 137"):
                 brev.run(app, fn, [], {}, instance="box")
 
@@ -2819,7 +2813,7 @@ def test_on_finish_fires_in_container_mode(tmp_path):
             rsync_down=mock.DEFAULT,
         ),
     ):
-        with mock.patch("runplz.backends.brev.subprocess.run", fake_sub):
+        with mock.patch("runplz.backends.provisioning.subprocess.run", fake_sub):
             brev.run(app, fn, [], {}, instance="box")
 
     delete_calls = [c for c in captured["calls"] if c[:2] == ["brev", "delete"]]
@@ -2831,7 +2825,7 @@ def test_apply_on_finish_warns_on_nonzero_exit(capsys):
     be silent — that's the whole point of on_finish existing."""
     cfg = BrevConfig(mode="vm", use_docker=True)  # on_finish default = "stop"
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends.provisioning.subprocess.run",
         return_value=mock.Mock(returncode=1, stdout="", stderr="brev api 503"),
     ):
         brev._apply_on_finish(instance="box", cfg=cfg)
@@ -2855,7 +2849,7 @@ def test_apply_on_finish_silent_on_success(capsys):
             )
         return mock.Mock(returncode=0, stdout="", stderr="")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         brev._apply_on_finish(instance="box", cfg=cfg)
 
     # Only the "+ on_finish=stop: running ..." line; no warning.

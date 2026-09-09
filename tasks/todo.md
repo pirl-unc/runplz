@@ -2646,8 +2646,326 @@ line/branch coverage; `git diff --check` is clean.
 - [x] Run `./format.sh`, `./lint.sh`, and `./test.sh` on the exact release head
       (1,494 passed, 15 optional-environment skips; 95.91% coverage).
 - [x] Push this release checklist and require green CI on the final PR head.
-- [ ] Merge PR #169, switch to a clean `main`, and fast-forward from origin.
-- [ ] Run `./deploy.sh` from clean `main`; verify the pushed version tag and the
+- [x] Merge PR #169, switch to a clean `main`, and fast-forward from origin.
+- [x] Run `./deploy.sh` from clean `main`; verify the pushed version tag and the
       published PyPI version.
-- [ ] Review open issues for the next foundational block of work and record the
+- [x] Review open issues for the next foundational block of work and record the
       release outcome in the PR.
+
+### Issue #170 — block accidental live Modal launches in tests
+
+Keep the safeguard test-only: production behavior and ordinary Modal imports,
+receipt probes, volume reads, and artifact collection must remain unchanged.
+
+- [x] Start from clean 4.5.0 `main`, create a feature branch, read issue #170,
+      and inspect the existing CLI guard plus Modal 1.x execution surfaces.
+- [x] Add `modal` to the billed-command map with an explicit `live_modal`
+      marker. Block real CLI invocations regardless of argument form while
+      continuing to allow test-installed `sandbox_bin` executables and direct
+      test mocks.
+- [x] Guard the Modal SDK methods that submit or deploy work (`Function`
+      remote/spawn/map variants, `App` run/deploy, and `Sandbox.create`),
+      including `.aio` calls.
+      Apply the wrapper only when the real SDK is importable, preserve each
+      original descriptor for marked live tests, and leave read-only SDK APIs
+      untouched.
+- [x] Add regressions for blocked CLI run/deploy, marker opt-in, mocked and
+      sandboxed commands, blocked synchronous/asynchronous SDK submissions,
+      marked SDK delegation, and allowed read-only SDK operations.
+- [x] Update test-fidelity documentation and bump 4.5.0 to 4.5.1.
+- [x] Run focused tests against the minimum and current supported Modal SDK,
+      then `./format.sh`, `./lint.sh`, `./test.sh`, and inspect the final diff.
+- [x] Prepare the branch and PR handoff closing #170. Publication and final CI
+      verification are recorded on the PR rather than requiring a bookkeeping
+      commit after every check run.
+
+#### Review
+
+The guard tests pass under both Modal 1.1.0 and 1.5.5 (36 each). The local
+focused provider suite passes (195 tests), and final gates report **1,534 passed,
+1 skipped, 95.91% coverage**. Formatting, lint, and `git diff --check` pass.
+No live Modal API or paid command was invoked. The wider Modal 1.1.0 lifecycle
+suite exposed a pre-existing fake-protocol compatibility gap, filed separately
+as [issue #172](https://github.com/pirl-unc/runplz/issues/172).
+
+### PR #173 review follow-up — close remaining Modal launch paths
+
+- [x] Reconfirm the PR is open/clean and inspect the four omitted Function
+      descriptors on the installed supported SDK.
+- [x] Replace the opaque first-token helper with explicit argv normalization in
+      the guarded call site. Recognize both direct `modal ...` and supported
+      `python -m modal ...` invocations without changing unrelated commands.
+- [x] Add Function `spawn_map`, `experimental_spawn_map`, `keep_warm`, and
+      `update_autoscaler` to the SDK guard; cover sync and `.aio` access.
+- [x] Add regressions for list/tuple/string direct commands, absolute executable
+      paths, current-interpreter module execution, and a non-Modal `python -m`
+      command that must remain allowed.
+- [x] Re-run guard tests with Modal 1.1.0 and 1.5.5, then format, lint, the full
+      suite, and diff review. Push and final CI are recorded on the PR.
+
+#### Review
+
+Removed `_first_token`; the guarded call site now visibly normalizes argv and
+classifies direct Modal commands versus `python -m modal`. Direct fakes retain
+their path-based exemption, while a fake executable cannot exempt the Python
+module path. All four reviewed Function methods are guarded when exposed by the
+installed SDK, including `.aio`.
+
+Local guard tests: **51 passed** with Modal 1.1.4. Isolated endpoints each report
+**49 passed, 2 version-specific skips**: Modal 1.1.0 lacks
+`experimental_spawn_map`, while 1.5.5 lacks the removed `keep_warm`. The final
+single-worker full gate reports **1,535 passed, 15 environment skips, 95.91%
+coverage**; format, lint, and `git diff --check` pass. An initial eight-worker
+run under five concurrent sibling suites produced three scheduler-related
+subprocess timeouts; the exact regressions passed serially and the infrastructure
+flake is tracked separately in [issue #174](https://github.com/pirl-unc/runplz/issues/174).
+
+### PR #173 control-plane guard refactor
+
+Replace the reviewed public-API inventory with one default-deny boundary. Modal
+1.1 and 1.5 route unary and streaming RPC setup through
+`modal.client._Client._get_channel`, including hydrated `Function`, `Cls`/`Obj`,
+autoscaler, warm-container, App, and Sandbox operations. Blocking there also
+covers future SDK surfaces and deliberately requires `live_modal` for real
+read-only calls. Offline fake clients and explicit mocks remain usable.
+
+- [x] Patch `_Client._get_channel` in the autouse fixture and remove the public
+      descriptor inventory/wrapper.
+- [x] Keep the subprocess boundary separate; visibly normalize `env` wrappers
+      and Python interpreter flags, and validate the executable path actually
+      invoked before granting a `sandbox_bin` exemption.
+- [x] Replace exhaustive SDK-method tests with representative Function and
+      Cls/Obj calls plus direct control-boundary denial/delegation tests. Cover
+      sync and `.aio`, CLI wrappers, Python module spellings, and explicit-path
+      sandbox isolation.
+- [x] Update the fidelity notes and lessons, then run focused tests with Modal
+      1.1.0 and 1.5.5, format, lint, the full suite, and diff review.
+
+Publication and final CI are recorded on PR #173 rather than requiring a
+bookkeeping commit after the checks finish.
+
+#### Review
+
+The SDK safeguard is now a single patch of `_Client._get_channel`, the boundary
+immediately preceding Modal unary and streaming RPCs in both supported SDK
+endpoints. Representative Function and Cls/Obj autoscaler calls prove sync and
+`.aio` paths reach it; a direct boundary test proves denial occurs before client
+state is touched, and the live-marker test safely delegates through the captured
+original to a fake connection manager. No public SDK method list remains.
+
+The subprocess guard recognizes direct, `env`-wrapped, option-bearing
+`python -m modal`, and `python -mmodal` forms. Sandbox permission is based on the
+effective executable token, so a PATH fake cannot authorize an explicitly
+invoked outside binary. All **37 guard tests** pass on Modal 1.1.0, 1.1.4, and
+1.5.5 without skips; the focused Modal suite reports **198 passed**. Final gates:
+`./format.sh` and `./lint.sh` pass, and `./test.sh` reports **1,535 passed, 1
+environment skip, 95.91% coverage**. No live Modal RPC or paid command ran.
+
+CI follow-up: the representative public SDK tests inherited local Modal
+credentials, while credential-free CI rejected `from_env` before client setup
+could reach `_get_channel`. This is a test-fixture gap, not a guard bypass: no
+RPC can occur without credentials. Re-plan: supply unmistakably fake test
+credentials and reset Modal's cached environment client for those tests, prove
+both sync and async calls then fail at the intended channel boundary, rerun the
+three supported SDK endpoints and all gates, and require green matrix CI.
+
+### PR #173 subprocess execution-boundary hardening
+
+The guard must classify what the OS will execute, not just the apparent first
+argument. Keep the policy conservative wherever another interpreter would make
+that unknowable.
+
+- [x] Reject `shell=True` and every option-bearing `env` form before delegation;
+      options can change tokenization, working directory, or PATH resolution,
+      while tests can express safe calls as explicit argv or direct mocks.
+- [x] Apply `subprocess.run(executable=...)` to the effective argv before
+      classifying direct commands, Python modules, or sandbox eligibility.
+- [x] Peel repeated option-free `env` wrappers using `env` operand semantics:
+      `--` ends option parsing and every operand containing `=` is an assignment.
+- [x] Add safe adversarial regressions for shell chains, both split-string
+      spellings, executable overrides, dotted assignments, repeated wrappers,
+      and sandbox behavior without ever making a live provider call.
+- [x] Update fidelity/lessons, run Modal 1.1.0/1.5.5 focused tests, then format,
+      lint, the full suite, and diff review. Publication and final CI are
+      recorded on PR #173 rather than in a bookkeeping commit.
+
+#### Review
+
+The subprocess guard now rejects every `shell=True` or option-bearing `env`
+call before execution. This intentionally avoids pretending that `shlex` can
+evaluate a shell language or that a small option table can reproduce GNU/BSD
+`env`. Repeated option-free `env` wrappers remain supported; `--` ends option
+parsing and every operand containing `=` is treated as an assignment.
+
+Classification applies `executable=` first and accepts string, byte, path-like,
+list, and tuple command forms. Sandbox lookup uses the `env=` PATH that the
+child will receive and fails closed after a wrapper changes PATH; only the
+actually invoked executable can earn the exemption. The adversarial tests use
+disposable fake binaries and marker files, so every negative assertion remains
+safe even if regressed.
+
+All **50 guard tests** pass on Modal 1.1.0, 1.1.4, and 1.5.5 without skips; the
+focused Modal suite reports **211 passed**. Final gates: `./format.sh` and
+`./lint.sh` pass, `git diff --check` is clean, and `./test.sh` reports **1,548
+passed, 1 environment skip, 95.91% coverage**. No live provider command or
+Modal RPC ran.
+
+---
+
+## Guard hardening after code review (4.5.2)
+
+A `/code-review` pass on the branch found 12 defects in the guard, 5 of them
+confirmed empirically. Root cause of most: the classifier tried to identify
+*the* program by hand-rolling two partial parsers (a GNU/BSD `env` operand
+parser and a CPython interpreter-flag table). Every spelling those tables did
+not know about was a silent **allow** — the wrong error direction for a guard.
+
+- [x] Replace program-identification with a default-deny scan over every argv
+      token. Kills `uv run modal`, `timeout 600 modal`, `nohup`, `sudo`,
+      `stdbuf`, `xargs` and any future wrapper with one rule, and deletes the
+      `env` peeling loop entirely.
+- [x] Recognize `-m`-family module targets, including clusters (`-um`, `-Bm`)
+      and submodules (`modal.cli.entry_point`), via CPython's own rule that
+      the first `m` in a cluster ends the options.
+- [x] Read `shell`/`executable`/`env`/`cwd` by binding against `Popen`'s
+      signature, so they are seen when passed positionally.
+- [x] Fail closed on an untokenizable string command instead of delegating.
+- [x] Guard `Popen`, `call`, `check_call`, `check_output` as well as `run`.
+- [x] Resolve sandbox paths against the child's `cwd=`, and restore the
+      existence/executability check the path branch had dropped.
+- [x] Add `runplz.backends.modal_runs` to `_MODULES_TO_GUARD` and treat its
+      worker child as a Modal launch; assert the *invariant* that every
+      `runplz` module importing `subprocess` is guarded.
+- [x] Make a missing `modal.client._Client` a loud failure, not a silent
+      `return` that disables the whole SDK guard.
+- [x] Regression test per finding, plus FIDELITY.md and the version bump.
+
+#### Review
+
+The guard now asks "does this command mention anything billed?" instead of
+"what is the program?". Three constraints kept the change from over-blocking,
+all verified against the suite: the sandbox exemption is evaluated **per
+matched token** (so `env modal run fake.py` against a stub still runs), the
+marker is consulted **per billed name** (so a `live_ssh` test may run
+`rsync -e 'ssh ...'`), and matching is **strict basename equality** (so
+`gcloud compute config-ssh`, `aws ssm --name /aws/service/…` and
+`rsync --exclude=.ssh` are untouched).
+
+`env` options are still refused, but the refusal now runs *after* the scan so a
+visible billed name gives the better error, and the option also forces sandbox
+resolution to be treated as unreliable — `env -u PATH modal` must not be able
+to buy an exemption from a stub on *our* PATH.
+
+Control check: the old classifier was loaded in isolation with execution
+stubbed out, and **14 of 15** new cases reached the real `subprocess` under it
+— so these are genuine regression tests, not tests of behaviour that already
+worked. The 15th (`"modal run job.py"` with a positional `shell=True`) was
+already blocked incidentally because the split's first token was `modal`; the
+test now uses `"cd /tmp && modal run …"`, which the old guard did let through.
+Nothing was executed to establish this.
+
+**75 guard tests** pass. Full suite: **1,548 passed, 1 environment skip** —
+identical to the pre-change baseline, so the default-deny scan cost no
+existing coverage. No live provider command or Modal RPC ran.
+
+---
+
+## Second review round (4.5.3)
+
+A second `/code-review` found 13 more defects, several introduced by the first
+round's fix. Rather than patch each, the classifier was taken down another
+level of altitude: the `env` special case — which the module docstring had
+already argued against keeping — was where two of the bypasses lived.
+
+- [x] Scan **words**, not tokens: read inside an argument too, so `sh -c
+      "modal run job"`, `env -S "..."` and `--split-string=modal` are read
+      like any other argv. This deletes the `env` name check, the `PATH=`
+      scan, `uses_env_options` and `resolution_is_reliable` outright.
+- [x] Exempt only the **program actually launched**. A billed name anywhere
+      else is an argument to something unclassified, so no PATH of ours can
+      vouch for it — which is what made `env -u PATH modal` unsafe before.
+- [x] Guard `getoutput`/`getstatusoutput` (they run a command line through a
+      shell), read bytes command lines, and accept `Popen(args=[...])`.
+- [x] Drop `expect_module`: a flag cluster is `-m` only when a module name
+      follows in the same token, so `rsync -avzm` is no longer a Modal launch.
+- [x] One wrapper **per module**, so opting one backend out does not unguard
+      the rest; `_BILLED_MODULES` keyed on the package root so any self-spawn
+      of `runplz` is covered by one entry.
+- [x] Both list invariants: every module importing `subprocess` is listed *and*
+      binds it patchably; every listed module is actually patched.
+- [x] Hoist `_POPEN_SIGNATURE`; correct the docstring on how to opt out.
+
+#### Review
+
+The interesting failure was 51 tests going red on the per-module wrapper. They
+were not collateral: `test_brev_backend.py` and `test_runplz.py` patched
+`brev.subprocess.run` while the call is issued by `provisioning.subprocess.run`
+(`_brev_capture` delegates to `run_with_retries`). They passed only because the
+single shared wrapper leaked the patch across every module — the exact defect
+under repair. Repointing 46 patches at the module that issues the call is the
+fix; `_require_brev_cli` keeps its `brev` target because `which brev` really is
+issued there.
+
+Simplicity check: the classifier is 145 code lines against 147, but four state
+variables (`uses_env_options`, `resolution_is_reliable`, `expect_module`,
+`path_independent`) and all `env` operand modelling are gone, while the guard
+now covers strictly more. 22 isolated probes confirm every finding closed with
+no round-one regression, and the near-miss argv the suite depends on
+(`gcloud compute config-ssh`, `aws ssm --name /aws/service/...`, `rsync
+--exclude=.ssh`, `rsync -avzm`) still run. Full suite **1,585 passed, 1
+environment skip**. No live provider command or Modal RPC ran.
+
+---
+
+## Third review round (4.5.4)
+
+A third `/code-review` found 15 more, one of them a real rsync my own
+round-two test ran on every plain `pytest`. The altitude finding was the one
+that mattered: the guard hooked each module's `subprocess` *name*, so it
+needed a module list, a proxy class, an API list, a kwargs list, a `which`
+table, an import-convention test and its twin — and still missed `getoutput`,
+asyncio, from-imports and test-helper spawns.
+
+- [x] Hook `subprocess.Popen.__init__` per test instead. One seam sees every
+      spawn in the process; `getoutput` arrives as `shell=True` and gets the
+      refusal it deserves with no special case. Deleted: `_MODULES_TO_GUARD`,
+      `_GuardedSubprocessModule`, `_PROCESS_STARTING_APIS`, `_RUN_ONLY_KWARGS`,
+      `_NON_EXECUTING_PROGRAMS`, `_MODULE_FLAG`, `_make_guarded`, the
+      `hasattr` check, both list invariants and the three tautological tests.
+- [x] Validate the captured Popen signature at import, so a wraps-less
+      wrapper installed earlier cannot degrade it to `(*args, **kwargs)`.
+- [x] Words: split on the shell's separators and `=`, strip version
+      specifiers, take every suffix of a short-option cluster, casefold.
+      Closes `cd /tmp;modal`, `true&&modal`, `uvx modal==1.5`, `modal[aws]`,
+      `env -Smodal`, `Modal`.
+- [x] Modules: exact-or-root lookup in `_BILLED_MODULES` only, so `aws.json`,
+      `runplz._bootstrap` and `modal.py`-in-cwd are not launches; the worker
+      is also caught by file path; the CLI (`runplz.cli`, `cli.py`, bare
+      `runplz` in program position) is refused outright like `shell=True`.
+- [x] `executable=` grants the exemption too: argv[0] is then inert.
+- [x] `_require_brev_cli` uses `shutil.which`; the guard's `which` table and
+      its three tests go with it.
+- [x] Real worker spawns use an explicit `real_child_processes` fixture with a
+      justification comment — replacing the round-two passthrough that had
+      silently unguarded every module.
+- [x] The rsync-running test is classification-only; `dest/` removed.
+
+#### Review
+
+Blast radius was measured before the change, not after: a logging-only Popen
+hook ran under the old proxy and showed exactly 8 spawns a process-wide hook
+would newly refuse, all `python -m runplz.*` — five `runplz.bootstrap` (an
+over-block the narrowed module rule fixes for free) and the three real worker
+tests (the fixture). The word rules then over-blocked twice more in the full
+run, both the project's own name as data (`git config user.name "runplz test"`,
+`--labels=runplz=1`); the bare console-script name is now billed only as the
+launched program.
+
+Simplicity, honestly: conftest is 339 → 343 code lines and the classifier
+120 → 133, because it now handles file paths, casefolding, separators,
+specifiers and self-spawns. What shrank is the *system*: eight pieces of
+machinery gone, the guard-test file smaller, net −22 lines across the change,
+and no list to keep in sync. 38 isolated probes confirm every finding from all
+three rounds closed with no regression. Full suite **1,602 passed, 1 skip,
+95.91% coverage**. No live provider command or Modal RPC ran — the review
+agent's own probe did, which is recorded separately.

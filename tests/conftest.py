@@ -1,28 +1,43 @@
 """Test-wide safeguards.
 
-Issue #35: the runplz test suite must never invoke the real `brev`,
-`gcloud`, `aws`, `ssh`, or `rsync` CLIs. A plain `pytest` spinning up
+Issues #35 and #170: the runplz test suite must never invoke a real provider
+CLI or contact Modal's real control plane. A plain `pytest` spinning up
 a paid GPU box because one test forgot to mock a path is an
 unacceptable footgun — especially when `pytest -n auto` multiplies
 the blast radius and a killed test runner leaves orphan boxes
 running.
 
-This file installs an autouse fixture that replaces each backend
-module's `subprocess` reference with a wrapper whose `.run` raises on
-any of the banned CLIs. Tests that genuinely need live infra must opt
-in via `@pytest.mark.live_brev` / `live_gcp` / `live_aws` / `live_ssh`.
-Tests that already patch `subprocess.run` themselves are unaffected —
-their patch overrides ours.
+This file installs an autouse fixture that hooks `subprocess.Popen` — the one
+seam every spawn in the process goes through, whether it is spelled `run`,
+`check_output`, `getoutput`, `from subprocess import run`, or an asyncio
+subprocess — and refuses any command that names a banned CLI. Tests that
+genuinely need live infra opt in via `@pytest.mark.live_brev` / `live_gcp` /
+`live_aws` / `live_ssh` / `live_modal`; a test that must spawn a real child of
+this package without live access uses the `real_child_processes` fixture. A
+test can also take the boundary over with `mock.patch("<module>.subprocess.run")`,
+which is process-wide because `subprocess` is one module.
+
+Classification is deliberately conservative: the guard does not try to work
+out which token is *the* program, because every wrapper it has not heard of
+(`uv run modal`, `timeout 600 modal`, `nohup modal`) hides that answer, and
+each gap in such an analysis silently *allows* a billed launch. It asks the
+cheaper question instead — does this command mention anything billed? — and
+fails closed on anything it cannot read.
 """
 
 from __future__ import annotations
 
+import inspect
 import os
+import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+
+import runplz
 
 _E2E_REMOTE_ENV = "RUNPLZ_E2E_REMOTE"
 
@@ -57,7 +72,42 @@ _BILLED_COMMANDS = {
     "aws": "live_aws",
     "ssh": "live_ssh",
     "rsync": "live_ssh",
+    "modal": "live_modal",
 }
+
+# Python modules whose execution reaches a billed provider, looked up by exact
+# name and then by root package, so `modal.cli.entry_point` and every future
+# submodule are covered without naming them. The Modal worker is here because
+# it is spawned as a child interpreter that builds a real client, where no
+# in-process patch of ours applies.
+_BILLED_MODULES = {"modal": "modal", "runplz.backends.modal_runs": "modal"}
+
+# The package's own CLI. A child running it can dispatch to any backend, so no
+# single marker can vouch for it; it is refused outright, like `shell=True`.
+# The module and file-path spellings are billed wherever they appear; the bare
+# console-script name only as the launched program, because `runplz` is
+# ordinary data everywhere else in this repo's own argv (`--labels=runplz=1`,
+# `git config user.name "runplz test"`).
+_SELF_SPAWNS = {"runplz.cli"}
+_CONSOLE_SCRIPT = "runplz"
+_PACKAGE_DIR = Path(runplz.__file__).resolve().parent
+
+# Where one word ends inside an argument: whitespace, the shell's own
+# separators (`cd /tmp;modal run`, `true&&modal`), and `=` (`--opt=modal`).
+_SEPARATORS = re.compile(r"[\s;&|()<>=]+")
+# A version specifier glued to a package name (`modal[aws]`, `modal~=1.5`).
+_SPECIFIER = re.compile(r"[\[@~!<>=].*$")
+
+# The signature options are read against. It is validated here because a
+# `Popen.__init__` wrapper installed earlier without `functools.wraps` would
+# degrade it to `(*args, **kwargs)`, after which nothing would bind and every
+# command would pass — the one failure this guard must never have silently.
+_ORIGINAL_POPEN_INIT = subprocess.Popen.__init__
+_POPEN_INIT_SIGNATURE = inspect.signature(_ORIGINAL_POPEN_INIT)
+assert {"args", "shell", "executable", "cwd", "env"} <= set(_POPEN_INIT_SIGNATURE.parameters), (
+    "subprocess.Popen.__init__ has an unexpected signature; something wrapped it before "
+    f"conftest imported. Parameters: {list(_POPEN_INIT_SIGNATURE.parameters)}"
+)
 
 
 def pytest_configure(config):
@@ -78,15 +128,6 @@ def pytest_configure(config):
         )
 
 
-def _first_token(cmd) -> str:
-    if isinstance(cmd, (list, tuple)):
-        return os.path.basename(str(cmd[0])) if cmd else ""
-    if isinstance(cmd, str):
-        head = cmd.strip().split(None, 1)
-        return os.path.basename(head[0]) if head else ""
-    return ""
-
-
 # Directories holding stub executables a test installed itself. A billed
 # name resolving inside one of these is not the real CLI and cannot spend
 # money, so it is allowed through without a live marker. Registered by the
@@ -102,31 +143,192 @@ def _skip_environment(reason: str) -> None:
     pytest.skip(f"{_ENVIRONMENT_SKIP_PREFIX} {reason}")
 
 
-def _resolves_into_sandbox(prog: str) -> bool:
+def _child_path(word, cwd):
+    """Where the child would find `word`, or None if we cannot know.
+
+    subprocess resolves a path-bearing program relative to the *child's*
+    working directory — which `cwd=` moves and ours does not.
+    """
+    try:
+        base = Path.cwd() if cwd is None else Path(os.fsdecode(cwd))
+    except TypeError:
+        return None  # e.g. a directory file descriptor
+    return base / word
+
+
+def _resolves_into_sandbox(program, env, cwd):
+    """Whether `program` is a stub a test installed, not the real CLI."""
     if not _SANDBOX_BINS:
         return False
-    found = shutil.which(prog)
-    if not found:
-        return False
-    found = Path(found).resolve()
-    return any(sandbox in found.parents for sandbox in _SANDBOX_BINS)
+    if os.path.dirname(program):
+        found = _child_path(program, cwd)
+        # `shutil.which` checks this for bare names, so a path must too:
+        # otherwise a sandbox directory whose stub was never written earns the
+        # exemption and the guard reports a confusing FileNotFoundError.
+        if found is None or not (found.is_file() and os.access(found, os.X_OK)):
+            return False
+    else:
+        try:
+            search_path = os.pathsep.join(os.get_exec_path(env))
+        except (AttributeError, TypeError, ValueError):
+            # An environment we cannot normalize may still change PATH, so we
+            # cannot claim to know which file the child would find.
+            return False
+        located = shutil.which(program, path=search_path)
+        if not located:
+            return False
+        found = Path(located)
+    return any(sandbox in found.resolve().parents for sandbox in _SANDBOX_BINS)
 
 
-def _make_guarded_run(request):
-    def guarded(cmd, *args, **kwargs):
-        prog = _first_token(cmd)
-        required = _BILLED_COMMANDS.get(prog)
-        if required and not request.node.get_closest_marker(required):
-            if _resolves_into_sandbox(prog):
-                return subprocess.run(cmd, *args, **kwargs)
+def _words(text):
+    """Every bare word in `text`, read every way a shell or a tool might.
+
+    An argument may itself be a command line: `sh -c "modal run job"` and
+    `env -S "modal run job"` both hide a launch inside a single token. Reading
+    the words of every token catches those without the guard having to know
+    which programs re-tokenize their arguments.
+    """
+    words = set()
+    for piece in _SEPARATORS.split(text):
+        words.update({piece, piece.strip("\"'"), _SPECIFIER.sub("", piece)})
+        if piece.startswith("-") and not piece.startswith("--"):
+            # A value glued to a short option: `-Smodal run job` (env) or
+            # `-mmodal` (python). Every suffix is cheaper than knowing which
+            # letters take a value, and can only over-block.
+            words.update(piece[i:] for i in range(2, len(piece)))
+    try:
+        words.update(shlex.split(text))
+    except ValueError:
+        pass  # Unbalanced quotes; the quote-stripped reading above still stands.
+    return words - {""}
+
+
+def _command(cmd):
+    """The program `cmd` names and every word it is built from, or None.
+
+    None means a shape we cannot read at all, which the caller turns into a
+    refusal rather than a silent delegation.
+    """
+    if isinstance(cmd, (str, bytes, os.PathLike)):
+        # POSIX runs a shell-free string as one executable path; Windows parses
+        # it as a command line. Read it both ways rather than picking one.
+        text = os.fsdecode(cmd)
+        first = text.split()
+        return (first[0] if first else text), _words(text)
+    if isinstance(cmd, (list, tuple)):
+        tokens = [os.fsdecode(v) if isinstance(v, (bytes, os.PathLike)) else str(v) for v in cmd]
+        words = set(tokens)
+        for token in tokens:
+            words |= _words(token)
+        return (tokens[0] if tokens else ""), words
+    return None
+
+
+def _module_name(word, cwd):
+    """The Python module `word` would run, if it names one of ours or theirs."""
+    if word.endswith(".py"):
+        # A file, not a module name: `python <pkg>/backends/modal_runs.py` is
+        # the worker by path, while `modal.py` in the cwd is somebody's script.
+        found = _child_path(word, cwd)
+        try:
+            relative = found.resolve().relative_to(_PACKAGE_DIR)
+        except (AttributeError, ValueError):
+            return None  # not one of ours
+        return ".".join((_PACKAGE_DIR.name, *relative.with_suffix("").parts))
+    if "/" in word or os.sep in word:
+        return None
+    return _SPECIFIER.sub("", word)
+
+
+def _billed_name(word, cwd):
+    """What `word` launches that costs money: a CLI name, or None.
+
+    Matching is case-folded because the developer platform's filesystem is
+    case-insensitive: `Modal` would exec the real binary.
+    """
+    name = os.path.basename(word).casefold()
+    if name in _BILLED_COMMANDS:
+        return name
+    module = _module_name(word, cwd)
+    if module is None:
+        return None
+    if module in _SELF_SPAWNS:
+        return _CONSOLE_SCRIPT
+    return _BILLED_MODULES.get(module) or _BILLED_MODULES.get(module.partition(".")[0])
+
+
+def _reject_billed_commands(request, call_args, call_kwargs):
+    """Raise unless every billed name in this Popen call is allowed to run."""
+    try:
+        arguments = _POPEN_INIT_SIGNATURE.bind_partial(None, *call_args, **call_kwargs).arguments
+    except TypeError:
+        raise RuntimeError(
+            f"test {request.node.nodeid} called subprocess with arguments the provider "
+            "safety guard could not match against Popen's signature — pass explicit argv "
+            f"or mock subprocess.run. args: {call_args!r}"
+        ) from None
+    cmd = arguments.get("args")
+
+    # A shell can expand variables and execute arbitrarily many commands;
+    # tokenizing its source would not tell us what it will launch. This is
+    # also where `getoutput`/`getstatusoutput` arrive. Tests must use explicit
+    # argv or mock this boundary instead.
+    if arguments.get("shell"):
+        raise RuntimeError(
+            f"test {request.node.nodeid} tried to use subprocess with shell=True, "
+            "which the provider safety guard cannot inspect — pass explicit argv or mock "
+            f"subprocess.run. cmd: {cmd!r}"
+        )
+
+    read = _command(cmd)
+    if read is None:
+        raise RuntimeError(
+            f"test {request.node.nodeid} passed a command the provider safety guard cannot "
+            f"read — pass explicit argv or mock subprocess.run. cmd: {cmd!r}"
+        )
+    program, words = read
+
+    # On POSIX `executable=` replaces the program that is executed; argv[0] is
+    # then only what the child sees as its own name, and is not launched.
+    executable = arguments.get("executable")
+    if executable is not None:
+        words = (words - {program}) | {os.fsdecode(executable)}
+        program = os.fsdecode(executable)
+
+    cwd = arguments.get("cwd")
+    # Sorted so a command naming two billed tools always reports the same one.
+    for word in sorted(words):
+        name = _billed_name(word, cwd)
+        if (
+            name is None
+            and word == program
+            and os.path.basename(word).casefold() == _CONSOLE_SCRIPT
+        ):
+            name = _CONSOLE_SCRIPT
+        if name is None:
+            continue
+        marker = _BILLED_COMMANDS.get(name)
+        if marker is None:
             raise RuntimeError(
-                f"test {request.node.nodeid} tried to run `{prog}` for "
-                f"real — mock it, or mark the test `@pytest.mark.{required}` "
-                f"if hitting live infra is intentional. cmd: {cmd!r}"
+                f"test {request.node.nodeid} tried to run the `runplz` CLI in a child process, "
+                "which can dispatch to any backend where no in-process guard applies — call "
+                "runplz.cli.main() in-process, or use the `real_child_processes` fixture with "
+                f"a comment explaining why the child stays offline. cmd: {cmd!r}"
             )
-        return subprocess.run(cmd, *args, **kwargs)
-
-    return guarded
+        if request.node.get_closest_marker(marker):
+            continue
+        # Only the program actually launched can be a test's own stub. A billed
+        # name anywhere else is an argument to something we did not classify —
+        # a wrapper, or an `env` whose assignments change lookup — so no PATH
+        # of ours can vouch for what the child would find.
+        if word == program and _resolves_into_sandbox(program, arguments.get("env"), cwd):
+            continue
+        raise RuntimeError(
+            f"test {request.node.nodeid} tried to run `{name}` for "
+            f"real — mock it, or mark the test `@pytest.mark.{marker}` "
+            f"if hitting live infra is intentional. cmd: {cmd!r}"
+        )
 
 
 @pytest.fixture
@@ -148,54 +350,54 @@ def sandbox_bin(tmp_path, monkeypatch):
         _SANDBOX_BINS.discard(bin_dir)
 
 
-class _GuardedSubprocessModule:
-    """Thin wrapper over the real `subprocess` module.
-
-    Delegates every attribute to the real module except `run`, which is
-    replaced with a guard that refuses billed CLIs. This lets code keep
-    using `subprocess.CalledProcessError`, `subprocess.TimeoutExpired`,
-    `subprocess.DEVNULL`, etc. without us having to enumerate them.
-    """
-
-    def __init__(self, guarded_run):
-        self.run = guarded_run
-
-    def __getattr__(self, name):
-        return getattr(subprocess, name)
-
-
-# Every module that calls subprocess.run needs its `subprocess`
-# reference wrapped for the duration of each test.
-_MODULES_TO_GUARD = (
-    "runplz.backends.brev",
-    "runplz.backends.provisioning",
-    "runplz.runs",
-    "runplz.backends.ssh_common",
-    "runplz.backends.ssh",
-    "runplz.backends.modal",
-    "runplz.backends.local",
-    # aws/gcp were missing until 3.25.0, so `list_jobs` reached the real
-    # `aws` / `gcloud` binaries whenever a test drove `runplz ps` on a machine
-    # with the provider env vars set — exactly the billed-CLI call this guard
-    # exists to stop.
-    "runplz.backends.aws",
-    "runplz.backends.gcp",
-    "runplz.cli",
-)
-
-
 @pytest.fixture(autouse=True)
-def _block_real_brev_cli(request, monkeypatch):
-    """Swap each backend module's `subprocess` for a guarded wrapper."""
-    guarded = _make_guarded_run(request)
-    wrapper = _GuardedSubprocessModule(guarded)
-    for mod_path in _MODULES_TO_GUARD:
-        try:
-            mod = __import__(mod_path, fromlist=["subprocess"])
-        except ImportError:
-            continue
-        if hasattr(mod, "subprocess"):
-            monkeypatch.setattr(mod, "subprocess", wrapper, raising=False)
+def _block_real_provider_calls(request, monkeypatch):
+    """Guard every process spawn and every call to Modal's real control plane."""
+
+    def guarded_init(popen, *args, **kwargs):
+        _reject_billed_commands(request, args, kwargs)
+        _ORIGINAL_POPEN_INIT(popen, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess.Popen, "__init__", guarded_init)
+
+    try:
+        from modal.client import _Client
+    except ImportError as exc:
+        # `modal` is a hard runtime dependency (pyproject.toml), so this is not
+        # "Modal is not installed" — it is the SDK having moved or renamed
+        # `_Client`, the one case where continuing would leave every test in
+        # the suite running with no control-plane guard at all.
+        raise RuntimeError(
+            "the Modal control-plane guard could not find `modal.client._Client`; "
+            "point tests/conftest.py at the SDK's current channel boundary rather "
+            "than running unguarded."
+        ) from exc
+
+    original_get_channel = _Client._get_channel
+
+    async def guarded_get_channel(client, server_url):
+        if not request.node.get_closest_marker("live_modal"):
+            raise RuntimeError(
+                f"test {request.node.nodeid} tried to contact the real Modal control plane — "
+                "use an offline fake, or mark the test `@pytest.mark.live_modal` "
+                "if live Modal access is intentional."
+            )
+        return await original_get_channel(client, server_url)
+
+    monkeypatch.setattr(_Client, "_get_channel", guarded_get_channel)
+
+
+@pytest.fixture
+def real_child_processes(monkeypatch):
+    """Let this test spawn a real child of this package without a live marker.
+
+    For the few tests that must run the actual worker interpreter and can show
+    it stays offline — a `prepared` receipt is answered from disk, an invalid
+    one is rejected before any client exists. The test must say why in a
+    comment; the SDK control-plane guard stays in force for the parent, and
+    nothing in the child is guarded at all.
+    """
+    monkeypatch.setattr(subprocess.Popen, "__init__", _ORIGINAL_POPEN_INIT)
 
 
 @pytest.fixture(autouse=True)
