@@ -114,3 +114,7 @@
   first-token helper. Normalize argv at the guarded call site and recognize supported module
   execution (`python -m provider`) explicitly. When guarding an SDK, inventory all public methods
   that can submit work or provision capacity; common-looking methods are not necessarily funnels.
+- For a default-deny SDK safety guard, prefer the narrow transport/control-plane choke point over
+  enumerating public methods. If the policy can require an explicit marker for live reads as well
+  as writes, intercept every real RPC and let offline fake clients bypass that boundary naturally;
+  public API inventories are incomplete by construction and age badly as an SDK evolves.

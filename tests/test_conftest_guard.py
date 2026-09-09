@@ -3,30 +3,17 @@
 Issues #35 and #170.
 """
 
+import asyncio
 import shlex
 import sys
-from inspect import getattr_static
 from unittest import mock
 
 import modal as modal_sdk
 import pytest
+from modal.client import _Client
 
 from runplz.backends import brev, provisioning, ssh_common
 from runplz.backends import modal as modal_backend
-
-
-class _FakeModalMethod:
-    """Original descriptor used to prove a live marker delegates safely."""
-
-    def __get__(self, instance, owner):
-        def sync(*args, **kwargs):
-            return "sync", args, kwargs
-
-        def aio(*args, **kwargs):
-            return "aio", args, kwargs
-
-        sync.aio = aio
-        return sync
 
 
 def test_guard_blocks_real_brev_ls():
@@ -74,6 +61,12 @@ def test_guard_blocks_real_aws_via_cloud_helper():
         "modal run job.py::main",
         ["/usr/local/bin/modal", "deploy", "service.py"],
         [sys.executable, "-m", "modal", "run", "job.py::main"],
+        [sys.executable, "-u", "-m", "modal", "run", "job.py::main"],
+        [sys.executable, "-mmodal", "run", "job.py::main"],
+        ["env", "modal", "run", "job.py::main"],
+        ["env", "RUNPLZ_GUARD_TEST=1", "modal", "run", "job.py::main"],
+        ["env", "-u", "RUNPLZ_GUARD_TEST", "modal", "run", "job.py::main"],
+        ["env", sys.executable, "-u", "-m", "modal", "run", "job.py::main"],
         f"{shlex.quote(sys.executable)} -m modal deploy service.py",
     ],
 )
@@ -94,9 +87,28 @@ def test_guard_allows_sandboxed_modal_cli(sandbox_bin):
     executable.write_text("#!/bin/sh\nexit 0\n")
     executable.chmod(0o755)
 
-    result = modal_backend.subprocess.run(["modal", "run", "fake.py::main"])
+    for command in (
+        ["modal", "run", "fake.py::main"],
+        [str(executable), "run", "fake.py::main"],
+        ["env", "modal", "run", "fake.py::main"],
+    ):
+        result = modal_backend.subprocess.run(command)
+        assert result.returncode == 0
 
-    assert result.returncode == 0
+
+def test_sandboxed_name_does_not_exempt_an_explicit_modal_path(sandbox_bin):
+    sandboxed = sandbox_bin / "modal"
+    sandboxed.write_text("#!/bin/sh\nexit 0\n")
+    sandboxed.chmod(0o755)
+
+    outside_bin = sandbox_bin.parent / "outside-bin"
+    outside_bin.mkdir()
+    explicitly_invoked = outside_bin / "modal"
+    explicitly_invoked.write_text("#!/bin/sh\nexit 0\n")
+    explicitly_invoked.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+        modal_backend.subprocess.run([str(explicitly_invoked), "run", "job.py::main"])
 
 
 def test_sandboxed_executable_does_not_exempt_python_modal_module(sandbox_bin):
@@ -110,45 +122,44 @@ def test_sandboxed_executable_does_not_exempt_python_modal_module(sandbox_bin):
 
 def test_guard_allows_non_modal_python_module():
     result = modal_backend.subprocess.run(
-        [sys.executable, "-m", "this"], capture_output=True, text=True
+        [sys.executable, "-u", "-m", "this"], capture_output=True, text=True
     )
 
     assert result.returncode == 0
 
 
 @pytest.mark.parametrize("use_aio", [False, True], ids=["sync", "aio"])
-@pytest.mark.parametrize(
-    ("owner_name", "method_name"),
-    [
-        ("Function", "remote"),
-        ("Function", "remote_gen"),
-        ("Function", "spawn"),
-        ("Function", "map"),
-        ("Function", "starmap"),
-        ("Function", "for_each"),
-        ("Function", "spawn_map"),
-        ("Function", "experimental_spawn_map"),
-        ("Function", "keep_warm"),
-        ("Function", "update_autoscaler"),
-        ("App", "run"),
-        ("App", "deploy"),
-        ("Sandbox", "create"),
-    ],
-)
-def test_guard_blocks_real_modal_sdk_launches(owner_name, method_name, use_aio):
-    if owner_name == "Function":
-        target = modal_sdk.Function.from_name("runplz-guard-test", "job")
-    elif owner_name == "App":
-        target = modal_sdk.App("runplz-guard-test")
-    else:
-        target = modal_sdk.Sandbox
-    if not hasattr(target, method_name):
-        pytest.skip(f"installed Modal does not expose {owner_name}.{method_name}")
-    method = getattr(target, method_name)
-    call = method.aio if use_aio else method
+def test_guard_blocks_modal_function_at_control_plane(use_aio):
+    function = modal_sdk.Function.from_name("runplz-guard-test", "job")
+    call = function.spawn.aio if use_aio else function.spawn
 
-    with pytest.raises(RuntimeError, match=rf"`{owner_name}\.{method_name}` for real"):
-        call()
+    with pytest.raises(RuntimeError, match="real Modal control plane"):
+        if use_aio:
+            asyncio.run(call())
+        else:
+            call()
+
+
+@pytest.mark.parametrize("use_aio", [False, True], ids=["sync", "aio"])
+def test_guard_blocks_modal_class_autoscaler_at_control_plane(use_aio):
+    model = modal_sdk.Cls.from_name("runplz-guard-test", "Model")
+    instance = model()
+    call = instance.update_autoscaler.aio if use_aio else instance.update_autoscaler
+
+    with pytest.raises(RuntimeError, match="real Modal control plane"):
+        if use_aio:
+            asyncio.run(call(buffer_containers=1))
+        else:
+            call(buffer_containers=1)
+
+
+def test_guard_blocks_direct_modal_control_plane_access_before_connection():
+    client = mock.Mock()
+
+    with pytest.raises(RuntimeError, match="real Modal control plane"):
+        asyncio.run(_Client._get_channel(client, "https://example.invalid"))
+
+    assert client.mock_calls == []
 
 
 def test_guard_allows_explicit_modal_sdk_mock(monkeypatch):
@@ -160,18 +171,14 @@ def test_guard_allows_explicit_modal_sdk_mock(monkeypatch):
     spawn.assert_called_once_with()
 
 
-def test_guard_leaves_read_only_modal_sdk_construction_available():
+def test_guard_allows_offline_modal_object_construction():
     function = modal_sdk.Function.from_name("runplz-guard-test", "job")
     volume = modal_sdk.Volume.from_name("runplz-guard-test")
+    model = modal_sdk.Cls.from_name("runplz-guard-test", "Model")
 
     assert function is not None
     assert volume is not None
-    for owner, method_name in (
-        (modal_sdk.FunctionCall, "from_id"),
-        (modal_sdk.Volume, "read_file"),
-        (modal_sdk.Volume, "iterdir"),
-    ):
-        assert not hasattr(getattr_static(owner, method_name), "_operation")
+    assert model is not None
 
 
 def test_guard_lets_unrelated_commands_through():
@@ -243,12 +250,16 @@ def test_guard_allows_harmless_modal_cli_when_opted_in(cmd):
 
 
 @pytest.mark.live_modal
-def test_guard_allows_modal_sdk_delegation_when_opted_in(monkeypatch):
-    # Replace the captured real descriptor so this tests the marker/delegation
-    # branch without submitting any provider work.
-    guard = getattr_static(modal_sdk.Function, "spawn")
-    monkeypatch.setattr(guard, "_original", _FakeModalMethod())
-    function = modal_sdk.Function.from_name("runplz-guard-test", "job")
+def test_guard_allows_modal_control_plane_delegation_when_opted_in():
+    client = mock.Mock()
+    client._reset_on_pid_change = mock.AsyncMock()
+    expected_channel = object()
+    client._connection_manager.get_or_create_channel = mock.AsyncMock(return_value=expected_channel)
 
-    assert function.spawn(1, value=2) == ("sync", (1,), {"value": 2})
-    assert function.spawn.aio(3, value=4) == ("aio", (3,), {"value": 4})
+    channel = asyncio.run(_Client._get_channel(client, "https://example.invalid"))
+
+    assert channel is expected_channel
+    client._reset_on_pid_change.assert_awaited_once_with()
+    client._connection_manager.get_or_create_channel.assert_awaited_once_with(
+        "https://example.invalid"
+    )

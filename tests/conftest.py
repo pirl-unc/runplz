@@ -1,7 +1,7 @@
 """Test-wide safeguards.
 
 Issues #35 and #170: the runplz test suite must never invoke a real provider
-CLI or a Modal SDK execution method. A plain `pytest` spinning up
+CLI or contact Modal's real control plane. A plain `pytest` spinning up
 a paid GPU box because one test forgot to mock a path is an
 unacceptable footgun — especially when `pytest -n auto` multiplies
 the blast radius and a killed test runner leaves orphan boxes
@@ -23,7 +23,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-from inspect import getattr_static
 from pathlib import Path
 
 import pytest
@@ -64,26 +63,6 @@ _BILLED_COMMANDS = {
     "modal": "live_modal",
 }
 
-# Public Modal methods that submit functions or change deployed app state. The
-# read-only lifecycle APIs in modal_runs (FunctionCall.from_id, Volume reads,
-# and hydration) deliberately remain available to offline tests.
-_MODAL_SDK_LAUNCH_METHODS = {
-    "Function": (
-        "remote",
-        "remote_gen",
-        "spawn",
-        "map",
-        "starmap",
-        "for_each",
-        "spawn_map",
-        "experimental_spawn_map",
-        "keep_warm",
-        "update_autoscaler",
-    ),
-    "App": ("run", "deploy"),
-    "Sandbox": ("create",),
-}
-
 
 def pytest_configure(config):
     # Refuse to run with the retired env var still exported. Ignoring it
@@ -118,10 +97,12 @@ def _skip_environment(reason: str) -> None:
     pytest.skip(f"{_ENVIRONMENT_SKIP_PREFIX} {reason}")
 
 
-def _resolves_into_sandbox(prog: str) -> bool:
+def _resolves_into_sandbox(executable: str) -> bool:
     if not _SANDBOX_BINS:
         return False
-    found = shutil.which(prog)
+    # subprocess executes paths containing a directory exactly as supplied;
+    # only bare command names are resolved through PATH.
+    found = executable if os.path.dirname(executable) else shutil.which(executable)
     if not found:
         return False
     found = Path(found).resolve()
@@ -140,15 +121,78 @@ def _make_guarded_run(request):
         else:
             command_args = []
 
-        executable = os.path.basename(command_args[0]) if command_args else ""
-        billed_command = executable
-        executable_is_python = executable.lower().startswith("python") or (
-            bool(command_args)
-            and os.path.realpath(command_args[0]) == os.path.realpath(sys.executable)
+        # `env` is the one common executable wrapper: peel off its options and
+        # NAME=VALUE assignments so the program it launches remains visible.
+        effective_args = command_args
+        if command_args and os.path.basename(command_args[0]) == "env":
+            command_index = 1
+            while command_index < len(command_args):
+                value = command_args[command_index]
+                if value == "--":
+                    command_index += 1
+                    break
+                if value in {
+                    "-u",
+                    "--unset",
+                    "-C",
+                    "--chdir",
+                    "-S",
+                    "--split-string",
+                    "-P",
+                    "-a",
+                    "--argv0",
+                }:
+                    command_index += 2
+                    continue
+                if value.startswith(("--unset=", "--chdir=", "--split-string=", "--argv0=")):
+                    command_index += 1
+                    continue
+                if value.startswith("-"):
+                    command_index += 1
+                    continue
+                name, separator, _ = value.partition("=")
+                is_assignment = (
+                    bool(separator)
+                    and bool(name)
+                    and not name[0].isdigit()
+                    and name.replace("_", "a").isalnum()
+                )
+                if is_assignment:
+                    command_index += 1
+                    continue
+                break
+            effective_args = command_args[command_index:]
+
+        effective_executable = effective_args[0] if effective_args else ""
+        executable_name = os.path.basename(effective_executable)
+        billed_command = executable_name
+        executable_is_python = executable_name.lower().startswith("python") or (
+            bool(effective_args)
+            and os.path.realpath(effective_executable) == os.path.realpath(sys.executable)
         )
-        runs_modal_module = (
-            executable_is_python and len(command_args) >= 3 and command_args[1:3] == ["-m", "modal"]
-        )
+        modal_module = False
+        if executable_is_python:
+            argument_index = 1
+            while argument_index < len(effective_args):
+                value = effective_args[argument_index]
+                if value == "-m":
+                    modal_module = (
+                        argument_index + 1 < len(effective_args)
+                        and effective_args[argument_index + 1] == "modal"
+                    )
+                    break
+                if value.startswith("-m") and len(value) > 2:
+                    modal_module = value[2:] == "modal"
+                    break
+                if value in {"-c", "-", "--"} or not value.startswith("-"):
+                    break
+                # These interpreter options consume the following argument;
+                # joined forms such as `-Xdev` naturally consume only this one.
+                if value in {"-W", "-X", "--check-hash-based-pycs"}:
+                    argument_index += 2
+                else:
+                    argument_index += 1
+        runs_modal_module = executable_is_python and modal_module
         if runs_modal_module:
             billed_command = "modal"
 
@@ -156,7 +200,7 @@ def _make_guarded_run(request):
         if required and not request.node.get_closest_marker(required):
             # A sandboxed executable makes a direct CLI call safe. It cannot
             # make `python -m modal` safe: that imports the installed SDK.
-            if not runs_modal_module and _resolves_into_sandbox(billed_command):
+            if not runs_modal_module and _resolves_into_sandbox(effective_executable):
                 return subprocess.run(cmd, *args, **kwargs)
             raise RuntimeError(
                 f"test {request.node.nodeid} tried to run `{billed_command}` for "
@@ -203,42 +247,6 @@ class _GuardedSubprocessModule:
         return getattr(subprocess, name)
 
 
-class _GuardedModalMethod:
-    """Descriptor that blocks both sync and ``.aio`` Modal execution calls."""
-
-    def __init__(self, request, original, operation):
-        self._request = request
-        self._original = original
-        self._operation = operation
-
-    def _check(self):
-        if self._request.node.get_closest_marker("live_modal"):
-            return
-        raise RuntimeError(
-            f"test {self._request.node.nodeid} tried to call Modal SDK "
-            f"`{self._operation}` for real — mock it, or mark the test "
-            "`@pytest.mark.live_modal` if hitting live infra is intentional."
-        )
-
-    def __get__(self, instance, owner):
-        descriptor_get = getattr(self._original, "__get__", None)
-        bound = descriptor_get(instance, owner) if descriptor_get else self._original
-
-        def guarded(*args, **kwargs):
-            self._check()
-            return bound(*args, **kwargs)
-
-        aio = getattr(bound, "aio", None)
-        if aio is not None:
-
-            def guarded_aio(*args, **kwargs):
-                self._check()
-                return aio(*args, **kwargs)
-
-            guarded.aio = guarded_aio
-        return guarded
-
-
 # Every module that calls subprocess.run needs its `subprocess`
 # reference wrapped for the duration of each test.
 _MODULES_TO_GUARD = (
@@ -261,7 +269,7 @@ _MODULES_TO_GUARD = (
 
 @pytest.fixture(autouse=True)
 def _block_real_provider_calls(request, monkeypatch):
-    """Guard provider CLIs and Modal SDK methods that can launch paid work."""
+    """Guard provider CLIs and every call to Modal's real control plane."""
     guarded = _make_guarded_run(request)
     wrapper = _GuardedSubprocessModule(guarded)
     for mod_path in _MODULES_TO_GUARD:
@@ -273,24 +281,22 @@ def _block_real_provider_calls(request, monkeypatch):
             monkeypatch.setattr(mod, "subprocess", wrapper, raising=False)
 
     try:
-        import modal
+        from modal.client import _Client
     except ImportError:
         return
-    for owner_name, method_names in _MODAL_SDK_LAUNCH_METHODS.items():
-        owner = getattr(modal, owner_name, None)
-        if owner is None:
-            continue
-        for method_name in method_names:
-            try:
-                original = getattr_static(owner, method_name)
-            except AttributeError:
-                continue
-            operation = f"{owner_name}.{method_name}"
-            monkeypatch.setattr(
-                owner,
-                method_name,
-                _GuardedModalMethod(request, original, operation),
+
+    original_get_channel = _Client._get_channel
+
+    async def guarded_get_channel(client, server_url):
+        if not request.node.get_closest_marker("live_modal"):
+            raise RuntimeError(
+                f"test {request.node.nodeid} tried to contact the real Modal control plane — "
+                "use an offline fake, or mark the test `@pytest.mark.live_modal` "
+                "if live Modal access is intentional."
             )
+        return await original_get_channel(client, server_url)
+
+    monkeypatch.setattr(_Client, "_get_channel", guarded_get_channel)
 
 
 @pytest.fixture(autouse=True)

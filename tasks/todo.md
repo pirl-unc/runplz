@@ -2719,3 +2719,44 @@ coverage**; format, lint, and `git diff --check` pass. An initial eight-worker
 run under five concurrent sibling suites produced three scheduler-related
 subprocess timeouts; the exact regressions passed serially and the infrastructure
 flake is tracked separately in [issue #174](https://github.com/pirl-unc/runplz/issues/174).
+
+### PR #173 control-plane guard refactor
+
+Replace the reviewed public-API inventory with one default-deny boundary. Modal
+1.1 and 1.5 route unary and streaming RPC setup through
+`modal.client._Client._get_channel`, including hydrated `Function`, `Cls`/`Obj`,
+autoscaler, warm-container, App, and Sandbox operations. Blocking there also
+covers future SDK surfaces and deliberately requires `live_modal` for real
+read-only calls. Offline fake clients and explicit mocks remain usable.
+
+- [x] Patch `_Client._get_channel` in the autouse fixture and remove the public
+      descriptor inventory/wrapper.
+- [x] Keep the subprocess boundary separate; visibly normalize `env` wrappers
+      and Python interpreter flags, and validate the executable path actually
+      invoked before granting a `sandbox_bin` exemption.
+- [x] Replace exhaustive SDK-method tests with representative Function and
+      Cls/Obj calls plus direct control-boundary denial/delegation tests. Cover
+      sync and `.aio`, CLI wrappers, Python module spellings, and explicit-path
+      sandbox isolation.
+- [x] Update the fidelity notes and lessons, then run focused tests with Modal
+      1.1.0 and 1.5.5, format, lint, the full suite, and diff review.
+
+Publication and final CI are recorded on PR #173 rather than requiring a
+bookkeeping commit after the checks finish.
+
+#### Review
+
+The SDK safeguard is now a single patch of `_Client._get_channel`, the boundary
+immediately preceding Modal unary and streaming RPCs in both supported SDK
+endpoints. Representative Function and Cls/Obj autoscaler calls prove sync and
+`.aio` paths reach it; a direct boundary test proves denial occurs before client
+state is touched, and the live-marker test safely delegates through the captured
+original to a fake connection manager. No public SDK method list remains.
+
+The subprocess guard recognizes direct, `env`-wrapped, option-bearing
+`python -m modal`, and `python -mmodal` forms. Sandbox permission is based on the
+effective executable token, so a PATH fake cannot authorize an explicitly
+invoked outside binary. All **37 guard tests** pass on Modal 1.1.0, 1.1.4, and
+1.5.5 without skips; the focused Modal suite reports **198 passed**. Final gates:
+`./format.sh` and `./lint.sh` pass, and `./test.sh` reports **1,535 passed, 1
+environment skip, 95.91% coverage**. No live Modal RPC or paid command ran.

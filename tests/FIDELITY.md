@@ -22,13 +22,14 @@ under test -- a remote exit code, a 255 transport failure, a message only the
 real code path produces.
 
 The same default-deny rule covers Modal through `live_modal`. It blocks real
-`modal` CLI commands (including `python -m modal`) and SDK methods that submit
-functions, change autoscaling/warm-container state, deploy apps, or create
-sandboxes, including their asynchronous `.aio` forms. Read-only receipt,
-FunctionCall, and Volume observation stays available without the marker. A
-test-installed CLI in `sandbox_bin` or an explicit method mock remains safe and
-is allowed; a fake executable does not exempt `python -m modal`, which imports
-the installed SDK instead.
+`modal` CLI commands (including option-bearing `python -m modal` and `env`
+wrappers) and every SDK call to Modal's real control plane. The SDK guard sits at
+the shared channel boundary, so it covers Function, Cls/Obj, autoscaler,
+warm-container, App, Sandbox, read-only, synchronous, asynchronous, and future
+SDK operations without maintaining a public-method inventory. Offline fake
+clients and explicit mocks remain usable without the marker. A test-installed
+CLI in `sandbox_bin` is allowed only when it is the executable actually invoked;
+a PATH fake cannot exempt an explicit outside path or `python -m modal`.
 
 Tests that need a local/container SSH service are marked as environmental
 integration tests. An unavailable service produces an explicit `SKIPPED`
