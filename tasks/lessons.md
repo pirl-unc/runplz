@@ -144,3 +144,23 @@
   the given command did not demonstrate it. Load the old code in isolation with execution
   stubbed and diff old-vs-new classification; never establish a control by running the
   bypass for real, because that is exactly the billed launch under test.
+- When a guard needs a special case for one wrapper, that is the signal the altitude is
+  wrong, not that the case needs writing. Modelling `env` by name cost two bypasses (a
+  string-form `env -S` the name check never saw, and marked tests refused because an
+  *inner* program's flag looked like env's). Reading every word of every argument covers
+  `env`, `sh -c`, `--opt=value` and the next wrapper with no name to miss, and deleted four
+  state variables on the way.
+- Exempt only what you can actually see being launched. "This token resolves into the test
+  sandbox" is not a safety property when the token is an argument to an unclassified
+  wrapper -- `env -u PATH modal` resolves `modal` from a PATH the guard does not control.
+  Narrowing the exemption to the program position removed the entire question of whether
+  our PATH reading was still valid.
+- A shared mutable test double is a coupling nobody declares. One `_GuardedSubprocessModule`
+  instance handed to every module meant patching *any* module's `subprocess.run` silently
+  unguarded all of them -- and 51 tests had come to depend on it, patching
+  `brev.subprocess.run` for a call that `provisioning` issues. Give each seam its own
+  double; the tests that break are the ones that were passing for the wrong reason.
+- Fixing a review finding can introduce a worse one. The one-line passthrough added to keep
+  an offline worker test running turned off the guard for every backend at once. Re-review
+  the fix, not just the bug -- and prefer the narrowest escape hatch the harness already
+  offers over a new one.

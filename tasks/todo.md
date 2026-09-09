@@ -2867,3 +2867,50 @@ Nothing was executed to establish this.
 **75 guard tests** pass. Full suite: **1,548 passed, 1 environment skip** —
 identical to the pre-change baseline, so the default-deny scan cost no
 existing coverage. No live provider command or Modal RPC ran.
+
+---
+
+## Second review round (4.5.3)
+
+A second `/code-review` found 13 more defects, several introduced by the first
+round's fix. Rather than patch each, the classifier was taken down another
+level of altitude: the `env` special case — which the module docstring had
+already argued against keeping — was where two of the bypasses lived.
+
+- [x] Scan **words**, not tokens: read inside an argument too, so `sh -c
+      "modal run job"`, `env -S "..."` and `--split-string=modal` are read
+      like any other argv. This deletes the `env` name check, the `PATH=`
+      scan, `uses_env_options` and `resolution_is_reliable` outright.
+- [x] Exempt only the **program actually launched**. A billed name anywhere
+      else is an argument to something unclassified, so no PATH of ours can
+      vouch for it — which is what made `env -u PATH modal` unsafe before.
+- [x] Guard `getoutput`/`getstatusoutput` (they run a command line through a
+      shell), read bytes command lines, and accept `Popen(args=[...])`.
+- [x] Drop `expect_module`: a flag cluster is `-m` only when a module name
+      follows in the same token, so `rsync -avzm` is no longer a Modal launch.
+- [x] One wrapper **per module**, so opting one backend out does not unguard
+      the rest; `_BILLED_MODULES` keyed on the package root so any self-spawn
+      of `runplz` is covered by one entry.
+- [x] Both list invariants: every module importing `subprocess` is listed *and*
+      binds it patchably; every listed module is actually patched.
+- [x] Hoist `_POPEN_SIGNATURE`; correct the docstring on how to opt out.
+
+#### Review
+
+The interesting failure was 51 tests going red on the per-module wrapper. They
+were not collateral: `test_brev_backend.py` and `test_runplz.py` patched
+`brev.subprocess.run` while the call is issued by `provisioning.subprocess.run`
+(`_brev_capture` delegates to `run_with_retries`). They passed only because the
+single shared wrapper leaked the patch across every module — the exact defect
+under repair. Repointing 46 patches at the module that issues the call is the
+fix; `_require_brev_cli` keeps its `brev` target because `which brev` really is
+issued there.
+
+Simplicity check: the classifier is 145 code lines against 147, but four state
+variables (`uses_env_options`, `resolution_is_reliable`, `expect_module`,
+`path_independent`) and all `env` operand modelling are gone, while the guard
+now covers strictly more. 22 isolated probes confirm every finding closed with
+no round-one regression, and the near-miss argv the suite depends on
+(`gcloud compute config-ssh`, `aws ssm --name /aws/service/...`, `rsync
+--exclude=.ssh`, `rsync -avzm`) still run. Full suite **1,585 passed, 1
+environment skip**. No live provider command or Modal RPC ran.

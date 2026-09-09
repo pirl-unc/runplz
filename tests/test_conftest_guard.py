@@ -75,8 +75,6 @@ def test_guard_blocks_real_aws_via_cloud_helper():
         [sys.executable, "-m", "modal", "run", "job.py::main"],
         [sys.executable, "-u", "-m", "modal", "run", "job.py::main"],
         [sys.executable, "-mmodal", "run", "job.py::main"],
-        ["env", "modal", "run", "job.py::main"],
-        ["env", "RUNPLZ_GUARD_TEST=1", "modal", "run", "job.py::main"],
         ["env", sys.executable, "-u", "-m", "modal", "run", "job.py::main"],
         f"{shlex.quote(sys.executable)} -m modal deploy service.py",
     ],
@@ -113,140 +111,38 @@ def _sandboxed_modal_that_records_running(sandbox_bin, marker_name):
 @pytest.mark.parametrize(
     "env_args",
     [
+        # env's own options: ones that re-tokenize (-S), ones that change
+        # lookup (-u PATH), and one nobody has invented yet.
         ["-S", "modal run job.py::main"],
         ["--split-string", "modal run job.py::main"],
         ["--split-string=modal run job.py::main"],
-    ],
-)
-def test_guard_rejects_env_options_that_hide_the_command(sandbox_bin, env_args):
-    # `-S` re-tokenizes its argument into a command the guard never gets to
-    # read, so there is no billed name to report — only the opaque layer.
-    marker = _sandboxed_modal_that_records_running(sandbox_bin, "env-option-ran")
-
-    with pytest.raises(RuntimeError, match="env options"):
-        modal_backend.subprocess.run(["env", *env_args], check=True)
-
-    assert not marker.exists()
-
-
-@pytest.mark.parametrize(
-    "env_args",
-    [
-        ["-u", "RUNPLZ_GUARD_TEST", "modal", "run", "job.py::main"],
+        ["-u", "PATH", "modal", "run", "job.py::main"],
         ["--future-option", "modal", "run", "job.py::main"],
+        # Operands: a bare command, assignments (including a name outside
+        # shell-identifier syntax), a `--` terminator, a repeated wrapper, and
+        # an assignment that rewrites the PATH the child will search.
+        ["modal", "run", "job.py::main"],
+        ["RUNPLZ_GUARD_TEST=1", "modal", "run", "job.py::main"],
+        ["A.B=x", "modal", "run", "job.py::main"],
+        ["--", "modal", "run", "job.py::main"],
+        ["OUTER=1", "env", "INNER=2", "modal", "run", "job.py::main"],
+        ["PATH=/somewhere/else", "modal", "run", "job.py::main"],
     ],
 )
-def test_env_options_cannot_buy_a_sandbox_exemption(sandbox_bin, env_args):
-    # Here the billed name is visible, so the guard names it. The option is
-    # still what makes it unsafe: `env -u PATH modal` resolves `modal` from a
-    # PATH we do not control, so the sandbox stub cannot stand in for it.
-    marker = _sandboxed_modal_that_records_running(sandbox_bin, "env-option-ran")
+def test_guard_blocks_env_wrapped_modal_however_it_is_spelled(sandbox_bin, env_args):
+    """One rule, no `env` parser: the exemption covers the launched program.
+
+    Behind `env` that program is `env`, so the sandbox stub cannot stand in for
+    `modal` no matter which operand or option spelling puts it there — including
+    the ones that re-tokenize or rewrite PATH, which no operand parser of ours
+    would have modelled correctly anyway.
+    """
+    marker = _sandboxed_modal_that_records_running(sandbox_bin, "env-wrapped-ran")
 
     with pytest.raises(RuntimeError, match="tried to run `modal`"):
         modal_backend.subprocess.run(["env", *env_args], check=True)
 
     assert not marker.exists()
-
-
-def test_guard_uses_executable_override_as_the_launched_program(tmp_path):
-    explicitly_invoked = tmp_path / "modal"
-    explicitly_invoked.write_text("#!/bin/sh\nexit 0\n")
-    explicitly_invoked.chmod(0o755)
-
-    with pytest.raises(RuntimeError, match="tried to run `modal`"):
-        modal_backend.subprocess.run(
-            ["harmless-argv-zero", "run", "job.py::main"],
-            executable=explicitly_invoked,
-        )
-
-
-def test_guard_classifies_pathlike_and_space_containing_executables(tmp_path):
-    outside_bin = tmp_path / "outside bin"
-    outside_bin.mkdir()
-    explicitly_invoked = outside_bin / "modal"
-    explicitly_invoked.write_text("#!/bin/sh\nexit 0\n")
-    explicitly_invoked.chmod(0o755)
-
-    for command in (explicitly_invoked, str(explicitly_invoked)):
-        with pytest.raises(RuntimeError, match="tried to run `modal`"):
-            modal_backend.subprocess.run(command)
-
-
-def test_guard_allows_sandboxed_executable_override(sandbox_bin):
-    executable = sandbox_bin / "modal"
-    executable.write_text("#!/bin/sh\nexit 0\n")
-    executable.chmod(0o755)
-
-    result = modal_backend.subprocess.run(
-        ["harmless-argv-zero", "run", "fake.py::main"],
-        executable=executable,
-    )
-
-    assert result.returncode == 0
-
-
-@pytest.mark.parametrize("separator", [[], ["--"]], ids=["plain", "after-double-dash"])
-def test_guard_treats_every_env_name_value_operand_as_an_assignment(tmp_path, separator):
-    explicitly_invoked = tmp_path / "modal"
-    explicitly_invoked.write_text("#!/bin/sh\nexit 0\n")
-    explicitly_invoked.chmod(0o755)
-
-    with pytest.raises(RuntimeError, match="tried to run `modal`"):
-        modal_backend.subprocess.run(
-            ["env", *separator, "A.B=x", str(explicitly_invoked), "run", "job.py::main"]
-        )
-
-
-def test_guard_peels_repeated_env_wrappers(tmp_path):
-    explicitly_invoked = tmp_path / "modal"
-    explicitly_invoked.write_text("#!/bin/sh\nexit 0\n")
-    explicitly_invoked.chmod(0o755)
-
-    with pytest.raises(RuntimeError, match="tried to run `modal`"):
-        modal_backend.subprocess.run(
-            [
-                "env",
-                "OUTER=value",
-                "env",
-                "INNER=value",
-                str(explicitly_invoked),
-                "run",
-                "job.py::main",
-            ]
-        )
-
-
-def test_subprocess_env_path_controls_sandbox_resolution(sandbox_bin):
-    sandboxed = sandbox_bin / "modal"
-    sandboxed.write_text("#!/bin/sh\nexit 0\n")
-    sandboxed.chmod(0o755)
-
-    outside_bin = sandbox_bin.parent / "outside-path"
-    outside_bin.mkdir()
-    outside = outside_bin / "modal"
-    outside.write_text("#!/bin/sh\nexit 0\n")
-    outside.chmod(0o755)
-
-    with pytest.raises(RuntimeError, match="tried to run `modal`"):
-        modal_backend.subprocess.run(
-            ["modal", "run", "job.py::main"],
-            env={"PATH": str(outside_bin)},
-        )
-
-
-def test_env_path_assignment_cannot_reuse_outer_sandbox_resolution(sandbox_bin):
-    sandboxed = sandbox_bin / "modal"
-    sandboxed.write_text("#!/bin/sh\nexit 0\n")
-    sandboxed.chmod(0o755)
-
-    outside_bin = sandbox_bin.parent / "outside-env-path"
-    outside_bin.mkdir()
-    outside = outside_bin / "modal"
-    outside.write_text("#!/bin/sh\nexit 0\n")
-    outside.chmod(0o755)
-
-    with pytest.raises(RuntimeError, match="tried to run `modal`"):
-        modal_backend.subprocess.run(["env", f"PATH={outside_bin}", "modal", "run", "job.py::main"])
 
 
 def test_guard_allows_explicit_modal_cli_mock():
@@ -261,10 +157,11 @@ def test_guard_allows_sandboxed_modal_cli(sandbox_bin):
     executable.write_text("#!/bin/sh\nexit 0\n")
     executable.chmod(0o755)
 
+    # `env modal ...` is deliberately absent: the exemption covers the program
+    # actually launched, and behind a wrapper that is the wrapper.
     for command in (
         ["modal", "run", "fake.py::main"],
         [str(executable), "run", "fake.py::main"],
-        ["env", "modal", "run", "fake.py::main"],
     ):
         result = modal_backend.subprocess.run(command)
         assert result.returncode == 0
@@ -474,12 +371,19 @@ def test_guard_blocks_modal_behind_flag_spellings_and_wrappers(cmd):
         modal_backend.subprocess.run(cmd, check=True)
 
 
-def test_guard_fails_closed_on_an_untokenizable_string_command():
-    # shlex cannot split an unbalanced quote. Treating that as "no tokens"
-    # delegated straight to the real subprocess, where Windows' own parser
-    # would have found `modal` again.
-    with pytest.raises(RuntimeError, match="cannot tokenize"):
-        modal_backend.subprocess.run("/usr/bin/modal run 'unclosed")
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "/usr/bin/modal run 'unclosed",  # shlex cannot split an unbalanced quote
+        "'modal' run 'unclosed",  # ...and the name is quoted, so splitting on
+        "'modal' run job.py",  # whitespace alone would not reveal it either
+    ],
+)
+def test_guard_reads_a_string_command_shlex_cannot_split(cmd):
+    # Treating an unsplittable string as "no tokens" delegated straight to the
+    # real subprocess, where Windows' own parser would have found `modal`.
+    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+        modal_backend.subprocess.run(cmd)
 
 
 def test_guard_reads_shell_passed_positionally(sandbox_bin):
@@ -561,23 +465,51 @@ def test_every_module_that_shells_out_is_guarded():
     """Close the class of bug, not the one instance of it.
 
     `runplz.backends.modal_runs` called `subprocess.run` while absent from
-    `_MODULES_TO_GUARD`, so its commands never reached the guard at all. The
-    next module to shell out must not be able to repeat that silently.
+    `_MODULES_TO_GUARD`, so its commands never reached the guard at all. Two
+    ways to repeat that silently: leave a module off the list, or bind the
+    module under a name the fixture cannot replace — `from subprocess import
+    run` and `import subprocess as sp` both leave no `subprocess` attribute to
+    patch, so the guard skips them while the code still shells out.
     """
     from conftest import _MODULES_TO_GUARD
 
     package = Path(runplz.__file__).parent
     shells_out = set()
+    unguardable = []
     for path in package.rglob("*.py"):
+        module = ".".join(path.relative_to(package.parent).with_suffix("").parts)
         for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.Import) and any(a.name == "subprocess" for a in node.names):
-                shells_out.add(".".join(path.relative_to(package.parent).with_suffix("").parts))
+            if isinstance(node, ast.ImportFrom) and node.module == "subprocess":
+                unguardable.append(f"{module}: from subprocess import ...")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name != "subprocess":
+                        continue
+                    if alias.asname:
+                        unguardable.append(f"{module}: import subprocess as {alias.asname}")
+                    else:
+                        shells_out.add(module)
 
     assert shells_out, "expected to find modules importing subprocess"
+    assert not unguardable, (
+        "these modules bind subprocess under a name the guard cannot replace; "
+        f"use plain `import subprocess`: {sorted(unguardable)}"
+    )
     assert not shells_out - set(_MODULES_TO_GUARD), (
         "these modules call subprocess but are not in _MODULES_TO_GUARD: "
         f"{sorted(shells_out - set(_MODULES_TO_GUARD))}"
     )
+
+
+def test_every_guarded_module_is_actually_patchable():
+    # The reverse invariant. A listed module with no `subprocess` attribute was
+    # skipped silently, so the list could carry a dead entry — or an entry that
+    # quietly stopped being guarded — while still reading as covered.
+    from conftest import _MODULES_TO_GUARD
+
+    for mod_path in _MODULES_TO_GUARD:
+        module = __import__(mod_path, fromlist=["subprocess"])
+        assert type(module.subprocess).__name__ == "_GuardedSubprocessModule", mod_path
 
 
 def test_control_plane_guard_is_actually_installed():
@@ -592,3 +524,94 @@ def test_guard_allows_looking_a_billed_cli_up_without_running_it():
     # executes its operand, so blocking it would be a false positive.
     result = brev.subprocess.run(["which", "brev"], capture_output=True)
     assert result.returncode in (0, 1)
+
+
+# --- Regression tests for the second review round --------------------------
+
+
+@pytest.mark.parametrize("api", ["getoutput", "getstatusoutput"])
+def test_guard_covers_the_shell_helpers(api):
+    # These take a command line and run it through a shell, so leaving them to
+    # `__getattr__` handed back an unguarded `shell=True`.
+    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+        getattr(modal_backend.subprocess, api)("modal run job.py::main")
+
+
+def test_guard_reads_a_bytes_command_line():
+    # The `str` branch splits because Windows parses a string as a command
+    # line; the same parsing applies to bytes, which used to arrive as one
+    # undecoded token that hid every billed name.
+    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+        modal_backend.subprocess.run(b"modal run job.py")
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        ["sh", "-c", "modal run job.py::main"],
+        ["bash", "-lc", "cd /tmp && modal run job.py::main"],
+        [sys.executable, "-c", "import modal; modal.Function.from_name('a', 'b').spawn()"],
+    ],
+)
+def test_guard_reads_commands_hidden_inside_an_argument(cmd):
+    # An argument can itself be a command line. Reading the words of every
+    # token catches that without the guard knowing which programs re-tokenize.
+    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+        modal_backend.subprocess.run(cmd)
+
+
+def test_guard_allows_an_ordinary_python_c_snippet():
+    # The control for the case above: `-c` is not itself suspicious.
+    result = modal_backend.subprocess.run(
+        [sys.executable, "-c", "import time; print(time.strftime('%Y'))"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+
+
+def test_string_and_argv_forms_classify_alike():
+    # `launched` used to be the whole command string, so `basename()` never
+    # matched `which` and the string form was blocked where argv was allowed.
+    # POSIX runs a shell-free string as one path, so it fails to exec — which
+    # is fine; what matters is that the guard did not classify it as a launch.
+    try:
+        modal_backend.subprocess.run("which modal", capture_output=True)
+    except FileNotFoundError:
+        pass
+
+
+def test_guard_classifies_popen_args_passed_by_keyword():
+    # `args` is Popen's documented parameter name, so this spelling is legal
+    # and used to die on a TypeError naming a parameter the caller never used.
+    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+        modal_backend.subprocess.Popen(args=["modal", "run", "job.py::main"])
+
+
+def test_patching_one_module_does_not_unguard_the_others(monkeypatch):
+    # A single shared wrapper meant a test opting one backend out silently
+    # opened every other backend too.
+    monkeypatch.setattr(modal_runs.subprocess, "run", mock.Mock(return_value="passthrough"))
+
+    assert modal_runs.subprocess.run(["modal", "run", "j.py"]) == "passthrough"
+    with pytest.raises(RuntimeError, match="tried to run `brev`"):
+        brev.subprocess.run(["brev", "ls", "--json"])
+
+
+def test_guard_blocks_any_self_spawn_of_this_package():
+    # A child interpreter running our own package can reach any backend, and
+    # no in-process patch of ours applies inside it.
+    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+        modal_backend.subprocess.run([sys.executable, "-m", "runplz.cli", "run", "job.py"])
+
+
+@pytest.mark.live_ssh
+@pytest.mark.parametrize("cmd", [["rsync", "-avzm", "src/", "dest/"], ["tar", "-xzmf", "a.tgz"]])
+def test_option_clusters_containing_m_are_not_module_flags(cmd):
+    # `-avzm` matched the interpreter-flag pattern, so the *next* operand was
+    # classified as a Python module — and module hits are never exemptible, so
+    # no marker or stub could clear the resulting false block.
+    try:
+        modal_backend.subprocess.run(cmd, capture_output=True)
+    except (FileNotFoundError, OSError):
+        pass  # the tool need not exist; only the classification is under test

@@ -243,7 +243,7 @@ def test_pick_instance_type_builds_correct_search_cmd():
         )
 
     fn = _fn_with(gpu="T4", min_cpu=4, min_memory=26, min_gpu_memory=16, min_disk=100)
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         result = _pick_instance_type(fn)
     assert result == "n1-highmem-4:nvidia-tesla-t4:1"
     cmd = captured["cmd"]
@@ -264,7 +264,7 @@ def test_pick_instance_type_threads_num_gpus_through():
         return mock.Mock(returncode=0, stdout=json.dumps([{"type": "a100-x4"}]))
 
     fn = _fn_with(gpu="A100", num_gpus=4)
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         _pick_instance_type(fn)
     cmd = captured["cmd"]
     assert "--min-gpus" in cmd and "4" in cmd
@@ -279,7 +279,7 @@ def test_pick_instance_type_omits_min_gpus_when_only_one():
         return mock.Mock(returncode=0, stdout=json.dumps([{"type": "t4-x1"}]))
 
     fn = _fn_with(gpu="T4", num_gpus=1)
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         _pick_instance_type(fn)
     assert "--min-gpus" not in captured["cmd"]
 
@@ -290,7 +290,7 @@ def test_pick_instance_type_cpu_when_no_gpu():
         assert cmd[:3] == ["brev", "search", "cpu"]
         return mock.Mock(returncode=0, stdout=json.dumps([{"type": "n2d-highmem-2"}]))
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         result = _pick_instance_type(_fn_with(min_memory=16))
     assert result == "n2d-highmem-2"
 
@@ -313,7 +313,7 @@ def test_pick_instance_types_returns_up_to_n_ranked_candidates():
     def fake_run(cmd, *a, **kw):
         return mock.Mock(returncode=0, stdout=json.dumps(brev_rows), stderr="")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         result = _pick_instance_types(_fn_with(gpu="T4", min_memory=16), n=3)
 
     # Band (a, b); hinted prefers b first (lower eta). Fallback #3: c.
@@ -332,9 +332,9 @@ def test_pick_instance_types_n1_falls_back_to_single_picker():
     def fake_run(cmd, *a, **kw):
         return mock.Mock(returncode=0, stdout=json.dumps(rows), stderr="")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         single = _pick_instance_type(_fn_with(gpu="T4"))
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         multi = _pick_instance_types(_fn_with(gpu="T4"), n=1)
     assert multi == [single]
 
@@ -345,7 +345,7 @@ def test_pick_instance_types_empty_on_no_matches():
     def fake_run(cmd, *a, **kw):
         return mock.Mock(returncode=0, stdout="[]", stderr="")
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         assert _pick_instance_types(_fn_with(gpu="T4"), n=3) == []
 
 
@@ -363,7 +363,7 @@ def test_pick_instance_type_prefers_faster_start_within_5pct():
     def fake_run(cmd, *a, **kw):
         return mock.Mock(returncode=0, stdout=json.dumps(brev_rows))
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         result = _pick_instance_type(_fn_with(gpu="T4", min_memory=16))
     assert result == "t4-fast-region"
 
@@ -379,7 +379,7 @@ def test_pick_instance_type_cost_wins_outside_5pct():
     def fake_run(cmd, *a, **kw):
         return mock.Mock(returncode=0, stdout=json.dumps(brev_rows))
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         result = _pick_instance_type(_fn_with(gpu="T4"))
     assert result == "cheap-slow"
 
@@ -393,7 +393,7 @@ def test_pick_instance_type_legacy_shape_no_price_field_falls_back_to_first():
     def fake_run(cmd, *a, **kw):
         return mock.Mock(returncode=0, stdout=json.dumps(brev_rows))
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         result = _pick_instance_type(_fn_with(gpu="T4"))
     assert result == "minimal-row-1"
 
@@ -410,14 +410,14 @@ def test_pick_instance_type_alternate_price_key_name():
     def fake_run(cmd, *a, **kw):
         return mock.Mock(returncode=0, stdout=json.dumps(brev_rows))
 
-    with mock.patch("runplz.backends.brev.subprocess.run", fake_run):
+    with mock.patch("runplz.backends.provisioning.subprocess.run", fake_run):
         result = _pick_instance_type(_fn_with(gpu="T4"))
     assert result == "faster"
 
 
 def test_pick_instance_type_returns_none_on_no_match():
     with mock.patch(
-        "runplz.backends.brev.subprocess.run",
+        "runplz.backends.provisioning.subprocess.run",
         return_value=mock.Mock(returncode=0, stdout="[]"),
     ):
         assert _pick_instance_type(_fn_with(gpu="H100", min_memory=999999)) is None
