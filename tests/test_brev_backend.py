@@ -293,19 +293,13 @@ def test_wait_until_ssh_reachable_invokes_refresh_callback_periodically(monkeypa
 
 
 def test_require_brev_cli_raises_when_missing():
-    with mock.patch(
-        "runplz.backends.brev.subprocess.run",
-        return_value=mock.Mock(returncode=1),
-    ):
+    with mock.patch("runplz.backends.brev.shutil.which", return_value=None):
         with pytest.raises(RuntimeError, match="brev` CLI not found"):
             brev._require_brev_cli()
 
 
 def test_require_brev_cli_silent_when_present():
-    with mock.patch(
-        "runplz.backends.brev.subprocess.run",
-        return_value=mock.Mock(returncode=0),
-    ):
+    with mock.patch("runplz.backends.brev.shutil.which", return_value="/usr/local/bin/brev"):
         brev._require_brev_cli()  # no raise
 
 

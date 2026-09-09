@@ -2914,3 +2914,58 @@ no round-one regression, and the near-miss argv the suite depends on
 (`gcloud compute config-ssh`, `aws ssm --name /aws/service/...`, `rsync
 --exclude=.ssh`, `rsync -avzm`) still run. Full suite **1,585 passed, 1
 environment skip**. No live provider command or Modal RPC ran.
+
+---
+
+## Third review round (4.5.4)
+
+A third `/code-review` found 15 more, one of them a real rsync my own
+round-two test ran on every plain `pytest`. The altitude finding was the one
+that mattered: the guard hooked each module's `subprocess` *name*, so it
+needed a module list, a proxy class, an API list, a kwargs list, a `which`
+table, an import-convention test and its twin — and still missed `getoutput`,
+asyncio, from-imports and test-helper spawns.
+
+- [x] Hook `subprocess.Popen.__init__` per test instead. One seam sees every
+      spawn in the process; `getoutput` arrives as `shell=True` and gets the
+      refusal it deserves with no special case. Deleted: `_MODULES_TO_GUARD`,
+      `_GuardedSubprocessModule`, `_PROCESS_STARTING_APIS`, `_RUN_ONLY_KWARGS`,
+      `_NON_EXECUTING_PROGRAMS`, `_MODULE_FLAG`, `_make_guarded`, the
+      `hasattr` check, both list invariants and the three tautological tests.
+- [x] Validate the captured Popen signature at import, so a wraps-less
+      wrapper installed earlier cannot degrade it to `(*args, **kwargs)`.
+- [x] Words: split on the shell's separators and `=`, strip version
+      specifiers, take every suffix of a short-option cluster, casefold.
+      Closes `cd /tmp;modal`, `true&&modal`, `uvx modal==1.5`, `modal[aws]`,
+      `env -Smodal`, `Modal`.
+- [x] Modules: exact-or-root lookup in `_BILLED_MODULES` only, so `aws.json`,
+      `runplz._bootstrap` and `modal.py`-in-cwd are not launches; the worker
+      is also caught by file path; the CLI (`runplz.cli`, `cli.py`, bare
+      `runplz` in program position) is refused outright like `shell=True`.
+- [x] `executable=` grants the exemption too: argv[0] is then inert.
+- [x] `_require_brev_cli` uses `shutil.which`; the guard's `which` table and
+      its three tests go with it.
+- [x] Real worker spawns use an explicit `real_child_processes` fixture with a
+      justification comment — replacing the round-two passthrough that had
+      silently unguarded every module.
+- [x] The rsync-running test is classification-only; `dest/` removed.
+
+#### Review
+
+Blast radius was measured before the change, not after: a logging-only Popen
+hook ran under the old proxy and showed exactly 8 spawns a process-wide hook
+would newly refuse, all `python -m runplz.*` — five `runplz.bootstrap` (an
+over-block the narrowed module rule fixes for free) and the three real worker
+tests (the fixture). The word rules then over-blocked twice more in the full
+run, both the project's own name as data (`git config user.name "runplz test"`,
+`--labels=runplz=1`); the bare console-script name is now billed only as the
+launched program.
+
+Simplicity, honestly: conftest is 339 → 343 code lines and the classifier
+120 → 133, because it now handles file paths, casefolding, separators,
+specifiers and self-spawns. What shrank is the *system*: eight pieces of
+machinery gone, the guard-test file smaller, net −22 lines across the change,
+and no list to keep in sync. 38 isolated probes confirm every finding from all
+three rounds closed with no regression. Full suite **1,602 passed, 1 skip,
+95.91% coverage**. No live provider command or Modal RPC ran — the review
+agent's own probe did, which is recorded separately.

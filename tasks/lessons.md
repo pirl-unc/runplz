@@ -164,3 +164,21 @@
   an offline worker test running turned off the guard for every backend at once. Re-review
   the fix, not just the bug -- and prefer the narrowest escape hatch the harness already
   offers over a new one.
+- Hook the seam the process actually has, not the names code happens to use. Guarding
+  `<module>.subprocess.run` needed a list of modules, a proxy, a list of APIs, a convention
+  test to police imports, and still missed `getoutput`, asyncio and test helpers. One
+  `Popen.__init__` hook sees every spawn, and `getoutput` arrives as the `shell=True` it is.
+  The same principle as guarding the SDK at `_get_channel` rather than enumerating methods.
+- Measure blast radius before an architectural change, with an observe-only version of it.
+  A logging hook run under the old guard named the 8 spawns a process-wide hook would newly
+  refuse, and why, before any test went red — so the redesign was a decision, not a surprise.
+- A project's own name is data in its own argv. Billing bare `runplz` anywhere refused
+  `git config user.name "runplz test"` and `--labels=runplz=1`; a name that is also a
+  launch can only be billed in the position where it launches.
+- A `.py` word is a file, not a module name; resolve it against the child's cwd and the
+  package directory, never the package's parent — the parent is the repo root, and
+  `modal.py` in it is not the Modal SDK.
+- A review verifier that reproduces a fail-open by *removing* the guard has reproduced the
+  incident. Reproduce a guard bypass by classification with execution stubbed, never by
+  running the suite unguarded; the second one executed real `brev create` and
+  `aws ec2 run-instances` on a developer laptop.

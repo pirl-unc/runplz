@@ -3,11 +3,13 @@
 Issues #35 and #170.
 """
 
-import ast
 import asyncio
 import shlex
+import subprocess
 import sys
 from pathlib import Path
+from subprocess import run as bare_run
+from types import SimpleNamespace
 from unittest import mock
 
 import modal as modal_sdk
@@ -265,9 +267,9 @@ def test_guard_lets_docker_commands_through():
     # We only verify the call reaches subprocess.run (it'll either succeed
     # or fail on `docker` being missing; either outcome is fine for this
     # test since the guard didn't trip).
-    import subprocess as real
+    from conftest import _ORIGINAL_POPEN_INIT
 
-    assert brev.subprocess.run is not real.run  # guard wrapper installed
+    assert subprocess.Popen.__init__ is not _ORIGINAL_POPEN_INIT  # guard installed
     # This just needs to not raise our RuntimeError.
     try:
         brev.subprocess.run(
@@ -277,14 +279,6 @@ def test_guard_lets_docker_commands_through():
         )
     except FileNotFoundError:
         pass  # no docker on this host — still proves the guard didn't block it
-
-
-def test_guard_subprocess_module_proxies_non_run_attributes():
-    # Code that uses subprocess.TimeoutExpired / CalledProcessError /
-    # DEVNULL through a guarded backend module must still work.
-    assert brev.subprocess.TimeoutExpired is __import__("subprocess").TimeoutExpired
-    assert brev.subprocess.CalledProcessError is __import__("subprocess").CalledProcessError
-    assert brev.subprocess.DEVNULL == __import__("subprocess").DEVNULL
 
 
 @pytest.mark.live_brev
@@ -409,13 +403,6 @@ def test_guard_reads_executable_passed_positionally(tmp_path):
         modal_backend.subprocess.run(["harmless-argv-zero"], -1, str(explicitly_invoked))
 
 
-@pytest.mark.parametrize("api", ["Popen", "call", "check_call", "check_output"])
-def test_guard_covers_every_process_starting_entry_point(api):
-    # Guarding `run` alone left four documented ways to reach the same binary.
-    with pytest.raises(RuntimeError, match="tried to run `modal`"):
-        getattr(modal_backend.subprocess, api)(["modal", "run", "job.py::main"])
-
-
 def test_sandbox_exemption_follows_the_childs_working_directory(sandbox_bin, tmp_path, monkeypatch):
     sandboxed = sandbox_bin / "modal"
     sandboxed.write_text("#!/bin/sh\nexit 0\n")
@@ -456,84 +443,15 @@ def test_guard_blocks_the_modal_worker_child():
         )
 
 
-def test_modal_worker_module_is_guarded():
-    # The exact assertion that showed the module was missing from the list.
-    assert type(modal_runs.subprocess).__name__ == "_GuardedSubprocessModule"
-
-
-def test_every_module_that_shells_out_is_guarded():
-    """Close the class of bug, not the one instance of it.
-
-    `runplz.backends.modal_runs` called `subprocess.run` while absent from
-    `_MODULES_TO_GUARD`, so its commands never reached the guard at all. Two
-    ways to repeat that silently: leave a module off the list, or bind the
-    module under a name the fixture cannot replace — `from subprocess import
-    run` and `import subprocess as sp` both leave no `subprocess` attribute to
-    patch, so the guard skips them while the code still shells out.
-    """
-    from conftest import _MODULES_TO_GUARD
-
-    package = Path(runplz.__file__).parent
-    shells_out = set()
-    unguardable = []
-    for path in package.rglob("*.py"):
-        module = ".".join(path.relative_to(package.parent).with_suffix("").parts)
-        for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.ImportFrom) and node.module == "subprocess":
-                unguardable.append(f"{module}: from subprocess import ...")
-            elif isinstance(node, ast.Import):
-                for alias in node.names:
-                    if alias.name != "subprocess":
-                        continue
-                    if alias.asname:
-                        unguardable.append(f"{module}: import subprocess as {alias.asname}")
-                    else:
-                        shells_out.add(module)
-
-    assert shells_out, "expected to find modules importing subprocess"
-    assert not unguardable, (
-        "these modules bind subprocess under a name the guard cannot replace; "
-        f"use plain `import subprocess`: {sorted(unguardable)}"
-    )
-    assert not shells_out - set(_MODULES_TO_GUARD), (
-        "these modules call subprocess but are not in _MODULES_TO_GUARD: "
-        f"{sorted(shells_out - set(_MODULES_TO_GUARD))}"
-    )
-
-
-def test_every_guarded_module_is_actually_patchable():
-    # The reverse invariant. A listed module with no `subprocess` attribute was
-    # skipped silently, so the list could carry a dead entry — or an entry that
-    # quietly stopped being guarded — while still reading as covered.
-    from conftest import _MODULES_TO_GUARD
-
-    for mod_path in _MODULES_TO_GUARD:
-        module = __import__(mod_path, fromlist=["subprocess"])
-        assert type(module.subprocess).__name__ == "_GuardedSubprocessModule", mod_path
-
-
-def test_control_plane_guard_is_actually_installed():
-    # The SDK guard used to `return` on ImportError. `modal` is a hard runtime
-    # dependency, so the only way that fired was the SDK moving `_Client` --
-    # which would have left the whole suite unguarded and still green.
-    assert _Client._get_channel.__name__ == "guarded_get_channel"
-
-
-def test_guard_allows_looking_a_billed_cli_up_without_running_it():
-    # `_require_brev_cli` runs this as a precondition check; `which` never
-    # executes its operand, so blocking it would be a false positive.
-    result = brev.subprocess.run(["which", "brev"], capture_output=True)
-    assert result.returncode in (0, 1)
-
-
 # --- Regression tests for the second review round --------------------------
 
 
 @pytest.mark.parametrize("api", ["getoutput", "getstatusoutput"])
 def test_guard_covers_the_shell_helpers(api):
-    # These take a command line and run it through a shell, so leaving them to
-    # `__getattr__` handed back an unguarded `shell=True`.
-    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+    # These run a command line through a shell. Hooking Popen sees them arrive
+    # as `shell=True`, so they get the shell refusal rather than a tokenizing
+    # of shell source that `cd /tmp;modal run job` would have slipped past.
+    with pytest.raises(RuntimeError, match="shell=True"):
         getattr(modal_backend.subprocess, api)("modal run job.py::main")
 
 
@@ -560,27 +478,6 @@ def test_guard_reads_commands_hidden_inside_an_argument(cmd):
         modal_backend.subprocess.run(cmd)
 
 
-def test_guard_allows_an_ordinary_python_c_snippet():
-    # The control for the case above: `-c` is not itself suspicious.
-    result = modal_backend.subprocess.run(
-        [sys.executable, "-c", "import time; print(time.strftime('%Y'))"],
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0
-
-
-def test_string_and_argv_forms_classify_alike():
-    # `launched` used to be the whole command string, so `basename()` never
-    # matched `which` and the string form was blocked where argv was allowed.
-    # POSIX runs a shell-free string as one path, so it fails to exec — which
-    # is fine; what matters is that the guard did not classify it as a launch.
-    try:
-        modal_backend.subprocess.run("which modal", capture_output=True)
-    except FileNotFoundError:
-        pass
-
-
 def test_guard_classifies_popen_args_passed_by_keyword():
     # `args` is Popen's documented parameter name, so this spelling is legal
     # and used to die on a TypeError naming a parameter the caller never used.
@@ -588,30 +485,133 @@ def test_guard_classifies_popen_args_passed_by_keyword():
         modal_backend.subprocess.Popen(args=["modal", "run", "job.py::main"])
 
 
-def test_patching_one_module_does_not_unguard_the_others(monkeypatch):
-    # A single shared wrapper meant a test opting one backend out silently
-    # opened every other backend too.
-    monkeypatch.setattr(modal_runs.subprocess, "run", mock.Mock(return_value="passthrough"))
-
-    assert modal_runs.subprocess.run(["modal", "run", "j.py"]) == "passthrough"
-    with pytest.raises(RuntimeError, match="tried to run `brev`"):
-        brev.subprocess.run(["brev", "ls", "--json"])
+# --- Regression tests for the third review round ---------------------------
 
 
-def test_guard_blocks_any_self_spawn_of_this_package():
-    # A child interpreter running our own package can reach any backend, and
-    # no in-process patch of ours applies inside it.
+def _classify(cmd, *markers, **popen_kwargs):
+    """Run the guard's classifier alone, for cases a real spawn would need a
+    live marker or a tool for. Raises exactly as the hook would."""
+    from conftest import _reject_billed_commands
+
+    node = SimpleNamespace(nodeid="classification", get_closest_marker=lambda m: m in markers)
+    _reject_billed_commands(SimpleNamespace(node=node), (cmd,), popen_kwargs)
+
+
+def test_the_seam_is_popen_so_every_spelling_of_a_spawn_is_guarded():
+    # Hooking each module's `subprocess` name left every other route open:
+    # a from-import, an alias, a test helper, asyncio. Popen is the one seam.
+    cmd = ["modal", "run", "job.py::main"]
     with pytest.raises(RuntimeError, match="tried to run `modal`"):
-        modal_backend.subprocess.run([sys.executable, "-m", "runplz.cli", "run", "job.py"])
+        bare_run(cmd)
+    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+        subprocess.check_output(cmd)
+    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+        subprocess.Popen(args=cmd)
+    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+        asyncio.run(asyncio.create_subprocess_exec(*cmd))
 
 
-@pytest.mark.live_ssh
-@pytest.mark.parametrize("cmd", [["rsync", "-avzm", "src/", "dest/"], ["tar", "-xzmf", "a.tgz"]])
-def test_option_clusters_containing_m_are_not_module_flags(cmd):
-    # `-avzm` matched the interpreter-flag pattern, so the *next* operand was
-    # classified as a Python module — and module hits are never exemptible, so
-    # no marker or stub could clear the resulting false block.
-    try:
-        modal_backend.subprocess.run(cmd, capture_output=True)
-    except (FileNotFoundError, OSError):
-        pass  # the tool need not exist; only the classification is under test
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        ["uvx", "modal==1.5", "run", "job.py"],
+        ["uvx", "modal[aws]", "run", "job.py"],
+        ["uvx", "modal@latest", "run", "job.py"],
+        ["pipx", "run", "modal>=1", "run", "job.py"],
+        ["uv", "tool", "run", "modal~=1.5", "deploy", "s.py"],
+    ],
+)
+def test_guard_reads_a_billed_name_through_a_version_specifier(cmd):
+    # Install-and-run wrappers resolve the console script in a fresh env and
+    # run it for real; the specifier glued to the name hid it from the scan.
+    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+        subprocess.run(cmd)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        ["env", "-Smodal run job.py::main"],  # env's glued -S<string>
+        ["sh", "-c", "cd /tmp;modal run job.py"],  # separator, plus a `/`
+        ["sh", "-c", "true&&modal run job.py"],
+        ["sh", "-c", "true|modal run job.py"],
+        [sys.executable, "-c", "import modal;modal.run()"],
+        ["Modal", "run", "job.py"],  # case-insensitive filesystem
+        ["MODAL", "run", "job.py"],
+    ],
+)
+def test_guard_reads_a_billed_name_glued_to_a_separator_or_case(cmd):
+    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+        subprocess.run(cmd)
+
+
+def test_guard_blocks_the_modal_worker_spelled_as_a_file_path():
+    # The `-m` spelling was refused; the same worker by path was not.
+    with pytest.raises(RuntimeError, match="tried to run `modal`"):
+        subprocess.run([sys.executable, modal_runs.__file__, "probe", "/tmp/out"])
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        ["runplz", "run", "job.py"],
+        [sys.executable, "-m", "runplz.cli", "run", "job.py"],
+        ["uv", "run", "python", "-m", "runplz.cli", "run", "job.py"],
+        [sys.executable, str(Path(runplz.__file__).parent / "cli.py"), "run", "job.py"],
+    ],
+)
+def test_a_child_running_the_cli_is_refused_whatever_the_marker(cmd):
+    # It can dispatch to any backend, so no one marker can vouch for it.
+    for markers in ((), ("live_modal",), ("live_brev", "live_ssh")):
+        with pytest.raises(RuntimeError, match="`runplz` CLI in a child process"):
+            _classify(cmd, *markers)
+
+
+@pytest.mark.parametrize(
+    "cmd, markers",
+    [
+        # runplz's own remote-command strings and docker argv name its
+        # bootstrap module, which reaches no provider.
+        (["ssh", "box", "bash -lc 'python -m runplz._bootstrap > last.log 2>&1'"], ("live_ssh",)),
+        (["ssh", "box", "pkill -f 'runplz._bootstrap' || true"], ("live_ssh",)),
+        (["docker", "run", "img", "python", "-m", "runplz._bootstrap"], ()),
+        ([sys.executable, "-m", "runplz.bootstrap"], ()),
+        # Product-embedded user data and ordinary filenames are not launches.
+        (["docker", "run", "-e", 'RUNPLZ_KWARGS={"cfg": "aws.yaml"}', "img"], ()),
+        (["cat", "aws.json"], ()),
+        (["git", "config", "user.name", "runplz test"], ()),
+        (["gcloud", "compute", "instances", "create", "box", "--labels=runplz=1"], ("live_gcp",)),
+        (["docker", "build", "-t", "runplz.local:latest", "."], ()),
+        (["git", "commit", "-m", "fix modal.py"], ()),
+        # A short-option cluster is not `-m` unless a module name follows it.
+        (["rsync", "-avzm", "src/", "dest/"], ("live_ssh",)),
+        (["tar", "-xzmf", "a.tgz"], ()),
+        # `-c` is not itself suspicious.
+        ([sys.executable, "-c", "import time; print(time.strftime('%Y'))"], ()),
+    ],
+)
+def test_guard_does_not_bill_words_that_merely_resemble_a_launch(cmd, markers):
+    _classify(cmd, *markers)  # must not raise
+
+
+def test_executable_override_can_grant_the_exemption_too(sandbox_bin):
+    # POSIX execs `executable=`; argv[0] is then only the child's own name.
+    stub = sandbox_bin / "modal"
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+
+    result = subprocess.run(["modal", "run", "job.py"], executable=str(stub))
+
+    assert result.returncode == 0
+
+
+def test_real_child_processes_is_the_only_way_to_spawn_our_worker(real_child_processes):
+    # The escape hatch exists for the worker tests; here it proves it is
+    # scoped to the test that asks for it, by being the one that asks.
+    result = subprocess.run(
+        [sys.executable, "-m", "runplz.backends.modal_runs", "probe", "/nonexistent"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 2  # rejected the receipt, offline
