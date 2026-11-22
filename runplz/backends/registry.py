@@ -171,6 +171,25 @@ BACKENDS = {
                 )
             ),
         ),
+        BackendSpec(
+            name="colab",
+            module="runplz.backends.colab",
+            listing=ListingSpec(
+                default_fan_out=False,
+                scope=(
+                    ScopeField(
+                        name="auth",
+                        flag="--colab-auth",
+                        help="Authentication strategy for `colab sessions` (oauth2 or adc).",
+                    ),
+                    ScopeField(
+                        name="config",
+                        flag="--colab-config",
+                        help="Path to colab-cli session state JSON file.",
+                    ),
+                ),
+            ),
+        ),
     )
 }
 

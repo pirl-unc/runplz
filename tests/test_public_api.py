@@ -34,7 +34,10 @@ PUBLIC_MODULES = (
         "runplz.logcapture",
     )
     + ("runplz.backends.listing", "runplz.backends.modal_runs")
-    + tuple(f"runplz.backends.{name}" for name in ("local", "ssh", "brev", "modal", "gcp", "aws"))
+    + tuple(
+        f"runplz.backends.{name}"
+        for name in ("local", "ssh", "brev", "modal", "gcp", "aws", "colab")
+    )
 )
 
 
@@ -245,6 +248,7 @@ def test_emitted_bootstrap_path_is_the_legacy_one():
         "backends/local.py": 1,
         "backends/modal.py": 2,
         "backends/ssh_common.py": 3,
+        "backends/colab.py": 1,
     }
     for rel, expected in emitters.items():
         text = (root / rel).read_text()

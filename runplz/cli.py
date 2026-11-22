@@ -197,6 +197,10 @@ def _parse_entrypoint_args(entrypoint, extra_argv, fail):
         description=f"Arguments for @app.local_entrypoint def {entrypoint.__name__}(...):",
         add_help=False,  # --help is already owned by the outer parser
     )
+    try:
+        hints = typing.get_type_hints(entrypoint)
+    except Exception:
+        hints = {}
     for name, param in sig.parameters.items():
         if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
             fail(
@@ -204,7 +208,8 @@ def _parse_entrypoint_args(entrypoint, extra_argv, fail):
                 f"is not supported by the CLI — use explicit keyword params "
                 f"with type annotations instead."
             )
-        declared_type = _effective_type(param.annotation)
+        annotation = hints.get(name, param.annotation)
+        declared_type = _effective_type(annotation)
         has_default = param.default is not inspect.Parameter.empty
         flag = f"--{name.replace('_', '-')}"
         if declared_type is bool:
