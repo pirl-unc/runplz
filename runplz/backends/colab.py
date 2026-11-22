@@ -503,6 +503,8 @@ def _validated_tar_members(tar: tarfile.TarFile, dest: Path) -> list[tarfile.Tar
 
 _TRANSIENT_ATTEMPTS = 3
 _TRANSIENT_BACKOFF_S = 2.0
+_TRANSFER_ATTEMPTS = 6
+_TRANSFER_BACKOFF_S = 5.0
 _RUNNER_STARTED_SENTINEL = "[runplz] colab runner started"
 _COLAB_HANG_PATTERNS = ("RuntimeError: Connection was lost.",)
 _COLAB_HANG_GRACE_S = 5.0
@@ -774,8 +776,9 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
             _run_colab(
                 [*base_cmd, "upload", "-s", session, str(local_repo_tar), _REMOTE_REPO_TAR],
                 dry_run=cfg.dry_run,
-                retries=_TRANSIENT_ATTEMPTS,
+                retries=_TRANSFER_ATTEMPTS,
                 cmd_timeout=300.0,
+                backoff_s=_TRANSFER_BACKOFF_S,
             )
             _run_colab_exec(
                 [*base_cmd, "exec", "-s", session, "-f", str(local_runner), "--timeout", "0"],
@@ -799,7 +802,8 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
                 [*base_cmd, "download", "-s", session, _REMOTE_OUT_TAR, str(local_out_tar)],
                 dry_run=False,
                 check=False,
-                retries=_TRANSIENT_ATTEMPTS,
+                retries=_TRANSFER_ATTEMPTS,
+                backoff_s=_TRANSFER_BACKOFF_S,
             )
             if out_dl.returncode == 0 and local_out_tar.is_file():
                 _extract_tar(local_out_tar, host_out)
@@ -808,7 +812,8 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
                 [*base_cmd, "download", "-s", session, _REMOTE_RESULT_JSON, str(local_result)],
                 dry_run=False,
                 check=False,
-                retries=_TRANSIENT_ATTEMPTS,
+                retries=_TRANSFER_ATTEMPTS,
+                backoff_s=_TRANSFER_BACKOFF_S,
             )
             if res_dl.returncode != 0 or not local_result.is_file():
                 raise RuntimeError(
