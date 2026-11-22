@@ -669,3 +669,85 @@ def test_colab_upload_survives_tls_warmup_retries(tmp_path: Path):
     assert upload_attempts == 5
     assert slept == [5.0, 10.0, 15.0, 20.0]
     assert (tmp_path / "out" / "ok.txt").read_text() == "ok"
+
+
+def test_colab_exec_reconnects_via_attach_after_mid_run_disconnect():
+    seen_cmds: list[list[str]] = []
+    outcomes = iter([(1, True), (1, False), (0, False)])
+
+    def fake_once(cmd, *, cmd_timeout, hang_grace_s=5.0):
+        seen_cmds.append(list(cmd))
+        return next(outcomes)
+
+    with (
+        mock.patch("runplz.backends.colab._exec_colab_once", side_effect=fake_once),
+        mock.patch("runplz.backends.colab.time.sleep") as sleep_mock,
+    ):
+        res = colab._run_colab_exec(
+            ["colab", "exec", "-f", "runner.py"],
+            dry_run=False,
+            cmd_timeout=3600.0,
+            retries=3,
+            attach_cmd=["colab", "exec", "-f", "attach.py"],
+        )
+
+    assert res.returncode == 0
+    assert seen_cmds == [
+        ["colab", "exec", "-f", "runner.py"],
+        ["colab", "exec", "-f", "attach.py"],
+        ["colab", "exec", "-f", "attach.py"],
+    ]
+    assert sleep_mock.call_count == 2
+
+
+def test_colab_exec_attach_bails_after_three_quick_failures_and_templates_compile():
+    seen = []
+
+    def always_fail(cmd, *, cmd_timeout, hang_grace_s=5.0):
+        seen.append(cmd[-1])
+        return (1, True) if cmd[-1] == "runner.py" else (1, False)
+
+    with (
+        mock.patch("runplz.backends.colab._exec_colab_once", side_effect=always_fail),
+        mock.patch("runplz.backends.colab.time.sleep"),
+    ):
+        with pytest.raises(subprocess.CalledProcessError):
+            colab._run_colab_exec(
+                ["colab", "exec", "-f", "runner.py"],
+                dry_run=False,
+                cmd_timeout=3600.0,
+                retries=3,
+                attach_cmd=["colab", "exec", "-f", "attach.py"],
+            )
+    assert seen == ["runner.py", "attach.py", "attach.py", "attach.py"]
+
+    # Verify generated worker, launcher, and attach scripts are all valid Python
+    worker_src = colab._WORKER_TEMPLATE.format(
+        workspace="/w",
+        out_dir="/o",
+        repo_tar="/r.tgz",
+        out_tar="/o.tgz",
+        result_json="/res.json",
+        done_flag="/done",
+        image_ops=[],
+        container_env={},
+        preconditions={},
+        timeout=60,
+    )
+    runner_src = colab._RUNNER_TEMPLATE.format(
+        worker_py="/worker.py",
+        job_log="/job.log",
+        tail_offset="/tail.off",
+        worker_pid="/worker.pid",
+        done_flag="/done",
+        worker_src=worker_src,
+    )
+    attach_src = colab._ATTACH_TEMPLATE.format(
+        job_log="/job.log",
+        tail_offset="/tail.off",
+        worker_pid="/worker.pid",
+        done_flag="/done",
+    )
+    compile(worker_src, "worker.py", "exec")
+    compile(runner_src, "runner.py", "exec")
+    compile(attach_src, "attach.py", "exec")
