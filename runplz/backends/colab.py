@@ -861,14 +861,6 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
         client_oauth_config=cfg.client_oauth_config,
     )
 
-    new_cmd = [*base_cmd, "new", "-s", session]
-    if gpu_flag:
-        new_cmd += ["--gpu", gpu_flag]
-    if tpu_flag:
-        new_cmd += ["--tpu", tpu_flag]
-    if want_high_mem:
-        new_cmd.append("--high-mem")
-
     worker_src = _WORKER_TEMPLATE.format(
         workspace=REMOTE_WORKSPACE,
         out_dir=REMOTE_OUT,
@@ -923,38 +915,77 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
             size_mb = local_repo_tar.stat().st_size / (1024 * 1024)
             print(f"+ packed repo archive: {size_mb:.2f} MB", flush=True)
 
+        def _provision(sess: str, *, allow_high_mem: bool) -> None:
+            cmd = [*base_cmd, "new", "-s", sess]
+            if gpu_flag:
+                cmd += ["--gpu", gpu_flag]
+            if tpu_flag:
+                cmd += ["--tpu", tpu_flag]
+            if allow_high_mem:
+                cmd.append("--high-mem")
+            try:
+                _run_colab(
+                    cmd,
+                    dry_run=cfg.dry_run,
+                    retries=_TRANSIENT_ATTEMPTS,
+                    cmd_timeout=300.0,
+                    backoff_s=5.0,
+                )
+            except subprocess.CalledProcessError:
+                if not (allow_high_mem and cfg.fallback_to_standard_mem):
+                    raise
+                fallback_cmd = [part for part in cmd if part != "--high-mem"]
+                print(
+                    "[runplz] colab --high-mem provisioning failed; "
+                    "retrying standard memory shape...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _run_colab(
+                    fallback_cmd,
+                    dry_run=cfg.dry_run,
+                    retries=_TRANSIENT_ATTEMPTS,
+                    cmd_timeout=300.0,
+                    backoff_s=5.0,
+                )
+
+        _provision(session, allow_high_mem=want_high_mem)
         try:
-            _run_colab(
-                new_cmd,
-                dry_run=cfg.dry_run,
-                retries=_TRANSIENT_ATTEMPTS,
-                cmd_timeout=300.0,
-                backoff_s=5.0,
-            )
-        except subprocess.CalledProcessError:
-            if not (want_high_mem and cfg.fallback_to_standard_mem):
-                raise
-            fallback_cmd = [part for part in new_cmd if part != "--high-mem"]
-            print(
-                "[runplz] colab --high-mem provisioning failed; retrying standard memory shape...",
-                file=sys.stderr,
-                flush=True,
-            )
-            _run_colab(
-                fallback_cmd,
-                dry_run=cfg.dry_run,
-                retries=_TRANSIENT_ATTEMPTS,
-                cmd_timeout=300.0,
-                backoff_s=5.0,
-            )
-        try:
-            _run_colab(
-                [*base_cmd, "upload", "-s", session, str(local_repo_tar), _REMOTE_REPO_TAR],
-                dry_run=cfg.dry_run,
-                retries=_TRANSFER_ATTEMPTS,
-                cmd_timeout=300.0,
-                backoff_s=_TRANSFER_BACKOFF_S,
-            )
+            try:
+                _run_colab(
+                    [*base_cmd, "upload", "-s", session, str(local_repo_tar), _REMOTE_REPO_TAR],
+                    dry_run=cfg.dry_run,
+                    retries=_TRANSFER_ATTEMPTS,
+                    cmd_timeout=300.0,
+                    backoff_s=_TRANSFER_BACKOFF_S,
+                )
+            except subprocess.CalledProcessError:
+                if cfg.dry_run:
+                    raise
+                print(
+                    f"[runplz] initial colab upload failed on {session!r}; "
+                    "stopping broken session and re-provisioning once...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _run_colab(
+                    [*base_cmd, "stop", "-s", session],
+                    dry_run=False,
+                    check=False,
+                    cmd_timeout=120.0,
+                )
+                session = _session_name(app.name, function.name)
+                _provision(
+                    session,
+                    allow_high_mem=want_high_mem and not cfg.fallback_to_standard_mem,
+                )
+                _run_colab(
+                    [*base_cmd, "upload", "-s", session, str(local_repo_tar), _REMOTE_REPO_TAR],
+                    dry_run=False,
+                    retries=_TRANSFER_ATTEMPTS,
+                    cmd_timeout=300.0,
+                    backoff_s=_TRANSFER_BACKOFF_S,
+                )
             _run_colab_exec(
                 [*base_cmd, "exec", "-s", session, "-f", str(local_runner), "--timeout", "0"],
                 dry_run=cfg.dry_run,
