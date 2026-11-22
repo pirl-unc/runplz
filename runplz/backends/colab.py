@@ -50,6 +50,11 @@ REMOTE_OUT = "/content/out"
 _REMOTE_REPO_TAR = "/content/runplz-repo.tar.gz"
 _REMOTE_OUT_TAR = "/content/runplz-out.tar.gz"
 _REMOTE_RESULT_JSON = "/content/runplz-result.json"
+_REMOTE_WORKER_PY = "/content/runplz-worker.py"
+_REMOTE_JOB_LOG = "/content/runplz-job.log"
+_REMOTE_TAIL_OFFSET = "/content/runplz-tail.offset"
+_REMOTE_WORKER_PID = "/content/runplz-worker.pid"
+_REMOTE_DONE_FLAG = "/content/runplz-done"
 
 # Colab accepts a single GPU per session from this exact set. Unrecognized
 # names silently fall back to A100 inside colab-cli, so we validate upfront.
@@ -83,8 +88,8 @@ _SESSION_LINE_RE = re.compile(
     r"Variant:\s+(?P<variant>[^|]+?)(?:\s+\|\s+Status:\s+(?P<status>.+))?$"
 )
 
-_RUNNER_TEMPLATE = '''\
-"""Generated Google Colab runner for runplz. Do not edit."""
+_WORKER_TEMPLATE = '''\
+"""Generated detached Google Colab worker for runplz. Do not edit."""
 
 import importlib.util
 import json
@@ -100,6 +105,7 @@ _OUT_DIR = {out_dir!r}
 _REPO_TAR = {repo_tar!r}
 _OUT_TAR = {out_tar!r}
 _RESULT_JSON = {result_json!r}
+_DONE_FLAG = {done_flag!r}
 _IMAGE_OPS = {image_ops!r}
 _CONTAINER_ENV = {container_env!r}
 _PRECONDITIONS = {preconditions!r}
@@ -124,9 +130,6 @@ def _safe_extract(tar_path: str, dest: str) -> None:
 
 
 def _stream(cmd, *, shell: bool = False, cwd=None, env=None, timeout=None) -> int:
-    # Jupyter kernels only forward writes to Python's sys.stdout/sys.stderr over
-    # WebSockets; child OS fds would otherwise vanish. Stream line-by-line so
-    # pip/apt/bootstrap logs appear live in the caller's terminal.
     proc = subprocess.Popen(
         cmd,
         shell=shell,
@@ -222,7 +225,6 @@ def _check_preconditions() -> None:
 
 
 def _main() -> None:
-    print("[runplz] colab runner started", flush=True)
     exit_code = 1
     error_msg = ""
     os.makedirs(_OUT_DIR, exist_ok=True)
@@ -256,10 +258,127 @@ def _main() -> None:
             json.dump({{"exit_code": exit_code, "error": error_msg}}, f)
         with tarfile.open(_OUT_TAR, "w:gz") as tar:
             tar.add(_OUT_DIR, arcname=".")
+        with open(_DONE_FLAG, "w") as f:
+            f.write("done\\n")
 
 
 _main()
 '''
+
+_TAIL_SNIPPET = """\
+def _pid_alive(pid_path: str) -> bool:
+    if not os.path.exists(pid_path):
+        return False
+    try:
+        pid = int(open(pid_path).read().strip())
+        os.kill(pid, 0)
+        return True
+    except (ValueError, ProcessLookupError, OSError):
+        return False
+
+
+def _tail_until_done(log_path: str, offset_path: str, pid_path: str, done_path: str) -> None:
+    offset = 0
+    if os.path.exists(offset_path):
+        try:
+            offset = int(open(offset_path).read().strip())
+        except ValueError:
+            offset = 0
+    while True:
+        if os.path.exists(log_path):
+            with open(log_path, "rb") as fh:
+                fh.seek(offset)
+                chunk = fh.read()
+            if chunk:
+                sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+                sys.stdout.flush()
+                offset += len(chunk)
+                with open(offset_path, "w") as oh:
+                    oh.write(str(offset))
+                continue
+        if os.path.exists(done_path):
+            break
+        if not _pid_alive(pid_path):
+            time.sleep(0.5)
+            if os.path.exists(log_path):
+                with open(log_path, "rb") as fh:
+                    fh.seek(offset)
+                    chunk = fh.read()
+                if chunk:
+                    sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+                    sys.stdout.flush()
+                    offset += len(chunk)
+                    with open(offset_path, "w") as oh:
+                        oh.write(str(offset))
+            break
+        time.sleep(1.0)
+"""
+
+_RUNNER_TEMPLATE = (
+    '''\
+"""Generated Google Colab launcher for runplz. Do not edit."""
+
+import os
+import subprocess
+import sys
+import time
+
+_WORKER_PY = {worker_py!r}
+_JOB_LOG = {job_log!r}
+_TAIL_OFFSET = {tail_offset!r}
+_WORKER_PID = {worker_pid!r}
+_DONE_FLAG = {done_flag!r}
+_WORKER_SRC = {worker_src!r}
+
+'''
+    + _TAIL_SNIPPET
+    + """
+
+def _launch() -> None:
+    for p in (_DONE_FLAG, _TAIL_OFFSET, _WORKER_PID):
+        if os.path.exists(p):
+            os.remove(p)
+    with open(_WORKER_PY, "w") as fh:
+        fh.write(_WORKER_SRC)
+    log_fh = open(_JOB_LOG, "wb")
+    proc = subprocess.Popen(
+        [sys.executable, "-u", _WORKER_PY],
+        start_new_session=True,
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        close_fds=True,
+    )
+    log_fh.close()
+    with open(_WORKER_PID, "w") as ph:
+        ph.write(str(proc.pid))
+    print("[runplz] colab runner started", flush=True)
+    _tail_until_done(_JOB_LOG, _TAIL_OFFSET, _WORKER_PID, _DONE_FLAG)
+
+
+_launch()
+"""
+)
+
+_ATTACH_TEMPLATE = (
+    '''\
+"""Generated Google Colab log-attach helper for runplz. Do not edit."""
+
+import os
+import sys
+import time
+
+_JOB_LOG = {job_log!r}
+_TAIL_OFFSET = {tail_offset!r}
+_WORKER_PID = {worker_pid!r}
+_DONE_FLAG = {done_flag!r}
+
+'''
+    + _TAIL_SNIPPET
+    + """
+
+_tail_until_done(_JOB_LOG, _TAIL_OFFSET, _WORKER_PID, _DONE_FLAG)
+"""
+)
 
 
 def gpu_flag_for(
@@ -578,6 +697,10 @@ def _exec_colab_once(
     return rc, bool(state["started"])
 
 
+_MAX_RECONNECTS = 20
+_RECONNECT_BACKOFF_S = 5.0
+
+
 def _run_colab_exec(
     cmd: list[str],
     *,
@@ -585,13 +708,18 @@ def _run_colab_exec(
     cmd_timeout: float,
     retries: int = _TRANSIENT_ATTEMPTS,
     hang_grace_s: float = _COLAB_HANG_GRACE_S,
+    attach_cmd: Optional[list[str]] = None,
+    max_reconnects: int = _MAX_RECONNECTS,
 ) -> subprocess.CompletedProcess:
     print("+ " + " ".join(shlex.quote(part) for part in cmd), flush=True)
     if dry_run:
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+    overall_deadline = time.monotonic() + cmd_timeout
     last_rc = 1
+    started = False
     for attempt in range(1, max(1, retries) + 1):
-        rc, started = _exec_colab_once(cmd, cmd_timeout=cmd_timeout, hang_grace_s=hang_grace_s)
+        remaining = max(1.0, overall_deadline - time.monotonic())
+        rc, started = _exec_colab_once(cmd, cmd_timeout=remaining, hang_grace_s=hang_grace_s)
         last_rc = rc
         if rc == 0 or started or attempt >= retries:
             break
@@ -603,6 +731,36 @@ def _run_colab_exec(
             flush=True,
         )
         time.sleep(wait_s)
+    if last_rc != 0 and started and attach_cmd is not None:
+        quick_fails = 0
+        for reconn in range(1, max(1, max_reconnects) + 1):
+            remaining = overall_deadline - time.monotonic()
+            if remaining <= 0:
+                last_rc = 124
+                break
+            wait_s = _RECONNECT_BACKOFF_S * min(reconn, 3)
+            print(
+                f"[runplz] colab WebSocket dropped mid-run (rc={last_rc}); "
+                f"re-attaching to detached worker ({reconn}/{max_reconnects}) in {wait_s:.0f}s...",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(wait_s)
+            t0 = time.monotonic()
+            rc, _ = _exec_colab_once(
+                attach_cmd,
+                cmd_timeout=max(1.0, overall_deadline - time.monotonic()),
+                hang_grace_s=hang_grace_s,
+            )
+            last_rc = rc
+            if rc == 0:
+                break
+            if (time.monotonic() - t0) < 15.0:
+                quick_fails += 1
+                if quick_fails >= 3:
+                    break
+            else:
+                quick_fails = 0
     if last_rc != 0:
         raise subprocess.CalledProcessError(last_rc, cmd)
     return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -711,26 +869,43 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
     if want_high_mem:
         new_cmd.append("--high-mem")
 
-    runner_src = _RUNNER_TEMPLATE.format(
+    worker_src = _WORKER_TEMPLATE.format(
         workspace=REMOTE_WORKSPACE,
         out_dir=REMOTE_OUT,
         repo_tar=_REMOTE_REPO_TAR,
         out_tar=_REMOTE_OUT_TAR,
         result_json=_REMOTE_RESULT_JSON,
+        done_flag=_REMOTE_DONE_FLAG,
         image_ops=image_ops,
         container_env=container_env,
         preconditions=dict(function.preconditions),
         timeout=timeout_s,
+    )
+    runner_src = _RUNNER_TEMPLATE.format(
+        worker_py=_REMOTE_WORKER_PY,
+        job_log=_REMOTE_JOB_LOG,
+        tail_offset=_REMOTE_TAIL_OFFSET,
+        worker_pid=_REMOTE_WORKER_PID,
+        done_flag=_REMOTE_DONE_FLAG,
+        worker_src=worker_src,
+    )
+    attach_src = _ATTACH_TEMPLATE.format(
+        job_log=_REMOTE_JOB_LOG,
+        tail_offset=_REMOTE_TAIL_OFFSET,
+        worker_pid=_REMOTE_WORKER_PID,
+        done_flag=_REMOTE_DONE_FLAG,
     )
 
     with tempfile.TemporaryDirectory(prefix="runplz-colab-") as tmp:
         tmp_dir = Path(tmp)
         local_repo_tar = tmp_dir / "repo.tar.gz"
         local_runner = tmp_dir / "runner.py"
+        local_attach = tmp_dir / "attach.py"
         local_out_tar = tmp_dir / "out.tar.gz"
         local_result = tmp_dir / "result.json"
 
         local_runner.write_text(runner_src)
+        local_attach.write_text(attach_src)
         if not cfg.dry_run:
             out_excludes: list[str] = list(cfg.exclude)
             try:
@@ -785,6 +960,16 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
                 dry_run=cfg.dry_run,
                 cmd_timeout=float(timeout_s) + 600.0,
                 retries=_TRANSIENT_ATTEMPTS,
+                attach_cmd=[
+                    *base_cmd,
+                    "exec",
+                    "-s",
+                    session,
+                    "-f",
+                    str(local_attach),
+                    "--timeout",
+                    "0",
+                ],
             )
             if cfg.dry_run:
                 _run_colab(
