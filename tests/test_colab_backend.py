@@ -751,3 +751,55 @@ def test_colab_exec_attach_bails_after_three_quick_failures_and_templates_compil
     compile(worker_src, "worker.py", "exec")
     compile(runner_src, "runner.py", "exec")
     compile(attach_src, "attach.py", "exec")
+
+
+def test_colab_reprovisions_session_when_initial_upload_fails(tmp_path: Path):
+    """If a newly allocated Colab proxy rejects all upload attempts, stop and re-provision once."""
+    app, fn = _make_app_and_fn(
+        tmp_path,
+        colab_config=ColabConfig(high_mem=True, fallback_to_standard_mem=True),
+        gpu="A100",
+    )
+    new_sessions: list[tuple[str, bool]] = []
+    stopped_sessions: list[str] = []
+
+    def fake_run(cmd, *, check=False, timeout=None, **kw):
+        if "new" in cmd:
+            sess = cmd[cmd.index("-s") + 1]
+            new_sessions.append((sess, "--high-mem" in cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if "upload" in cmd:
+            sess = cmd[cmd.index("-s") + 1]
+            if sess == new_sessions[0][0]:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="SSL error")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if "stop" in cmd:
+            stopped_sessions.append(cmd[cmd.index("-s") + 1])
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if "download" in cmd:
+            dest = Path(cmd[-1])
+            if dest.name == "result.json":
+                dest.write_text(json.dumps({"exit_code": 0, "error": None}))
+            else:
+                with tarfile.open(dest, "w:gz") as tar:
+                    info = tarfile.TarInfo("ok.txt")
+                    data = b"reprovisioned"
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    with (
+        mock.patch("runplz.backends.colab.shutil.which", return_value="/usr/bin/colab"),
+        mock.patch("runplz.backends.colab.subprocess.run", side_effect=fake_run),
+        mock.patch("runplz.backends.colab._exec_colab_once", return_value=(0, True)),
+        mock.patch("runplz.backends.colab.time.sleep"),
+    ):
+        colab.run(app, fn, [], {}, outputs_dir="out")
+
+    assert len(new_sessions) == 2
+    assert new_sessions[0][1] is True
+    assert new_sessions[1][1] is False
+    assert new_sessions[0][0] != new_sessions[1][0]
+    assert stopped_sessions == [new_sessions[0][0], new_sessions[1][0]]
+    assert (tmp_path / "out" / "ok.txt").read_text() == "reprovisioned"
