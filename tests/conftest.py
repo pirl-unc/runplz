@@ -73,6 +73,7 @@ _BILLED_COMMANDS = {
     "ssh": "live_ssh",
     "rsync": "live_ssh",
     "modal": "live_modal",
+    "colab": "live_colab",
 }
 
 # Python modules whose execution reaches a billed provider, looked up by exact
@@ -80,7 +81,11 @@ _BILLED_COMMANDS = {
 # submodule are covered without naming them. The Modal worker is here because
 # it is spawned as a child interpreter that builds a real client, where no
 # in-process patch of ours applies.
-_BILLED_MODULES = {"modal": "modal", "runplz.backends.modal_runs": "modal"}
+_BILLED_MODULES = {
+    "modal": "modal",
+    "runplz.backends.modal_runs": "modal",
+    "colab_cli": "colab",
+}
 
 # The package's own CLI. A child running it can dispatch to any backend, so no
 # single marker can vouch for it; it is refused outright, like `shell=True`.

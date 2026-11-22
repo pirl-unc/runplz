@@ -16,6 +16,7 @@ __all__ = [
     "ModalConfig",
     "GcpConfig",
     "AwsConfig",
+    "ColabConfig",
 ]
 
 
@@ -366,6 +367,77 @@ class AwsConfig:
                 "key_name='my-key'). GPU availability and pricing are "
                 "per-region, so there is no safe default."
             )
+
+
+_VALID_COLAB_AUTH = ("oauth2", "adc")
+_VALID_COLAB_ON_FINISH = ("stop", "leave")
+_VALID_COLAB_TPUS = ("v5e1", "v6e1")
+
+
+@dataclass(frozen=True)
+class ColabConfig:
+    """Config for the `colab` backend — provision a Google Colab VM via `colab` CLI.
+
+    Shells out to `colab` (`google-colab-cli`) so the core stays dependency-free
+    and the test suite's billed-CLI guard covers `colab` automatically.
+
+    Auth uses `google-colab-cli`'s own OAuth2 keyring token (`auth="oauth2"`,
+    default — ideal for personal Google AI / Colab Pro+ / Ultra accounts without
+    disturbing GCP service-account ADC) or Application Default Credentials
+    (`auth="adc"`).
+    """
+
+    auth: str = "oauth2"
+    tpu: Optional[str] = None
+    high_mem: bool = False
+    on_finish: str = "stop"
+    max_runtime_seconds: Optional[int] = None
+    session_config_path: Optional[str] = None
+    client_oauth_config: Optional[str] = None
+    exclude: tuple = ()
+    dry_run: bool = False
+
+    def __post_init__(self):
+        if self.auth not in _VALID_COLAB_AUTH:
+            raise ValueError(
+                f"ColabConfig.auth must be one of {_VALID_COLAB_AUTH}; got {self.auth!r}."
+            )
+        if self.tpu is not None:
+            if not isinstance(self.tpu, str) or self.tpu.strip().lower() not in _VALID_COLAB_TPUS:
+                raise ValueError(
+                    f"ColabConfig.tpu must be one of {_VALID_COLAB_TPUS} (or None); "
+                    f"got {self.tpu!r}."
+                )
+        if not isinstance(self.high_mem, bool):
+            raise ValueError("ColabConfig.high_mem must be a bool.")
+        if self.on_finish not in _VALID_COLAB_ON_FINISH:
+            raise ValueError(
+                f"ColabConfig.on_finish must be one of {_VALID_COLAB_ON_FINISH}; "
+                f"got {self.on_finish!r}."
+            )
+        if self.max_runtime_seconds is not None and (
+            not isinstance(self.max_runtime_seconds, int) or self.max_runtime_seconds <= 0
+        ):
+            raise ValueError(
+                f"ColabConfig.max_runtime_seconds must be a positive int (or None); "
+                f"got {self.max_runtime_seconds!r}."
+            )
+        if self.session_config_path is not None and not str(self.session_config_path).strip():
+            raise ValueError("ColabConfig.session_config_path must be a non-empty path (or None).")
+        if self.client_oauth_config is not None and not str(self.client_oauth_config).strip():
+            raise ValueError("ColabConfig.client_oauth_config must be a non-empty path (or None).")
+        if not isinstance(self.exclude, tuple):
+            raise ValueError(
+                f"ColabConfig.exclude must be a tuple of glob patterns; "
+                f"got {type(self.exclude).__name__}."
+            )
+        for pattern in self.exclude:
+            if not isinstance(pattern, str) or not pattern.strip():
+                raise ValueError(
+                    f"ColabConfig.exclude entries must be non-empty strings; got {pattern!r}."
+                )
+        if not isinstance(self.dry_run, bool):
+            raise ValueError("ColabConfig.dry_run must be a bool.")
 
 
 def _validate_ssh_key_path(cls_name: str, path) -> None:

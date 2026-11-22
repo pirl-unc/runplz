@@ -342,9 +342,9 @@ internal that can move in a patch release.
 
 | Module | What it is |
 |---|---|
-| `runplz` | Re-exports everything below that a job script needs: `App`, `Function`, `Image`, `ImageOp`, and the five backend configs. The only import most scripts need. |
+| `runplz` | Re-exports everything below that a job script needs: `App`, `Function`, `Image`, `ImageOp`, and the six backend configs. The only import most scripts need. |
 | `runplz.app` | `App`, `Function`, `repo_root_for`, `validate_image_vs_brev_mode`, `PRECONDITION_KEYS`. |
-| `runplz.config` | `BrevConfig`, `SshConfig`, `ModalConfig`, `GcpConfig`, `AwsConfig`. |
+| `runplz.config` | `BrevConfig`, `SshConfig`, `ModalConfig`, `GcpConfig`, `AwsConfig`, `ColabConfig`. |
 | `runplz.image` | `Image` and the `ImageOp` DSL. |
 | `runplz.cli` | The `runplz` console script (`main`). Also reachable as `python -m runplz.cli`. |
 | `runplz.runs` | The `tail` / `status` / `kill` verbs, plus the reader for the `run.json` manifest that `rsync_down` leaves in your outputs dir. |
@@ -353,7 +353,7 @@ internal that can move in a patch release.
 | `runplz.backends.listing` | The shape of a listed job and the scope a backend needs to produce one: `JobRecord`, `ScopeField`, `ListingSpec`, `MissingScope`, `InvalidScope`, `ListingUnsupported`. |
 | `runplz.backends.ssh_common` | The shared layer every ssh-reachable backend runs on: `dispatch_to_target`, `run_on_provisioned_vm`, and the individual pipeline stages. |
 | `runplz.backends.provisioning` | Retry policy, GPU shape tables, instance naming, and teardown shared by the cloud drivers. |
-| `runplz.backends.local`, `runplz.backends.ssh`, `runplz.backends.brev`, `runplz.backends.modal`, `runplz.backends.gcp`, `runplz.backends.aws` | The backend drivers. Each exports `run` and — where the backend declares a `ListingSpec` — `list_jobs`, returning `JobRecord`s. The contract `registry.load()` calls. Normally reached through the CLI or `App.bind()`, not imported directly. |
+| `runplz.backends.local`, `runplz.backends.ssh`, `runplz.backends.brev`, `runplz.backends.modal`, `runplz.backends.gcp`, `runplz.backends.aws`, `runplz.backends.colab` | The backend drivers. Each exports `run` and — where the backend declares a `ListingSpec` — `list_jobs`, returning `JobRecord`s. The contract `registry.load()` calls. Normally reached through the CLI or `App.bind()`, not imported directly. |
 | `runplz.backends.docker` | Container labels and `docker ps` parsing, shared by the local and ssh backends. |
 | `runplz.backends.modal_runs` | Detached Modal receipts (`prepare_run`, `record_launch`), bounded `status`, and later artifact `collect`. |
 | `runplz.selector` | `pick_machine` / `pick_machines` — cost-tolerance shape selection with an availability tiebreak. |
@@ -582,6 +582,32 @@ and collect persistent outputs later. `runplz modal --detach` / `--no-detach`
 and `app.bind("modal", detach=True/False)` override the config for that binding.
 These overrides are rejected on other backends. Modal still reads credentials
 and environment from its own CLI configuration; resources remain on the function.
+
+### ColabConfig
+
+Runs on Google Colab runtimes (CPU, GPU: `T4`/`L4`/`G4`/`A100`/`H100`, or
+TPU: `v5e1`/`v6e1`) via the official `colab` CLI (`pip install google-colab-cli`),
+consuming your Google Colab Pro / Pro+ / Google AI Ultra compute units.
+
+```python
+from runplz import App, ColabConfig
+
+app = App(
+    "my-job",
+    colab_config=ColabConfig(
+        auth="oauth2",     # "oauth2" (default, personal Google keyring) or "adc"
+        high_mem=True,     # request High-RAM shape (also auto-enabled when min_memory > 12 GB)
+        on_finish="stop",  # "stop" (default, releases VM on exit) or "leave"
+    ),
+)
+```
+
+Auth is handled by `google-colab-cli` (`colab --auth=oauth2 usage` once in a
+browser for personal accounts, or `gcloud auth application-default login` with
+the `colaboratory` + `userinfo.email` scopes for `auth="adc"`). Because Colab
+VMs do not run nested Docker, `Image.from_dockerfile(...)` is rejected upfront
+and `Image.from_registry(...)` layer ops execute inline on the VM. Use
+`runplz ps colab` to inspect active `runplz-*` Colab sessions.
 
 ### Why not one unified config?
 

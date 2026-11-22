@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from runplz.backends import registry
-from runplz.config import AwsConfig, BrevConfig, GcpConfig, ModalConfig, SshConfig
+from runplz.config import AwsConfig, BrevConfig, ColabConfig, GcpConfig, ModalConfig, SshConfig
 from runplz.image import Image
 
 
@@ -149,11 +149,13 @@ class App:
         ssh_config: Optional[SshConfig] = None,
         gcp_config: Optional[GcpConfig] = None,
         aws_config: Optional[AwsConfig] = None,
+        colab_config: Optional[ColabConfig] = None,
     ):
         self.name = name
         self.brev_config = brev_config or BrevConfig()
         self.modal_config = modal_config or ModalConfig()
         self.ssh_config = ssh_config or SshConfig()
+        self.colab_config = colab_config or ColabConfig()
         # Provisioning clouds have required fields, so they stay None
         # until the user supplies one. bind() raises a pointed error
         # rather than constructing an invalid default.

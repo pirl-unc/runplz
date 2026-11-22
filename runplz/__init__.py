@@ -35,7 +35,7 @@ operations on long-running runs.
 """
 
 from runplz.app import App, Function
-from runplz.config import AwsConfig, BrevConfig, GcpConfig, ModalConfig, SshConfig
+from runplz.config import AwsConfig, BrevConfig, ColabConfig, GcpConfig, ModalConfig, SshConfig
 from runplz.image import Image, ImageOp
 from runplz.version import __version__
 
@@ -46,6 +46,7 @@ __all__ = [
     "ImageOp",
     "AwsConfig",
     "BrevConfig",
+    "ColabConfig",
     "GcpConfig",
     "ModalConfig",
     "SshConfig",

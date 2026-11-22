@@ -1,3 +1,18 @@
+## 2026-11-21 PR Plan — Google Colab backend (`colab`)
+
+Branch: `colab-backend` (off `main` @ 4.5.5)
+
+- [x] Add `ColabConfig` in `runplz/config.py` and re-export from `runplz`
+- [x] Implement `runplz/backends/colab.py` (`run`, `list_jobs`, `gpu_flag_for`) shelling out to `google-colab-cli` (`colab`)
+- [x] Register `colab` in `runplz/backends/registry.py` (`default_fan_out=False`) and wire `App(..., colab_config=...)`
+- [x] Add `"colab": "live_colab"` and `"colab_cli": "colab"` to `tests/conftest.py` billed-CLI guard
+- [x] Add `tests/test_colab_backend.py` (36 tests, 99% branch coverage on `colab.py`, 100% on `config.py` & `registry.py`)
+- [x] Update `tests/test_public_api.py`, `README.md` (`## Public API` + `### ColabConfig`), and bump `runplz/version.py` to `4.6.0`
+- [x] Verify `./format.sh`, `./lint.sh`, and pytest suite (327 passed in repo venv; 95.99% total branch coverage across full suite)
+- [x] Run live end-to-end verification on Google Colab (`A100-SXM4-80GB`, 32-step PyTorch training parity check vs Modal `A100-SXM4-80GB`, clean automatic `colab stop`, zero active sessions)
+- [x] Add `google-colab-cli 0.8.0` WebSocket disconnect hang-reaper + hard per-command timeouts + pre-start safe retry in `runplz/backends/colab.py` (96.85% branch coverage)
+- [ ] Open PR, merge, and run `./deploy.sh`
+
 ## 2026-09-04 PR Plan — Stop the container gracefully on the cap (#158)
 
 Branch: `fix/graceful-container-stop-on-cap` (off `main` @ 4.3.2)
