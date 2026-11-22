@@ -628,3 +628,44 @@ def test_colab_high_mem_no_fallback_raises(tmp_path: Path):
             colab.run(app, fn, [], {}, outputs_dir="out")
 
     assert all("--high-mem" in c for c in seen_new_cmds)
+
+
+def test_colab_upload_survives_tls_warmup_retries(tmp_path: Path):
+    """Fresh Colab reverse proxies can reject initial TLS handshakes for 15-25s."""
+    app, fn = _make_app_and_fn(tmp_path, gpu="A100")
+    upload_attempts = 0
+    slept: list[float] = []
+
+    def fake_run(cmd, *, check=False, timeout=None, **kw):
+        nonlocal upload_attempts
+        if "upload" in cmd:
+            upload_attempts += 1
+            if upload_attempts < 5:
+                return subprocess.CompletedProcess(
+                    cmd, 1, stdout="", stderr="SSL: WRONG_VERSION_NUMBER"
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if "download" in cmd:
+            dest = Path(cmd[-1])
+            if dest.name == "result.json":
+                dest.write_text(json.dumps({"exit_code": 0, "error": None}))
+            else:
+                with tarfile.open(dest, "w:gz") as tar:
+                    info = tarfile.TarInfo("ok.txt")
+                    data = b"ok"
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    with (
+        mock.patch("runplz.backends.colab.shutil.which", return_value="/usr/bin/colab"),
+        mock.patch("runplz.backends.colab.subprocess.run", side_effect=fake_run),
+        mock.patch("runplz.backends.colab._exec_colab_once", return_value=(0, True)),
+        mock.patch("runplz.backends.colab.time.sleep", side_effect=slept.append),
+    ):
+        colab.run(app, fn, [], {}, outputs_dir="out")
+
+    assert upload_attempts == 5
+    assert slept == [5.0, 10.0, 15.0, 20.0]
+    assert (tmp_path / "out" / "ok.txt").read_text() == "ok"
