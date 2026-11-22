@@ -613,6 +613,7 @@ def _run_colab(
     check: bool = True,
     retries: int = 1,
     cmd_timeout: Optional[float] = 300.0,
+    backoff_s: float = _TRANSIENT_BACKOFF_S,
 ) -> subprocess.CompletedProcess:
     print("+ " + " ".join(shlex.quote(part) for part in cmd), flush=True)
     if dry_run:
@@ -626,7 +627,7 @@ def _run_colab(
         last_result = result
         if result.returncode == 0 or attempt >= retries:
             break
-        wait_s = _TRANSIENT_BACKOFF_S * attempt
+        wait_s = backoff_s * attempt
         print(
             f"[runplz] colab command failed (rc={result.returncode}); "
             f"retrying ({attempt}/{retries - 1}) in {wait_s:.0f}s...",
@@ -745,7 +746,30 @@ def run(app, function, args, kwargs, *, outputs_dir: str = "out"):
             size_mb = local_repo_tar.stat().st_size / (1024 * 1024)
             print(f"+ packed repo archive: {size_mb:.2f} MB", flush=True)
 
-        _run_colab(new_cmd, dry_run=cfg.dry_run, retries=_TRANSIENT_ATTEMPTS, cmd_timeout=300.0)
+        try:
+            _run_colab(
+                new_cmd,
+                dry_run=cfg.dry_run,
+                retries=_TRANSIENT_ATTEMPTS,
+                cmd_timeout=300.0,
+                backoff_s=5.0,
+            )
+        except subprocess.CalledProcessError:
+            if not (want_high_mem and cfg.fallback_to_standard_mem):
+                raise
+            fallback_cmd = [part for part in new_cmd if part != "--high-mem"]
+            print(
+                "[runplz] colab --high-mem provisioning failed; retrying standard memory shape...",
+                file=sys.stderr,
+                flush=True,
+            )
+            _run_colab(
+                fallback_cmd,
+                dry_run=cfg.dry_run,
+                retries=_TRANSIENT_ATTEMPTS,
+                cmd_timeout=300.0,
+                backoff_s=5.0,
+            )
         try:
             _run_colab(
                 [*base_cmd, "upload", "-s", session, str(local_repo_tar), _REMOTE_REPO_TAR],
