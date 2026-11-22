@@ -560,3 +560,71 @@ def test_cli_entrypoint_supports_stringized_annotations():
     )
     parsed = _parse_entrypoint_args(ns["main"], ["--steps", "32", "--flag"], pytest.fail)
     assert parsed == {"steps": 32, "flag": True}
+
+
+def test_colab_config_rejects_bad_fallback_to_standard_mem():
+    with pytest.raises(ValueError, match="fallback_to_standard_mem"):
+        ColabConfig(fallback_to_standard_mem="yes")
+
+
+def test_colab_high_mem_fallback_to_standard_mem(tmp_path: Path):
+    app, fn = _make_app_and_fn(
+        tmp_path,
+        colab_config=ColabConfig(high_mem=True, fallback_to_standard_mem=True),
+        gpu="A100",
+    )
+    seen_new_cmds: list[list[str]] = []
+
+    def fake_run(cmd, *, check=False, timeout=None, **kw):
+        if "new" in cmd:
+            seen_new_cmds.append(list(cmd))
+            if "--high-mem" in cmd:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="503")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if "download" in cmd:
+            dest = Path(cmd[-1])
+            if dest.name == "result.json":
+                dest.write_text(json.dumps({"exit_code": 0, "error": None}))
+            else:
+                with tarfile.open(dest, "w:gz") as tar:
+                    info = tarfile.TarInfo("ok.txt")
+                    data = b"ok"
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    with (
+        mock.patch("runplz.backends.colab.shutil.which", return_value="/usr/bin/colab"),
+        mock.patch("runplz.backends.colab.subprocess.run", side_effect=fake_run),
+        mock.patch("runplz.backends.colab._exec_colab_once", return_value=(0, True)),
+        mock.patch("runplz.backends.colab.time.sleep"),
+    ):
+        colab.run(app, fn, [], {}, outputs_dir="out")
+
+    assert any("--high-mem" in c for c in seen_new_cmds)
+    assert any("--high-mem" not in c for c in seen_new_cmds)
+    assert (tmp_path / "out" / "ok.txt").read_text() == "ok"
+
+
+def test_colab_high_mem_no_fallback_raises(tmp_path: Path):
+    app, fn = _make_app_and_fn(
+        tmp_path,
+        colab_config=ColabConfig(high_mem=True, fallback_to_standard_mem=False),
+        gpu="A100",
+    )
+    seen_new_cmds: list[list[str]] = []
+
+    def fake_run(cmd, *, check=False, timeout=None, **kw):
+        seen_new_cmds.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="503")
+
+    with (
+        mock.patch("runplz.backends.colab.shutil.which", return_value="/usr/bin/colab"),
+        mock.patch("runplz.backends.colab.subprocess.run", side_effect=fake_run),
+        mock.patch("runplz.backends.colab.time.sleep"),
+    ):
+        with pytest.raises(subprocess.CalledProcessError):
+            colab.run(app, fn, [], {}, outputs_dir="out")
+
+    assert all("--high-mem" in c for c in seen_new_cmds)

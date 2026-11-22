@@ -390,6 +390,7 @@ class ColabConfig:
     auth: str = "oauth2"
     tpu: Optional[str] = None
     high_mem: bool = False
+    fallback_to_standard_mem: bool = True
     on_finish: str = "stop"
     max_runtime_seconds: Optional[int] = None
     session_config_path: Optional[str] = None
@@ -410,6 +411,8 @@ class ColabConfig:
                 )
         if not isinstance(self.high_mem, bool):
             raise ValueError("ColabConfig.high_mem must be a bool.")
+        if not isinstance(self.fallback_to_standard_mem, bool):
+            raise ValueError("ColabConfig.fallback_to_standard_mem must be a bool.")
         if self.on_finish not in _VALID_COLAB_ON_FINISH:
             raise ValueError(
                 f"ColabConfig.on_finish must be one of {_VALID_COLAB_ON_FINISH}; "
